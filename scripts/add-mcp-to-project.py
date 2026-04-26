@@ -64,6 +64,20 @@ def build_mcp_servers(servers_config: list) -> dict:
                 f"--password={entry['password']}",
             ]
 
+        elif kind == "ssh":
+            server_label = name.removeprefix("ssh-") or entry["host"]
+            args = [
+                f"{MCP_SERVERS_DIR}/ssh/server.py",
+                f"--host={entry['host']}",
+                f"--port={entry.get('port', 22)}",
+                f"--user={entry['user']}",
+                f"--name={server_label}",
+            ]
+            if entry.get("key_file"):
+                args.append(f"--key-file={entry['key_file']}")
+            elif entry.get("password"):
+                args.append(f"--password={entry['password']}")
+
         else:
             print(f"WARN: tipo desconocido '{kind}' para '{name}', ignorando.")
             continue
@@ -74,11 +88,16 @@ def build_mcp_servers(servers_config: list) -> dict:
 
 
 def main():
+    update_mode = "--update" in sys.argv
+    args_clean = [a for a in sys.argv[1:] if a != "--update"]
+
     secrets = load_secrets()
     MCP_SERVERS = build_mcp_servers(secrets["mcp_servers"])
 
-    if len(sys.argv) < 2:
-        print("Uso: python3 add-mcp-to-project.py /ruta/absoluta/al/proyecto")
+    if not args_clean:
+        print("Uso: python3 add-mcp-to-project.py /ruta/absoluta/al/proyecto [--update]")
+        print()
+        print("  --update  sobreescribe entradas existentes con los valores de secrets.json")
         print()
         print("Proyectos disponibles en ~/.claude.json:")
         with open(CLAUDE_JSON) as f:
@@ -89,7 +108,7 @@ def main():
             print(f"  {p}{tag}")
         sys.exit(0)
 
-    project_path = os.path.abspath(sys.argv[1])
+    project_path = os.path.abspath(args_clean[0])
 
     with open(CLAUDE_JSON) as f:
         d = json.load(f)
@@ -110,11 +129,15 @@ def main():
         }
 
     existing = d["projects"][project_path].get("mcpServers", {})
-    added, skipped = [], []
+    added, updated, skipped = [], [], []
 
     for name, config in MCP_SERVERS.items():
         if name in existing:
-            skipped.append(name)
+            if update_mode:
+                existing[name] = config
+                updated.append(name)
+            else:
+                skipped.append(name)
         else:
             existing[name] = config
             added.append(name)
@@ -126,9 +149,11 @@ def main():
 
     print(f"Proyecto: {project_path}")
     if added:
-        print(f"  Agregados  : {', '.join(added)}")
+        print(f"  Agregados   : {', '.join(added)}")
+    if updated:
+        print(f"  Actualizados: {', '.join(updated)}")
     if skipped:
-        print(f"  Ya existían: {', '.join(skipped)}")
+        print(f"  Ya existían : {', '.join(skipped)}")
     print()
     print("Reinicia Claude Code (VSCode) para que carguen los MCPs.")
 
