@@ -1,11 +1,16 @@
 # Mrgenkko Skills
 
-Repositorio de herramientas, guías y servidores MCP para Claude Code.
+Repositorio de herramientas, guías y servidores MCP para Claude Code, orientado a mejorar la experiencia de trabajo en la extensión VSCode.
+
+Incluye servidores MCP para conectar Claude a bases de datos PostgreSQL, proyectos de Google Cloud y servidores SSH, junto con scripts para registrarlos en cada proyecto de trabajo.
+
+**Cuándo ejecutar `add-mcp-to-project.py`:**  
+Una vez por proyecto de VSCode que quieras que tenga acceso a los MCPs. No hace falta repetirlo a menos que cambies credenciales (usa `--update`) o agregues un proyecto nuevo. Los proyectos que no lo tengan registrado simplemente no verán los MCPs.
 
 ## Estructura
 
 ```
-Skills/
+Mrgenkko Skills/
 ├── CLAUDE.example.md            ← plantilla de contexto para Claude (tu CLAUDE.md va en .gitignore)
 ├── README.md
 ├── requirements.txt             ← dependencias Python de los MCPs
@@ -32,7 +37,7 @@ Skills/
 **1. Crear el entorno Python:**
 
 ```bash
-cd ~/Skills
+cd ~/Mrgenkko\ Skills
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
@@ -55,11 +60,24 @@ cp CLAUDE.example.md CLAUDE.md
 
 ## Agregar MCPs a un proyecto nuevo
 
+**Por qué hace falta este paso:**  
+La extensión VSCode de Claude Code no lee `~/.claude/settings.json` ni `~/.claude/mcp.json` — esos archivos los usa el CLI de línea de comandos, no la extensión. La extensión guarda su configuración en `~/.claude.json` (archivo en tu home directory, fuera de cualquier proyecto), donde cada proyecto tiene su propia entrada con los MCPs que puede usar. Sin registrar el proyecto ahí, Claude no ve ningún MCP aunque estén instalados.
+
+`add-mcp-to-project.py` automatiza ese registro: lee `secrets.json`, construye la configuración de cada servidor y la escribe en `~/.claude.json` para el proyecto que le indiques.
+
 ```bash
-python3 ~/Skills/scripts/add-mcp-to-project.py /ruta/absoluta/al/proyecto
+# Ver todos los proyectos registrados y qué MCPs tienen
+python3 ~/Mrgenkko\ Skills/scripts/add-mcp-to-project.py
+
+# Registrar todos los MCPs en un proyecto nuevo
+python3 ~/Mrgenkko\ Skills/scripts/add-mcp-to-project.py /ruta/absoluta/al/proyecto
+
+# Actualizar entradas ya existentes (cuando cambian credenciales o argumentos)
+python3 ~/Mrgenkko\ Skills/scripts/add-mcp-to-project.py /ruta/absoluta/al/proyecto --update
 ```
 
-Lee `scripts/secrets.json`, registra todos los MCPs definidos en `~/.claude.json` para ese proyecto y reiniciar Claude Code (VSCode).
+Por defecto no sobreescribe entradas existentes; usa `--update` para forzarlo.  
+Después de ejecutarlo, **reiniciar Claude Code en VSCode** para que carguen los nuevos MCPs.
 
 ---
 
@@ -94,14 +112,15 @@ Una instancia por base de datos, mismo binario con distintos `--db`.
 
 ## Archivos MCP en el sistema
 
-```
-~/.claude/
-├── mcp-servers/
-│   ├── gcloud/server.py    ← servidor gcloud activo
-│   └── postgres/server.py  ← servidor postgres activo
-└── .claude.json            ← registro de MCPs por proyecto (VSCode)
-```
+Los servidores MCP viven en `~/.claude/mcp-servers/` (fuera de este repositorio).  
+La configuración por proyecto se guarda en `~/.claude.json` (también fuera del repo).
 
-> **Quirk VSCode:** la extensión ignora `~/.claude/settings.json`.
-> Los MCPs deben registrarse en `~/.claude.json` por proyecto.
-> Usar `scripts/add-mcp-to-project.py` para automatizarlo.
+```
+~/                              ← home directory
+├── .claude.json                ← config global de Claude Code (VSCode): MCPs por proyecto
+└── .claude/
+    └── mcp-servers/
+        ├── gcloud/server.py    ← servidor gcloud activo
+        ├── postgres/server.py  ← servidor postgres activo
+        └── ssh/server.py       ← servidor SSH activo
+```
