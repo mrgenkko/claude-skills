@@ -1,0 +1,21 @@
+# Entorno Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets — nunca subir al repositorio
+scripts/secrets.json
+
+# Contexto personal de Claude (usa CLAUDE.example.md como plantilla)
+CLAUDE.md
+
+# Keys y credenciales
+*.json.key
+*.p12
+*.pem
+keys/
+
+# Variables de entorno
+.env
+.env.*
