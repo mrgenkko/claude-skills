@@ -55,6 +55,6 @@ Usar `scripts/add-mcp-to-project.py` para registrar los MCPs en un proyecto nuev
 ## Convenciones
 
 - Los servidores MCP custom van en `~/.claude/mcp-servers/<nombre>/server.py`
-- El venv para los MCP Python es `~/Skills/.venv`
+- El venv para los MCP Python es `~/Mrgenkko Skills/.venv`
 - Las service account keys van en `~/keys/<proyecto>/` (nunca en el repo)
 - Las credenciales van en `scripts/secrets.json` (gitignoreado)

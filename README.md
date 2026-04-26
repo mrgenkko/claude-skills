@@ -21,13 +21,16 @@ Mrgenkko Skills/
 │   └── secrets.example.json    ← plantilla de secrets
 ├── guides/
 │   ├── mcp-databases.md        ← cómo crear MCPs de bases de datos
-│   └── mcp-gcloud.md           ← cómo crear MCPs para Google Cloud
+│   ├── mcp-gcloud.md           ← cómo crear MCPs para Google Cloud
+│   └── mcp-ssh.md              ← cómo crear MCPs para servidores SSH
 ├── examples/
 │   ├── mcp-database/server.py  ← MCP mínimo para PostgreSQL
-│   └── mcp-gcloud/server.py    ← MCP mínimo para gcloud CLI
+│   ├── mcp-gcloud/server.py    ← MCP mínimo para gcloud CLI
+│   └── mcp-ssh/server.py       ← MCP mínimo para SSH
 └── deployed/
     ├── gcloud/server.py        ← servidor gcloud (multi-proyecto)
-    └── postgres/server.py      ← servidor postgres (read + write)
+    ├── postgres/server.py      ← servidor postgres (read + write)
+    └── ssh/server.py           ← servidor SSH (shell + SFTP)
 ```
 
 ---
@@ -107,6 +110,19 @@ Una instancia por base de datos, mismo binario con distintos `--db`.
 | `query`    | Ejecuta cualquier SQL (SELECT/INSERT/UPDATE/DELETE/DDL) |
 | `tables`   | Lista tablas del schema público con tamaño        |
 | `describe` | Describe columnas de una tabla                    |
+
+### ssh (`deployed/ssh/server.py`)
+
+Servidor Python para controlar servidores Ubuntu/Linux privados vía SSH.  
+Una instancia por servidor, mismo binario con distintos `--host` y `--user`.  
+Autenticación por clave privada (`--key-file`) o contraseña (`--password`).
+
+| Tool         | Descripción                                      |
+|--------------|--------------------------------------------------|
+| `shell`      | Ejecuta un comando bash en el servidor remoto    |
+| `read_file`  | Lee el contenido de un archivo remoto (SFTP)     |
+| `write_file` | Escribe contenido a un archivo remoto (SFTP)     |
+| `list_dir`   | Lista el contenido de un directorio remoto       |
 
 ---
 
