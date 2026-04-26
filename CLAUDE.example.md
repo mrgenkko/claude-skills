@@ -20,13 +20,18 @@ Skills/
 │   └── secrets.example.json     ← plantilla de credenciales
 ├── guides/
 │   ├── mcp-databases.md         ← cómo crear MCP de bases de datos
-│   └── mcp-gcloud.md            ← cómo crear MCP de Google Cloud
+│   ├── mcp-gcloud.md            ← cómo crear MCP de Google Cloud
+│   └── mcp-ssh.md               ← cómo crear MCP para servidores SSH
 ├── examples/
 │   ├── mcp-database/server.py   ← MCP mínimo para PostgreSQL
-│   └── mcp-gcloud/server.py     ← MCP mínimo para gcloud
+│   ├── mcp-gcloud/server.py     ← MCP mínimo para gcloud
+│   ├── mcp-ssh/server.py        ← MCP mínimo para SSH
+│   └── mcp-obsidian/server.py   ← MCP mínimo para vault de Obsidian
 └── deployed/
     ├── gcloud/server.py         ← servidor gcloud en producción
-    └── postgres/server.py       ← servidor postgres en producción
+    ├── postgres/server.py       ← servidor postgres en producción
+    ├── ssh/server.py            ← servidor SSH en producción
+    └── obsidian/server.py       ← servidor Obsidian en producción
 ```
 
 ## MCPs activos
@@ -39,9 +44,13 @@ Completar con los MCPs propios. Ejemplo de estructura:
 | `gcloud-proyecto-b` | Python custom | mi-otro-proyecto-gcp       |
 | `postgres-bd-1`     | Python custom | DB: mi_base_de_datos       |
 | `postgres-bd-2`     | Python custom | DB: mi_otra_base           |
+| `ssh-servidor-01`   | Python custom | 192.168.1.100              |
+| `obsidian`          | Python custom | Vault: ~/ObsidianVault     |
 
 El servidor gcloud está en: `~/.claude/mcp-servers/gcloud/server.py`  
 El servidor postgres está en: `~/.claude/mcp-servers/postgres/server.py`  
+El servidor SSH está en: `~/.claude/mcp-servers/ssh/server.py`  
+El servidor Obsidian está en: `~/.claude/mcp-servers/obsidian/server.py`  
 Ambas instancias gcloud usan el mismo binario con distintos `--project` y `--account`.  
 Ambas instancias postgres usan el mismo binario con distintos `--db`.
 

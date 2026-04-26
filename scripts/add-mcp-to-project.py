@@ -78,6 +78,12 @@ def build_mcp_servers(servers_config: list) -> dict:
             elif entry.get("password"):
                 args.append(f"--password={entry['password']}")
 
+        elif kind == "obsidian":
+            args = [
+                f"{MCP_SERVERS_DIR}/obsidian/server.py",
+                f"--vault-path={entry['vault_path']}",
+            ]
+
         else:
             print(f"WARN: tipo desconocido '{kind}' para '{name}', ignorando.")
             continue

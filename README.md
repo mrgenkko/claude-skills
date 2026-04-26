@@ -2,7 +2,7 @@
 
 Repositorio de herramientas, guías y servidores MCP para Claude Code, orientado a mejorar la experiencia de trabajo en la extensión VSCode.
 
-Incluye servidores MCP para conectar Claude a bases de datos PostgreSQL, proyectos de Google Cloud y servidores SSH, junto con scripts para registrarlos en cada proyecto de trabajo.
+Incluye servidores MCP para conectar Claude a bases de datos PostgreSQL, proyectos de Google Cloud, servidores SSH y vaults de Obsidian, junto con scripts para registrarlos en cada proyecto de trabajo.
 
 **Cuándo ejecutar `add-mcp-to-project.py`:**  
 Una vez por proyecto de VSCode que quieras que tenga acceso a los MCPs. No hace falta repetirlo a menos que cambies credenciales (usa `--update`) o agregues un proyecto nuevo. Los proyectos que no lo tengan registrado simplemente no verán los MCPs.
@@ -26,11 +26,13 @@ Mrgenkko Skills/
 ├── examples/
 │   ├── mcp-database/server.py  ← MCP mínimo para PostgreSQL
 │   ├── mcp-gcloud/server.py    ← MCP mínimo para gcloud CLI
-│   └── mcp-ssh/server.py       ← MCP mínimo para SSH
+│   ├── mcp-ssh/server.py       ← MCP mínimo para SSH
+│   └── mcp-obsidian/server.py  ← MCP mínimo para vault de Obsidian
 └── deployed/
     ├── gcloud/server.py        ← servidor gcloud (multi-proyecto)
     ├── postgres/server.py      ← servidor postgres (read + write)
-    └── ssh/server.py           ← servidor SSH (shell + SFTP)
+    ├── ssh/server.py           ← servidor SSH (shell + SFTP)
+    └── obsidian/server.py      ← servidor Obsidian (read/write/search notas)
 ```
 
 ---
@@ -124,6 +126,20 @@ Autenticación por clave privada (`--key-file`) o contraseña (`--password`).
 | `write_file` | Escribe contenido a un archivo remoto (SFTP)     |
 | `list_dir`   | Lista el contenido de un directorio remoto       |
 
+### obsidian (`deployed/obsidian/server.py`)
+
+Servidor Python para leer y escribir notas en un vault de Obsidian local.  
+Argumento `--vault-path` apunta al directorio raíz del vault.  
+Soporta symlinks dentro del vault (útil para exponer la memoria de Claude como notas).
+
+| Tool           | Descripción                                          |
+|----------------|------------------------------------------------------|
+| `read_note`    | Lee el contenido de una nota (path relativo al vault) |
+| `write_note`   | Crea o reemplaza una nota completa                   |
+| `append_note`  | Agrega contenido al final de una nota existente      |
+| `search_notes` | Busca notas por contenido (grep recursivo)           |
+| `list_notes`   | Lista archivos .md de una carpeta del vault          |
+
 ---
 
 ## Archivos MCP en el sistema
@@ -138,5 +154,6 @@ La configuración por proyecto se guarda en `~/.claude.json` (también fuera del
     └── mcp-servers/
         ├── gcloud/server.py    ← servidor gcloud activo
         ├── postgres/server.py  ← servidor postgres activo
-        └── ssh/server.py       ← servidor SSH activo
+        ├── ssh/server.py       ← servidor SSH activo
+        └── obsidian/server.py  ← servidor Obsidian activo
 ```
