@@ -67,6 +67,17 @@ async def list_tools() -> list[types.Tool]:
                 },
             },
         ),
+        types.Tool(
+            name="delete_note",
+            description="Elimina una nota o carpeta entera del vault (recursivo).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path relativo al vault"},
+                },
+                "required": ["path"],
+            },
+        ),
     ]
 
 
@@ -91,6 +102,23 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                     if fn.endswith(".md"):
                         files.append(os.path.relpath(os.path.join(r, fn), VAULT))
             output = "\n".join(sorted(files)) if files else "(sin notas)"
+
+        elif name == "delete_note":
+            import shutil
+            target = _resolve(arguments["path"])
+            target.relative_to(VAULT)
+            if not target.exists():
+                target_md = target.with_suffix(".md")
+                if target_md.exists():
+                    target = target_md
+                else:
+                    raise FileNotFoundError(f"No existe: {arguments['path']}")
+            if target.is_dir():
+                shutil.rmtree(target)
+                output = f"Carpeta eliminada: {arguments['path']}"
+            else:
+                target.unlink()
+                output = f"Nota eliminada: {arguments['path']}"
 
         else:
             output = f"Tool desconocido: {name}"

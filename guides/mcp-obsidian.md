@@ -13,6 +13,7 @@ El vault puede contener symlinks a directorios externos (como la memoria de Clau
 | `read_note`    | Lee el contenido de una nota (path relativo al vault)         |
 | `write_note`   | Crea o reemplaza una nota completa                            |
 | `append_note`  | Agrega contenido al final de una nota existente               |
+| `delete_note`  | Elimina una nota o carpeta entera (recursivo)                 |
 | `search_notes` | Busca notas por contenido (grep recursivo, sigue symlinks)    |
 | `list_notes`   | Lista archivos `.md` de una carpeta del vault (recursivo)     |
 
@@ -241,4 +242,43 @@ elif name == "rename_note":
     dst.parent.mkdir(parents=True, exist_ok=True)
     src.rename(dst)
     output = f"Nota movida: {arguments['path']} → {arguments['new_path']}"
+```
+
+### Ejemplo: tool para eliminar una nota o carpeta (ya incluida en el servidor)
+
+**En `list_tools()`:**
+
+```python
+types.Tool(
+    name="delete_note",
+    description="Elimina una nota o carpeta entera del vault (recursivo).",
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path relativo al vault"},
+        },
+        "required": ["path"],
+    },
+),
+```
+
+**En `call_tool()`:**
+
+```python
+elif name == "delete_note":
+    import shutil
+    target = _resolve(arguments["path"])
+    target.relative_to(VAULT)  # seguridad: evita salir del vault
+    if not target.exists():
+        target_md = target.with_suffix(".md")
+        if target_md.exists():
+            target = target_md
+        else:
+            raise FileNotFoundError(f"No existe: {arguments['path']}")
+    if target.is_dir():
+        shutil.rmtree(target)
+        output = f"Carpeta eliminada: {arguments['path']}"
+    else:
+        target.unlink()
+        output = f"Nota eliminada: {arguments['path']}"
 ```

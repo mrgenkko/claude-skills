@@ -104,6 +104,20 @@ async def list_tools() -> list[types.Tool]:
             description="Devuelve las convenciones del vault: estructura de carpetas, cuándo usar arquitectura/ vs decisiones/, formatos de notas. Llamar siempre antes de crear o buscar notas.",
             inputSchema={"type": "object", "properties": {}},
         ),
+        types.Tool(
+            name="delete_note",
+            description="Elimina una nota o carpeta entera del vault. Si se pasa una carpeta, borra todo su contenido recursivamente.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path relativo al vault (ej: lait/proyectos/foo o lait/proyectos/foo.md)",
+                    },
+                },
+                "required": ["path"],
+            },
+        ),
     ]
 
 
@@ -154,6 +168,25 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                         full = os.path.join(root, fn)
                         files.append(os.path.relpath(full, VAULT))
             output = "\n".join(sorted(files)) if files else "(sin notas)"
+
+        elif name == "delete_note":
+            import shutil
+            target = _resolve(arguments["path"])
+            # Asegurar que el target esté dentro del vault
+            target.relative_to(VAULT)
+            if not target.exists():
+                # Intentar con extensión .md si no existe
+                target_md = target.with_suffix(".md")
+                if target_md.exists():
+                    target = target_md
+                else:
+                    raise FileNotFoundError(f"No existe: {arguments['path']}")
+            if target.is_dir():
+                shutil.rmtree(target)
+                output = f"Carpeta eliminada: {arguments['path']}"
+            else:
+                target.unlink()
+                output = f"Nota eliminada: {arguments['path']}"
 
         elif name == "get_context":
             context_file = VAULT / "CONTEXT.md"

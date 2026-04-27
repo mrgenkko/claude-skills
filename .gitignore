@@ -8,6 +8,7 @@ __pycache__/
 scripts/secrets.json
 
 # Contexto personal de Claude (usa CLAUDE.example.md como plantilla)
+.claude/
 CLAUDE.md
 
 # Keys y credenciales
