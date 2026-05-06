@@ -36,10 +36,29 @@ def _account_flags() -> list:
     return [f"--account={ACCOUNT}"] if ACCOUNT else []
 
 
-def _run(cmd: list | str, shell: bool = False) -> str:
-    result = subprocess.run(
-        cmd, shell=shell, capture_output=True, text=True, cwd=WORKDIR
-    )
+def _run(cmd: list | str, shell: bool = False, timeout: int = 30) -> str:
+    try:
+        result = subprocess.run(
+            cmd, shell=shell, capture_output=True, text=True, cwd=WORKDIR, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return f"[timeout] El comando tardó más de {timeout}s y fue cancelado."
+    out = result.stdout.strip()
+    err = result.stderr.strip()
+    if result.returncode != 0:
+        return f"[exit {result.returncode}]\n{err or out}"
+    return out or err or "(sin output)"
+
+
+def _bq_query(sql: str, project: str, timeout: int = 120) -> str:
+    try:
+        result = subprocess.run(
+            ["bq", "query", f"--project_id={project}", "--use_legacy_sql=false",
+             "--headless", "--format=prettyjson", sql],
+            capture_output=True, text=True, cwd=WORKDIR, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return f"[timeout] La query de BigQuery tardó más de {timeout}s y fue cancelada."
     out = result.stdout.strip()
     err = result.stderr.strip()
     if result.returncode != 0:
@@ -111,6 +130,18 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["command"],
             },
         ),
+        types.Tool(
+            name="bq_query",
+            description="Ejecuta una query SQL en BigQuery con timeout extendido (120s). Usa para billing export y análisis de costos.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "Query SQL estándar (no legacy)"},
+                    "project_id": {"type": "string", "description": f"Proyecto BigQuery (default: {PROJECT})"},
+                },
+                "required": ["sql"],
+            },
+        ),
     ]
 
 
@@ -158,6 +189,10 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
     elif name == "shell":
         output = _run(arguments["command"], shell=True)
+
+    elif name == "bq_query":
+        project_id = arguments.get("project_id", PROJECT)
+        output = _bq_query(arguments["sql"], project=project_id)
 
     else:
         output = f"Tool desconocido: {name}"

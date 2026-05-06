@@ -15,6 +15,7 @@ El mismo binario (`server.py`) sirve para múltiples proyectos — se diferencia
 | `secret_list`     | Lista secrets de Secret Manager                          |
 | `secret_get`      | Obtiene el valor de un secret (versión específica)       |
 | `shell`           | Ejecuta un comando de shell en el `workdir` del proyecto |
+| `bq_query`        | Ejecuta SQL en BigQuery con timeout 120s (evita el cuelgue de `bq` CLI en `shell`) |
 
 ## Argumentos del servidor
 

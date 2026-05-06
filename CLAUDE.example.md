@@ -61,6 +61,79 @@ Los MCPs se deben registrar directamente en `~/.claude.json` bajo `projects["/ru
 
 Usar `scripts/add-mcp-to-project.py` para registrar los MCPs en un proyecto nuevo.
 
+## MCP Obsidian y vault
+
+El MCP `obsidian` expone el vault de Obsidian con estas herramientas:
+
+| Tool | Uso |
+|---|---|
+| `get_context` | Leer `CONTEXT.md` — llamar siempre antes de crear o buscar notas |
+| `read_note` | Leer una nota por path relativo al vault |
+| `write_note` | Crear o reemplazar una nota completa |
+| `append_note` | Agregar contenido al final de una nota existente |
+| `search_notes` | Grep recursivo en `.md` del vault |
+| `list_notes` | Listar archivos `.md` de una carpeta |
+| `delete_note` | Eliminar nota o carpeta entera |
+| `add_attachment` | Copiar imagen/PDF al vault y retornar sintaxis `![[filename]]` |
+
+### Estructura del vault
+
+```
+~/ObsidianVault/
+├── CONTEXT.md          ← convenciones del vault (leer con get_context)
+├── wiki/               ← wiki de conocimiento acumulativo
+│   ├── index.md        ← catálogo maestro por categoría
+│   ├── log.md          ← registro append-only de ingestas y queries
+│   ├── schema.md       ← convenciones, plantilla de página y protocolos
+│   ├── conceptos/
+│   ├── herramientas/
+│   ├── personas/
+│   ├── patrones/
+│   └── attachments/    ← imágenes y PDFs (![[filename]])
+├── claude-memory/      ← symlinks a memorias de proyecto (no editar)
+├── ecosistema/         ← infra compartida entre organizaciones
+├── <org>/              ← una carpeta por organización
+└── templates/
+```
+
+## Wiki de Conocimiento
+
+La carpeta `wiki/` es un cerebro externo acumulativo — crece con cada fuente procesada y mejora con el tiempo.
+
+### Cuándo hacer ingest
+
+- Al recibir un artículo, paper, video, imagen o URL relevante
+- Al descubrir un patrón de arquitectura o técnica no trivial
+- Al resolver un problema que otros podrían volver a enfrentar
+
+### Cuándo NO ingestar
+
+- Info específica de un proyecto → `<org>/proyectos/<nombre>/` en el vault
+- Decisiones de negocio → `ecosistema/` en el vault
+- Estado efímero de la conversación → `claude-memory/` (automático)
+
+### Protocolo ingest
+
+1. Leer/ver la fuente completa antes de ingestar
+2. Identificar páginas wiki afectadas (mínimo 3, máximo 15)
+3. Actualizar cada página: agregar/refinar secciones + cross-refs bidireccionales
+4. Si el concepto no existe → crear página con la plantilla de `wiki/schema.md`
+5. Registrar en `wiki/log.md` antes de cerrar la sesión
+6. Si hay categoría nueva → actualizar `wiki/index.md`
+
+### Protocolo imágenes y attachments
+
+1. Llamar `add_attachment(source_path, filename)` para copiar al vault
+2. Leer la imagen con el tool `Read` para extraer su contenido
+3. Referenciar en la nota con `![[filename.png]]`
+
+### Protocolo lint (al detectar >30 días sin lint en `wiki/log.md`)
+
+1. Páginas huérfanas (sin incoming links)
+2. Contradicciones entre páginas relacionadas
+3. Claims sin fuente en frontmatter `sources`
+4. Reportar hallazgos al usuario — no corregir automáticamente
+
 ## Convenciones
 
 - Los servidores MCP custom van en `~/.claude/mcp-servers/<nombre>/server.py`
