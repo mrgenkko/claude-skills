@@ -20,8 +20,10 @@ Mrgenkko Skills/
 │   ├── secrets.json            ← credenciales y configuración (gitignoreado)
 │   └── secrets.example.json    ← plantilla de secrets
 ├── guides/
+│   ├── mcp-cursor.md           ← MCP en Cursor IDE (~/.cursor/mcp.json, global por proyecto)
 │   ├── mcp-databases.md        ← cómo crear MCPs de bases de datos
 │   ├── mcp-gcloud.md           ← cómo crear MCPs para Google Cloud
+│   ├── mcp-obsidian.md         ← MCP vault Obsidian
 │   └── mcp-ssh.md              ← cómo crear MCPs para servidores SSH
 ├── examples/
 │   ├── mcp-database/server.py  ← MCP mínimo para PostgreSQL
