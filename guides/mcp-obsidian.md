@@ -157,6 +157,12 @@ ObsidianVault/
 
 ---
 
+## Animaciones Lottie en notas
+
+Para incrustar animaciones creadas en LottieFiles Creator, usar también el MCP `lottiefiles-creator` (export → `add_attachment` → wikilink en la nota). Instalación y registro en Cursor/Claude Code: `guides/mcp-lottie-creator.md`.
+
+---
+
 ## Registro manual en `~/.claude.json`
 
 Si no se usa `add-mcp-to-project.py`:

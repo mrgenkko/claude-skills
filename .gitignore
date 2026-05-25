@@ -10,6 +10,7 @@ scripts/secrets.json
 # Contexto personal de Claude (usa CLAUDE.example.md como plantilla)
 .claude/
 CLAUDE.md
+pendientes/
 
 # Keys y credenciales
 *.json.key

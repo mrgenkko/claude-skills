@@ -2,7 +2,7 @@
 
 Repositorio de herramientas, guías y servidores MCP para Claude Code, orientado a mejorar la experiencia de trabajo en la extensión VSCode.
 
-Incluye servidores MCP para conectar Claude a bases de datos PostgreSQL, proyectos de Google Cloud, servidores SSH y vaults de Obsidian, junto con scripts para registrarlos en cada proyecto de trabajo.
+Incluye servidores MCP para conectar Claude a bases de datos PostgreSQL, proyectos de Google Cloud, servidores SSH, vaults de Obsidian y LottieFiles Creator, junto con scripts para registrarlos en cada proyecto de trabajo.
 
 **Cuándo ejecutar `add-mcp-to-project.py`:**  
 Una vez por proyecto de VSCode que quieras que tenga acceso a los MCPs. No hace falta repetirlo a menos que cambies credenciales (usa `--update`) o agregues un proyecto nuevo. Los proyectos que no lo tengan registrado simplemente no verán los MCPs.
@@ -17,12 +17,15 @@ Mrgenkko Skills/
 ├── .gitignore
 ├── scripts/
 │   ├── add-mcp-to-project.py   ← registra MCPs en un proyecto nuevo
+│   ├── install-lottie-mcp.sh   ← instala @lottiefiles/creator-mcp en ~/.claude/mcp-servers/lottie
+│   ├── run-lottie-mcp.sh       ← arranque Lottie para Claude Code (stdio)
 │   ├── secrets.json            ← credenciales y configuración (gitignoreado)
 │   └── secrets.example.json    ← plantilla de secrets
 ├── guides/
-│   ├── mcp-cursor.md           ← MCP en Cursor IDE (~/.cursor/mcp.json, global por proyecto)
+│   ├── cursor.md               ← MCP en Cursor IDE (~/.cursor/mcp.json, global)
 │   ├── mcp-databases.md        ← cómo crear MCPs de bases de datos
 │   ├── mcp-gcloud.md           ← cómo crear MCPs para Google Cloud
+│   ├── mcp-lottie-creator.md   ← LottieFiles Creator (npm + browser bridge)
 │   ├── mcp-obsidian.md         ← MCP vault Obsidian
 │   └── mcp-ssh.md              ← cómo crear MCPs para servidores SSH
 ├── examples/
@@ -142,6 +145,17 @@ Soporta symlinks dentro del vault (útil para exponer la memoria de Claude como 
 | `search_notes` | Busca notas por contenido (grep recursivo)           |
 | `list_notes`   | Lista archivos .md de una carpeta del vault          |
 
+### lottiefiles-creator (npm oficial)
+
+Paquete `@lottiefiles/creator-mcp` instalado en `~/.claude/mcp-servers/lottie/`. Bridge con [creator.lottiefiles.com](https://creator.lottiefiles.com) (WebSocket + stdio). No va en `secrets.json` ni en `add-mcp-to-project.py`.
+
+| Contexto | Configuración |
+|----------|----------------|
+| **Cursor** (todos los workspaces) | `~/.cursor/mcp.json` → ver `guides/cursor.md` y `guides/mcp-lottie-creator.md` |
+| **Claude Code VSCode** | `~/.claude.json` por proyecto → `scripts/run-lottie-mcp.sh` |
+
+Instalación: `bash scripts/install-lottie-mcp.sh`
+
 ---
 
 ## Archivos MCP en el sistema
@@ -151,11 +165,13 @@ La configuración por proyecto se guarda en `~/.claude.json` (también fuera del
 
 ```
 ~/                              ← home directory
+├── .cursor/mcp.json            ← MCPs globales de Cursor IDE (gcloud, postgres, obsidian, lottie, …)
 ├── .claude.json                ← config global de Claude Code (VSCode): MCPs por proyecto
 └── .claude/
     └── mcp-servers/
         ├── gcloud/server.py    ← servidor gcloud activo
         ├── postgres/server.py  ← servidor postgres activo
         ├── ssh/server.py       ← servidor SSH activo
-        └── obsidian/server.py  ← servidor Obsidian activo
+        ├── obsidian/server.py  ← servidor Obsidian activo
+        └── lottie/             ← npm: @lottiefiles/creator-mcp (node_modules/…/dist/index.mjs)
 ```

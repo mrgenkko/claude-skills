@@ -19,8 +19,11 @@ Skills/
 │   ├── secrets.json             ← credenciales reales (gitignoreado)
 │   └── secrets.example.json     ← plantilla de credenciales
 ├── guides/
+│   ├── cursor.md                ← MCP global en Cursor (~/.cursor/mcp.json)
 │   ├── mcp-databases.md         ← cómo crear MCP de bases de datos
 │   ├── mcp-gcloud.md            ← cómo crear MCP de Google Cloud
+│   ├── mcp-lottie-creator.md    ← LottieFiles Creator (npm + browser)
+│   ├── mcp-obsidian.md          ← vault Obsidian
 │   └── mcp-ssh.md               ← cómo crear MCP para servidores SSH
 ├── examples/
 │   ├── mcp-database/server.py   ← MCP mínimo para PostgreSQL
@@ -45,14 +48,17 @@ Completar con los MCPs propios. Ejemplo de estructura:
 | `postgres-bd-1`     | Python custom | DB: mi_base_de_datos       |
 | `postgres-bd-2`     | Python custom | DB: mi_otra_base           |
 | `ssh-servidor-01`   | Python custom | 192.168.1.100              |
-| `obsidian`          | Python custom | Vault: ~/ObsidianVault     |
+| `obsidian`              | Python custom | Vault: ~/ObsidianVault     |
+| `lottiefiles-creator`   | npm oficial   | Creator + `~/.claude/mcp-servers/lottie/` |
 
 El servidor gcloud está en: `~/.claude/mcp-servers/gcloud/server.py`  
 El servidor postgres está en: `~/.claude/mcp-servers/postgres/server.py`  
 El servidor SSH está en: `~/.claude/mcp-servers/ssh/server.py`  
 El servidor Obsidian está en: `~/.claude/mcp-servers/obsidian/server.py`  
+Lottie: `~/.claude/mcp-servers/lottie/node_modules/@lottiefiles/creator-mcp/dist/index.mjs` (instalar con `scripts/install-lottie-mcp.sh`).  
 Ambas instancias gcloud usan el mismo binario con distintos `--project` y `--account`.  
-Ambas instancias postgres usan el mismo binario con distintos `--db`.
+Ambas instancias postgres usan el mismo binario con distintos `--db`.  
+En **Cursor**, Lottie y Obsidian suelen ir en `~/.cursor/mcp.json` (global). Ver `guides/mcp-lottie-creator.md` y `guides/cursor.md`.
 
 ## Quirk importante: VSCode Extension
 
@@ -75,6 +81,10 @@ El MCP `obsidian` expone el vault de Obsidian con estas herramientas:
 | `list_notes` | Listar archivos `.md` de una carpeta |
 | `delete_note` | Eliminar nota o carpeta entera |
 | `add_attachment` | Copiar imagen/PDF al vault y retornar sintaxis `![[filename]]` |
+
+### Animaciones Lottie en el vault
+
+Con `lottiefiles-creator` activo: exportar desde Creator → `add_attachment` con el `.json` / `.lottie` → referenciar en la nota con `![[archivo]]`. Detalle: `guides/mcp-lottie-creator.md` (sección «Uso con Obsidian»).
 
 ### Estructura del vault
 

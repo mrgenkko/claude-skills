@@ -10,7 +10,7 @@ Esta guía documenta la opción que usamos en el ecosistema Melquiades: **un sol
 
 | Alcance | Ruta | Cuándo usarla |
 |---------|------|----------------|
-| **Global (usuario)** | `~/.cursor/mcp.json` | Herramientas que quieres en **todos** los workspaces: gcloud, postgres, SSH, Obsidian, etc. |
+| **Global (usuario)** | `~/.cursor/mcp.json` | Herramientas que quieres en **todos** los workspaces: gcloud, postgres, SSH, Obsidian, Lottie, etc. |
 | **Por proyecto** | `<repo>/.cursor/mcp.json` | Solo si un repo necesita MCP distintos o argumentos distintos al resto. |
 
 En ambos casos el formato es el mismo: clave raíz `mcpServers` y un objeto por servidor.
@@ -74,6 +74,37 @@ Así el JSON se puede versionar sin contraseñas; las credenciales viven en el e
 
 ---
 
+## MCP npm: LottieFiles Creator
+
+Lottie no es Python: es un paquete Node instalado en `~/.claude/mcp-servers/lottie/`. En el global `~/.cursor/mcp.json`:
+
+```json
+"lottiefiles-creator": {
+  "type": "stdio",
+  "command": "/usr/bin/node",
+  "args": [
+    "${userHome}/.claude/mcp-servers/lottie/node_modules/@lottiefiles/creator-mcp/dist/index.mjs"
+  ],
+  "env": {}
+}
+```
+
+**Instalación previa** (una vez):
+
+```bash
+bash ~/Mrgenkko\ Skills/scripts/install-lottie-mcp.sh
+```
+
+Reglas específicas de Cursor:
+
+- **No** usar `"command": "npx"` — el Node de `.cursor-server` rompe el `prefix` de npm (`ENOENT` en `bin/lib`).
+- **No** poner el ejecutable en rutas con espacios en el campo `command` (p. ej. evitar `Mrgenkko Skills/scripts/...` como `command`; usar `node` + ruta bajo `~/.claude/`).
+- Tras instalar o cambiar versión: recargar ventana de Cursor.
+
+Guía completa (browser bridge, Obsidian, Claude Code): `guides/mcp-lottie-creator.md`.
+
+---
+
 ## Relación con Claude Code (VSCode)
 
 | Herramienta | Archivo de MCP |
@@ -89,7 +120,8 @@ Puedes mantener **las mismas** rutas a `server.py` y el mismo venv en ambos mund
 
 1. Asegúrate de que el venv tiene dependencias (`pip install -r requirements.txt` en `Mrgenkko Skills`).
 2. En Settings → MCP, revisa que el servidor no esté en error (ruta al Python, al script, permisos de clave, etc.).
-3. En el agente, una prueba típica con Obsidian: herramienta `get_context` y luego `search_notes` con un término corto en carpeta `wiki/`.
+3. **Obsidian**: `get_context` y luego `search_notes` en `wiki/`.
+4. **Lottie**: Creator abierto con MCP bridge en verde; en el agente, pedir listar escena o crear una forma simple (el servidor stdio debe estar conectado en Settings → MCP).
 
 ---
 
@@ -97,6 +129,7 @@ Puedes mantener **las mismas** rutas a `server.py` y el mismo venv en ambos mund
 
 - Plantilla de entradas MCP: `scripts/secrets.example.json` (convención de nombres y tipos).
 - Servidores desplegados: `deployed/*/server.py` (copia o symlink en `~/.claude/mcp-servers/`).
+- Lottie (npm): `scripts/install-lottie-mcp.sh`, `guides/mcp-lottie-creator.md`.
 - Otras guías por transporte/stack: `guides/mcp-gcloud.md`, `guides/mcp-databases.md`, `guides/mcp-ssh.md`, `guides/mcp-obsidian.md`.
 
 Documentación oficial de Cursor sobre MCP y rutas de configuración: [Cursor Docs — Model Context Protocol](https://cursor.com/docs/context/mcp).

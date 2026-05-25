@@ -3,7 +3,7 @@
 Registra MCPs en un proyecto de Claude Code (VSCode extension).
 
 Uso:
-    python3 "~/Skills/scripts/add-mcp-to-project.py" /ruta/al/proyecto
+    python3 "~/Skills/scripts/add-mcp-to-project.py" /ruta/al/proyecto [--update] [--only name1,name2,...]
 
 Por qué es necesario:
     La VSCode extension de Claude Code lee los MCPs por proyecto desde
@@ -95,15 +95,38 @@ def build_mcp_servers(servers_config: list) -> dict:
 
 def main():
     update_mode = "--update" in sys.argv
-    args_clean = [a for a in sys.argv[1:] if a != "--update"]
+    only_filter = None
+    args_clean = []
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if a == "--update":
+            pass
+        elif a == "--only":
+            i += 1
+            only_filter = {n.strip() for n in sys.argv[i].split(",") if n.strip()}
+        elif a.startswith("--only="):
+            only_filter = {n.strip() for n in a.split("=", 1)[1].split(",") if n.strip()}
+        else:
+            args_clean.append(a)
+        i += 1
 
     secrets = load_secrets()
     MCP_SERVERS = build_mcp_servers(secrets["mcp_servers"])
 
+    if only_filter is not None:
+        missing = only_filter - MCP_SERVERS.keys()
+        if missing:
+            print(f"ERROR: MCPs no encontrados en secrets.json: {', '.join(sorted(missing))}")
+            print(f"Disponibles: {', '.join(sorted(MCP_SERVERS.keys()))}")
+            sys.exit(1)
+        MCP_SERVERS = {k: v for k, v in MCP_SERVERS.items() if k in only_filter}
+
     if not args_clean:
-        print("Uso: python3 add-mcp-to-project.py /ruta/absoluta/al/proyecto [--update]")
+        print("Uso: python3 add-mcp-to-project.py /ruta/absoluta/al/proyecto [--update] [--only name1,name2,...]")
         print()
-        print("  --update  sobreescribe entradas existentes con los valores de secrets.json")
+        print("  --update          sobreescribe entradas existentes con los valores de secrets.json")
+        print("  --only A,B,C      registra solo esos MCPs (por defecto: todos los de secrets.json)")
         print()
         print("Proyectos disponibles en ~/.claude.json:")
         with open(CLAUDE_JSON) as f:
