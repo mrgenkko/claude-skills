@@ -105,6 +105,38 @@ Guía completa (browser bridge, Obsidian, Claude Code): `guides/mcp-lottie-creat
 
 ---
 
+## MCP oficial: Blender Lab
+
+Blender Lab publica un MCP oficial para Blender con dos piezas:
+
+- un add-on / extensión dentro de Blender
+- un servidor MCP local que el cliente arranca por `stdio`
+
+Si usas configuración JSON explícita en Cursor, la entrada luce así:
+
+```json
+"blender": {
+  "type": "stdio",
+  "command": "/ruta/absoluta/al/blender-mcp",
+  "args": [],
+  "env": {
+    "BLENDER_HOST": "localhost",
+    "BLENDER_PORT": "9876"
+  }
+}
+```
+
+Notas importantes:
+
+- usar una **instalación conocida del servidor oficial** de Blender Lab
+- no asumir que `uvx blender-mcp` apunta al proyecto oficial: hay forks comunitarios con nombres parecidos
+- `BLENDER_HOST` y `BLENDER_PORT` deben coincidir con el add-on dentro de Blender
+- si Blender corre en Windows y Cursor en WSL, `localhost` no cruza namespaces; en ese caso expón el add-on en Blender y apunta `BLENDER_HOST` a la IP del host Windows
+
+Guía completa: `guides/mcp-blender.md`.
+
+---
+
 ## Relación con Claude Code (VSCode)
 
 | Herramienta | Archivo de MCP |
@@ -130,6 +162,7 @@ Puedes mantener **las mismas** rutas a `server.py` y el mismo venv en ambos mund
 - Plantilla de entradas MCP: `scripts/secrets.example.json` (convención de nombres y tipos).
 - Servidores desplegados: `deployed/*/server.py` (copia o symlink en `~/.claude/mcp-servers/`).
 - Lottie (npm): `scripts/install-lottie-mcp.sh`, `guides/mcp-lottie-creator.md`.
+- Blender Lab oficial: `guides/mcp-blender.md`.
 - Otras guías por transporte/stack: `guides/mcp-gcloud.md`, `guides/mcp-databases.md`, `guides/mcp-ssh.md`, `guides/mcp-obsidian.md`.
 
 Documentación oficial de Cursor sobre MCP y rutas de configuración: [Cursor Docs — Model Context Protocol](https://cursor.com/docs/context/mcp).

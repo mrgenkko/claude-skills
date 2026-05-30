@@ -2,7 +2,7 @@
 
 Repositorio de herramientas, guías y servidores MCP para Claude Code, orientado a mejorar la experiencia de trabajo en la extensión VSCode.
 
-Incluye servidores MCP para conectar Claude a bases de datos PostgreSQL, proyectos de Google Cloud, servidores SSH, vaults de Obsidian y LottieFiles Creator, junto con scripts para registrarlos en cada proyecto de trabajo.
+Incluye servidores MCP para conectar Claude a bases de datos PostgreSQL, proyectos de Google Cloud, servidores SSH, vaults de Obsidian, LottieFiles Creator y Blender, junto con scripts y guías para registrarlos en cada proyecto de trabajo.
 
 **Cuándo ejecutar `add-mcp-to-project.py`:**  
 Una vez por proyecto de VSCode que quieras que tenga acceso a los MCPs. No hace falta repetirlo a menos que cambies credenciales (usa `--update`) o agregues un proyecto nuevo. Los proyectos que no lo tengan registrado simplemente no verán los MCPs.
@@ -24,6 +24,7 @@ Mrgenkko Skills/
 ├── guides/
 │   ├── cursor.md               ← MCP en Cursor IDE (~/.cursor/mcp.json, global)
 │   ├── mcp-databases.md        ← cómo crear MCPs de bases de datos
+│   ├── mcp-blender.md          ← Blender Lab oficial (add-on + servidor MCP)
 │   ├── mcp-gcloud.md           ← cómo crear MCPs para Google Cloud
 │   ├── mcp-lottie-creator.md   ← LottieFiles Creator (npm + browser bridge)
 │   ├── mcp-obsidian.md         ← MCP vault Obsidian
@@ -156,6 +157,21 @@ Paquete `@lottiefiles/creator-mcp` instalado en `~/.claude/mcp-servers/lottie/`.
 
 Instalación: `bash scripts/install-lottie-mcp.sh`
 
+### blender (Blender Lab oficial)
+
+MCP oficial de Blender Lab para conectar un cliente MCP con una sesión local de Blender.
+Usa un add-on dentro de Blender y un servidor MCP local que se comunica por `stdio` hacia el cliente y por TCP hacia Blender.
+
+No va en `secrets.json` ni en `add-mcp-to-project.py`; se registra manualmente porque depende del artefacto oficial instalado (`.mcpb` o ejecutable local `blender-mcp`).
+
+| Contexto | Configuración |
+|----------|----------------|
+| **Cursor** (todos los workspaces o por proyecto) | `~/.cursor/mcp.json` o importación del bundle oficial `.mcpb` |
+| **Claude Code VSCode** | `~/.claude.json` por proyecto |
+| **Blender** | add-on / extensión oficial de Blender Lab con host y puerto configurados |
+
+Guía completa: `guides/mcp-blender.md`
+
 ---
 
 ## Archivos MCP en el sistema
@@ -165,7 +181,7 @@ La configuración por proyecto se guarda en `~/.claude.json` (también fuera del
 
 ```
 ~/                              ← home directory
-├── .cursor/mcp.json            ← MCPs globales de Cursor IDE (gcloud, postgres, obsidian, lottie, …)
+├── .cursor/mcp.json            ← MCPs globales de Cursor IDE (gcloud, postgres, obsidian, lottie, blender, …)
 ├── .claude.json                ← config global de Claude Code (VSCode): MCPs por proyecto
 └── .claude/
     └── mcp-servers/
@@ -173,5 +189,6 @@ La configuración por proyecto se guarda en `~/.claude.json` (también fuera del
         ├── postgres/server.py  ← servidor postgres activo
         ├── ssh/server.py       ← servidor SSH activo
         ├── obsidian/server.py  ← servidor Obsidian activo
-        └── lottie/             ← npm: @lottiefiles/creator-mcp (node_modules/…/dist/index.mjs)
+        ├── lottie/             ← npm: @lottiefiles/creator-mcp (node_modules/…/dist/index.mjs)
+        └── blender/            ← instalación local del servidor MCP oficial (si usas stdio en vez de `.mcpb`)
 ```
