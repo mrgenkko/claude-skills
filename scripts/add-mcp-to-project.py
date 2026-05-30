@@ -42,6 +42,7 @@ def build_mcp_servers(servers_config: list) -> dict:
     for entry in servers_config:
         name = entry["name"]
         kind = entry["type"]
+        env = {}
 
         if kind == "gcloud":
             args = [
@@ -53,6 +54,10 @@ def build_mcp_servers(servers_config: list) -> dict:
             ]
             if entry.get("key_file"):
                 args.append(f"--key-file={entry['key_file']}")
+            # Aislamiento multi-cuenta: cada MCP gcloud usa su propio ~/.config/gcloud
+            # para que la cuenta activa no derive entre instancias (ej. dev vs prod).
+            if entry.get("config_dir"):
+                env["CLOUDSDK_CONFIG"] = os.path.expanduser(entry["config_dir"])
 
         elif kind == "postgres":
             args = [
@@ -88,7 +93,7 @@ def build_mcp_servers(servers_config: list) -> dict:
             print(f"WARN: tipo desconocido '{kind}' para '{name}', ignorando.")
             continue
 
-        result[name] = {"type": "stdio", "command": VENV_PYTHON, "args": args, "env": {}}
+        result[name] = {"type": "stdio", "command": VENV_PYTHON, "args": args, "env": env}
 
     return result
 

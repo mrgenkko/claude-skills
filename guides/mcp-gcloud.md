@@ -29,6 +29,52 @@ El mismo binario (`server.py`) sirve para múltiples proyectos — se diferencia
 
 Si se pasan `--account` y `--key-file`, el servidor activa la cuenta automáticamente al arrancar.
 
+### Aislamiento multi-cuenta con `CLOUDSDK_CONFIG`
+
+Todos los MCPs de gcloud comparten por defecto `~/.config/gcloud` (mismas credenciales,
+misma "cuenta activa"). Cuando hay **dos instancias del mismo proyecto/producto** —típico
+dev vs prod— la cuenta activa puede derivar entre invocaciones y `bq_query` / `shell` (que
+no aceptan `--account`) terminan ejecutándose con la SA equivocada. Detalle completo del
+problema en la wiki del vault: `wiki/herramientas/mcps/mcp-gcloud.md`.
+
+Solución: dar a cada MCP su propio `~/.config/gcloud` vía la variable de entorno
+`CLOUDSDK_CONFIG`. En `secrets.json` se declara con el campo `config_dir`; el script
+`add-mcp-to-project.py` lo inyecta como `env.CLOUDSDK_CONFIG` en `~/.claude.json`.
+
+```json
+{
+  "name": "gcloud-mi-proyecto-prod",
+  "type": "gcloud",
+  "project": "mi-proyecto-prod",
+  "region": "us-east4",
+  "workdir": "/home/melquiades/mi-proyecto",
+  "account": "sa-prod@mi-proyecto-prod.iam.gserviceaccount.com",
+  "key_file": "/home/melquiades/keys/mi-proyecto-prod/sa-prod.json",
+  "config_dir": "/home/melquiades/.config/gcloud-mi-proyecto-prod"
+}
+```
+
+Cada `config_dir` debe inicializarse **una vez** activando su SA:
+
+```bash
+mkdir -p ~/.config/gcloud-mi-proyecto-prod
+CLOUDSDK_CONFIG=~/.config/gcloud-mi-proyecto-prod \
+  gcloud auth activate-service-account sa-prod@mi-proyecto-prod.iam.gserviceaccount.com \
+  --key-file=~/keys/mi-proyecto-prod/sa-prod.json
+```
+
+### Patrón dev/prod separado: ejemplo gz
+
+| MCP             | Proyecto GCP      | Service Account                                  | config_dir                      |
+|-----------------|-------------------|--------------------------------------------------|---------------------------------|
+| `gcloud-gz-dev` | `gz-procurement`  | `gz-procurement-sa@gz-procurement.iam...`        | `~/.config/gcloud-gz-dev`       |
+| `gcloud-gz-prod`| `ai-ptt-497912`   | `gz-prod-mcp@ai-ptt-497912.iam...`               | `~/.config/gcloud-gz-prod`      |
+
+Son cuentas/organizaciones distintas: dev es de Lait (`juandelgado@lait.com.co` como humano),
+prod es de Grupo Zambrano. El MCP **nunca usa la cuenta humana** — solo la key de su SA. La
+SA de prod se crea desde la consola web de GCP (logueado como Grupo Zambrano) y se descarga su
+JSON; no hace falta loguear esa cuenta humana en el `gcloud` CLI local.
+
 ## Instalar en un proyecto nuevo
 
 ### 1. Copiar el servidor
@@ -95,7 +141,18 @@ python3 "~/Mrgenkko Skills/scripts/add-mcp-to-project.py" /ruta/al/proyecto
 
 - `roles/run.viewer` — ver servicios Cloud Run
 - `roles/logging.viewer` — leer logs
-- `roles/secretmanager.secretAccessor` — leer secrets
+- `roles/secretmanager.secretAccessor` — leer el valor de un secret por nombre (`secret_get`)
+- `roles/secretmanager.viewer` — **listar** secrets (`secret_list`); `secretAccessor` solo no alcanza para listar
+- `roles/bigquery.jobUser` — ejecutar `bq_query`
+
+Además, el proyecto necesita las APIs habilitadas (proyecto nuevo no las trae):
+
+```bash
+gcloud services enable \
+  run.googleapis.com secretmanager.googleapis.com logging.googleapis.com \
+  bigquery.googleapis.com cloudresourcemanager.googleapis.com \
+  --project=<proyecto>
+```
 
 ### Añadir el servidor al script `scripts/add-mcp-to-project.py`
 
