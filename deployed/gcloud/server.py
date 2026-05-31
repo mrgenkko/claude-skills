@@ -22,11 +22,15 @@ WORKDIR = args.workdir
 ACCOUNT = args.account
 KEY_FILE = args.key_file
 
-# Activar service account si se provee key file
+# Activar service account si se provee key file.
+# stdin=DEVNULL: nunca heredar el stdin del proceso MCP (es el canal JSON-RPC del
+# protocolo stdio). Si un subprocess lo hereda, puede colgarse esperando un prompt
+# interactivo de gcloud (ej. "API no habilitada, ¿enable? (y/N)") o robar bytes del
+# protocolo — ambos casos producen timeouts en la app.
 if KEY_FILE and ACCOUNT:
     subprocess.run(
         ["gcloud", "auth", "activate-service-account", ACCOUNT, f"--key-file={KEY_FILE}"],
-        capture_output=True,
+        capture_output=True, stdin=subprocess.DEVNULL,
     )
 
 app = Server(f"gcloud-{PROJECT}")
@@ -36,10 +40,23 @@ def _account_flags() -> list:
     return [f"--account={ACCOUNT}"] if ACCOUNT else []
 
 
-def _run(cmd: list | str, shell: bool = False, timeout: int = 30) -> str:
+TIMEOUT_DEFAULT = 30
+TIMEOUT_MAX = 300
+
+
+def _clamp_timeout(value) -> int:
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return TIMEOUT_DEFAULT
+    return max(1, min(value, TIMEOUT_MAX))
+
+
+def _run(cmd: list | str, shell: bool = False, timeout: int = TIMEOUT_DEFAULT) -> str:
     try:
         result = subprocess.run(
-            cmd, shell=shell, capture_output=True, text=True, cwd=WORKDIR, timeout=timeout
+            cmd, shell=shell, capture_output=True, text=True, cwd=WORKDIR,
+            timeout=timeout, stdin=subprocess.DEVNULL
         )
     except subprocess.TimeoutExpired:
         return f"[timeout] El comando tardó más de {timeout}s y fue cancelado."
@@ -55,7 +72,8 @@ def _bq_query(sql: str, project: str, timeout: int = 120) -> str:
         result = subprocess.run(
             ["bq", "query", f"--project_id={project}", "--use_legacy_sql=false",
              "--headless", "--format=prettyjson", sql],
-            capture_output=True, text=True, cwd=WORKDIR, timeout=timeout
+            capture_output=True, text=True, cwd=WORKDIR, timeout=timeout,
+            stdin=subprocess.DEVNULL
         )
     except subprocess.TimeoutExpired:
         return f"[timeout] La query de BigQuery tardó más de {timeout}s y fue cancelada."
@@ -79,7 +97,11 @@ async def list_tools() -> list[types.Tool]:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": 'Ej: ["run", "services", "list", "--region=us-east4"]',
-                    }
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": f"Timeout en segundos (default {TIMEOUT_DEFAULT}, máx {TIMEOUT_MAX}). Subirlo solo para lecturas largas; para mutaciones preferir comandos individuales.",
+                    },
                 },
                 "required": ["args"],
             },
@@ -125,7 +147,11 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "Ej: gsutil ls gs://gz-procurement-files"}
+                    "command": {"type": "string", "description": "Ej: gsutil ls gs://gz-procurement-files"},
+                    "timeout": {
+                        "type": "integer",
+                        "description": f"Timeout en segundos (default {TIMEOUT_DEFAULT}, máx {TIMEOUT_MAX}). Subirlo solo para lecturas largas; para mutaciones preferir comandos individuales.",
+                    },
                 },
                 "required": ["command"],
             },
@@ -150,7 +176,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     account_flags = _account_flags()
 
     if name == "gcloud":
-        output = _run(["gcloud"] + account_flags + arguments["args"])
+        output = _run(["gcloud"] + account_flags + arguments["args"],
+                      timeout=_clamp_timeout(arguments.get("timeout", TIMEOUT_DEFAULT)))
 
     elif name == "cloud_run_status":
         output = _run([
@@ -188,7 +215,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         ] + account_flags)
 
     elif name == "shell":
-        output = _run(arguments["command"], shell=True)
+        output = _run(arguments["command"], shell=True,
+                      timeout=_clamp_timeout(arguments.get("timeout", TIMEOUT_DEFAULT)))
 
     elif name == "bq_query":
         project_id = arguments.get("project_id", PROJECT)

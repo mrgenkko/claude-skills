@@ -94,6 +94,10 @@ def build_mcp_servers(servers_config: list) -> dict:
             continue
 
         result[name] = {"type": "stdio", "command": VENV_PYTHON, "args": args, "env": env}
+        # timeout por servidor (ms) del lado cliente — debe ser >= que el timeout máx
+        # interno del server para que gane su mensaje "[timeout]" en vez del corte seco.
+        if entry.get("timeout_ms"):
+            result[name]["timeout"] = entry["timeout_ms"]
 
     return result
 

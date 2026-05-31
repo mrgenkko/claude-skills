@@ -176,6 +176,30 @@ Agregar una entrada en `MCP_SERVERS`:
 
 ---
 
+## Timeouts: comandos largos vs cuelgues
+
+Los tools `gcloud` y `shell` aceptan un parámetro opcional `timeout` (segundos, default
+`30`, máx `300`). Subirlo solo para **lecturas** largas (queries, exports, listados
+grandes). Ejemplo: `shell(command="gsutil -m ls -r gs://bucket/**", timeout=180)`.
+
+Dos límites actúan en serie — el efectivo es el menor:
+
+1. **Server (`server.py`)**: el `timeout` del tool, clamp `1–300s`. Al vencer devuelve
+   `[timeout] El comando tardó más de Ns…`.
+2. **Cliente (extensión VSCode)**: campo `timeout` por servidor en `~/.claude.json`
+   (en **ms**), o variable de entorno `MCP_TOOL_TIMEOUT` (ms). Es un corte hard.
+
+Por eso el campo cliente se fija en `320000` (320s), **por encima** del tope del server
+(300s): así ante un comando largo gana el mensaje limpio del server y no el corte seco del
+cliente. En `secrets.json` se declara con `timeout_ms`; `add-mcp-to-project.py` lo emite
+como el campo `timeout` de la entrada del MCP.
+
+> **Mutaciones (IAM bindings, deploys en lote): NO usar loops largos en un solo `shell`.**
+> Cada `add-iam-policy-binding` es un read-modify-write completo de la IAM policy; varios
+> seguidos agotan el tiempo y, si se cortan a la mitad, dejan **estado parcial** difícil de
+> diagnosticar. Preferir comandos **individuales e idempotentes** — el timeout largo es para
+> lecturas, no para encadenar mutaciones.
+
 ## Extender el servidor con nuevas tools
 
 Editar `deployed/gcloud/server.py` (o el original en `~/.claude/mcp-servers/gcloud/server.py`).
