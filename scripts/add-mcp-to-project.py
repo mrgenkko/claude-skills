@@ -104,12 +104,13 @@ def build_mcp_servers(servers_config: list) -> dict:
 
 def main():
     update_mode = "--update" in sys.argv
+    remove_mode = "--remove" in sys.argv
     only_filter = None
     args_clean = []
     i = 1
     while i < len(sys.argv):
         a = sys.argv[i]
-        if a == "--update":
+        if a in ("--update", "--remove"):
             pass
         elif a == "--only":
             i += 1
@@ -123,7 +124,7 @@ def main():
     secrets = load_secrets()
     MCP_SERVERS = build_mcp_servers(secrets["mcp_servers"])
 
-    if only_filter is not None:
+    if only_filter is not None and not remove_mode:
         missing = only_filter - MCP_SERVERS.keys()
         if missing:
             print(f"ERROR: MCPs no encontrados en secrets.json: {', '.join(sorted(missing))}")
@@ -132,10 +133,11 @@ def main():
         MCP_SERVERS = {k: v for k, v in MCP_SERVERS.items() if k in only_filter}
 
     if not args_clean:
-        print("Uso: python3 add-mcp-to-project.py /ruta/absoluta/al/proyecto [--update] [--only name1,name2,...]")
+        print("Uso: python3 add-mcp-to-project.py /ruta/absoluta/al/proyecto [--update|--remove] [--only name1,name2,...]")
         print()
         print("  --update          sobreescribe entradas existentes con los valores de secrets.json")
-        print("  --only A,B,C      registra solo esos MCPs (por defecto: todos los de secrets.json)")
+        print("  --remove          elimina los MCPs del proyecto (usar con --only para especificar cuáles)")
+        print("  --only A,B,C      aplica la operación solo a esos MCPs")
         print()
         print("Proyectos disponibles en ~/.claude.json:")
         with open(CLAUDE_JSON) as f:
@@ -167,6 +169,28 @@ def main():
         }
 
     existing = d["projects"][project_path].get("mcpServers", {})
+
+    if remove_mode:
+        to_remove = only_filter if only_filter else set(existing.keys())
+        removed, not_found = [], []
+        for name in sorted(to_remove):
+            if name in existing:
+                del existing[name]
+                removed.append(name)
+            else:
+                not_found.append(name)
+        d["projects"][project_path]["mcpServers"] = existing
+        with open(CLAUDE_JSON, "w") as f:
+            json.dump(d, f, indent=2)
+        print(f"Proyecto: {project_path}")
+        if removed:
+            print(f"  Eliminados  : {', '.join(removed)}")
+        if not_found:
+            print(f"  No existían : {', '.join(not_found)}")
+        print()
+        print("Reinicia Claude Code (VSCode) para que apliquen los cambios.")
+        return
+
     added, updated, skipped = [], [], []
 
     for name, config in MCP_SERVERS.items():
