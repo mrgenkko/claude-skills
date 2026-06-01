@@ -9,7 +9,7 @@ El vault puede contener symlinks a directorios externos (como la memoria de Clau
 
 | Tool           | Descripción                                                   |
 |----------------|---------------------------------------------------------------|
-| `get_context`  | Lee `CONTEXT.md` del vault: convenciones y estructura         |
+| `get_context`  | Lee `wiki/CONTEXT.md` (convenciones globales); con `org="<org>"` añade el portal de la org |
 | `read_note`    | Lee el contenido de una nota (path relativo al vault)         |
 | `write_note`   | Crea o reemplaza una nota completa                            |
 | `append_note`  | Agrega contenido al final de una nota existente               |
@@ -53,7 +53,7 @@ source ~/.bashrc
 ```bash
 # Carpeta raíz del vault
 mkdir -p ~/ObsidianVault/claude-memory
-mkdir -p ~/ObsidianVault/templates
+mkdir -p ~/ObsidianVault/wiki/templates
 
 # Symlinks a la memoria de Claude por proyecto
 ln -sfn ~/.claude/projects/-home-TU_USUARIO-mi-proyecto/memory \
@@ -111,7 +111,7 @@ En una sesión de Claude Code con el proyecto registrado:
 Llama get_context y luego list_notes
 ```
 
-`get_context` debe devolver el contenido de `CONTEXT.md`. `list_notes` debe listar todos los `.md` del vault incluyendo los que están dentro de los symlinks.
+`get_context` debe devolver el contenido de `wiki/CONTEXT.md`. `list_notes` debe listar todos los `.md` del vault incluyendo los que están dentro de los symlinks.
 
 ---
 
@@ -120,34 +120,37 @@ Llama get_context y luego list_notes
 No hay una estructura obligatoria — el servidor opera sobre cualquier carpeta. La siguiente es una referencia para proyectos con múltiples equipos o empresas:
 
 ```
-ObsidianVault/
-├── CONTEXT.md              ← convenciones del vault (lo lee get_context)
-├── templates/
-│   └── adr.md              ← plantilla ADR reutilizable
-├── claude-memory/          ← symlinks a ~/.claude/projects/*/memory/
-│   └── mi-proyecto/        ← memoria automática de Claude (no editar)
-├── ecosistema/             ← infra y decisiones transversales
-│   ├── infraestructura.md
-│   ├── comunicacion.md
-│   └── decisiones/
-├── empresa-a/
-│   ├── index.md            ← portal: links a todos los proyectos
+ObsidianVault/                   ← contenedor (no es repo Git)
+├── wiki/                       ← repo vault-wiki (transversal)
+│   ├── CONTEXT.md              ← convenciones globales (lo lee get_context)
+│   ├── index.md
+│   └── templates/
+│       └── adr.md              ← plantilla ADR reutilizable
+├── claude-memory/              ← symlinks a ~/.claude/projects/*/memory/
+│   └── mi-proyecto/            ← memoria automática de Claude (no editar)
+├── empresa-a/                  ← repo por organización
+│   ├── CONTEXT.md              ← portal de la org (get_context org="empresa-a")
+│   ├── index.md                ← links a todos los proyectos
+│   ├── ecosistema/             ← infra propia de la org
+│   │   ├── infraestructura.md
+│   │   └── comunicacion.md
 │   └── proyectos/
 │       └── servicio-x/
-│           ├── index.md    ← hub del proyecto (conecta todo en el grafo)
+│           ├── index.md        ← hub del proyecto (conecta todo en el grafo)
 │           ├── arquitectura.md
 │           └── decisiones/
 │               └── 001-mi-decision.md
 └── empresa-b/
+    ├── CONTEXT.md
     ├── index.md
     └── proyectos/
 ```
 
 ### Claves de la estructura
 
-**`CONTEXT.md`** — Claude lo lee via `get_context` antes de escribir cualquier nota. Define dónde va cada tipo de contenido. Es el nodo raíz del grafo de Obsidian: debe tener `[[links]]` a todos los índices principales.
+**`wiki/CONTEXT.md`** — Claude lo lee via `get_context` antes de escribir cualquier nota. Define dónde va cada tipo de contenido (convenciones globales). Con `org="<org>"` el tool además concatena el portal `<org>/CONTEXT.md`. Debe tener `[[links]]` a los índices principales (incl. `wiki/index`) para no quedar como isla en el grafo.
 
-**`templates/`** — Plantillas reutilizables. Una sola por tipo (ej: `adr.md`), no una por proyecto. Evita nodos flotantes en el grafo.
+**`wiki/templates/`** — Plantillas reutilizables transversales. Una sola por tipo (ej: `adr.md`), no una por proyecto. Evita nodos flotantes en el grafo.
 
 **`<empresa>/index.md`** — Lista todos los proyectos de esa empresa con `[[wikilinks]]`. Conecta el grafo verticalmente.
 

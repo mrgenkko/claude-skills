@@ -73,7 +73,7 @@ El MCP `obsidian` expone el vault de Obsidian con estas herramientas:
 
 | Tool | Uso |
 |---|---|
-| `get_context` | Leer `CONTEXT.md` — llamar siempre antes de crear o buscar notas |
+| `get_context` | Leer `wiki/CONTEXT.md` (convenciones globales); con `org="<org>"` añade el portal de la org — llamar siempre antes de crear o buscar notas |
 | `read_note` | Leer una nota por path relativo al vault |
 | `write_note` | Crear o reemplazar una nota completa |
 | `append_note` | Agregar contenido al final de una nota existente |
@@ -89,9 +89,10 @@ Con `lottiefiles-creator` activo: exportar desde Creator → `add_attachment` co
 ### Estructura del vault
 
 ```
-~/ObsidianVault/
-├── CONTEXT.md          ← convenciones del vault (leer con get_context)
-├── wiki/               ← wiki de conocimiento acumulativo
+~/ObsidianVault/         ← contenedor (no es repo Git)
+├── wiki/               ← repo vault-wiki: conocimiento acumulativo
+│   ├── CONTEXT.md      ← convenciones globales (leer con get_context)
+│   ├── templates/      ← plantillas transversales (ADR, documentación)
 │   ├── index.md        ← catálogo maestro por categoría
 │   ├── log.md          ← registro append-only de ingestas y queries
 │   ├── schema.md       ← convenciones, plantilla de página y protocolos
@@ -101,9 +102,9 @@ Con `lottiefiles-creator` activo: exportar desde Creator → `add_attachment` co
 │   ├── patrones/
 │   └── attachments/    ← imágenes y PDFs (![[filename]])
 ├── claude-memory/      ← symlinks a memorias de proyecto (no editar)
-├── ecosistema/         ← infra compartida entre organizaciones
-├── <org>/              ← una carpeta por organización
-└── templates/
+└── <org>/              ← una carpeta (repo) por organización
+    ├── CONTEXT.md      ← portal de la org (get_context org="<org>")
+    └── ecosistema/     ← infra propia de la org
 ```
 
 ## Wiki de Conocimiento
