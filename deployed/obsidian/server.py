@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from mcp.server import Server
@@ -70,6 +71,37 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="edit_note",
+            description=(
+                "Edición quirúrgica de una nota: reemplaza una ocurrencia exacta de "
+                "'old_string' por 'new_string', sin reescribir el resto del documento. "
+                "Para insertar, usa un ancla en old_string y repítela en new_string seguida "
+                "del texto nuevo. Para eliminar, deja new_string vacío. Por defecto exige que "
+                "old_string aparezca exactamente una vez (incluye contexto suficiente para que "
+                "sea único); usa replace_all=true para reemplazar todas las ocurrencias."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path relativo al vault"},
+                    "old_string": {
+                        "type": "string",
+                        "description": "Texto exacto a buscar (debe coincidir tal cual, con indentación y saltos de línea)",
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Texto de reemplazo (vacío para eliminar old_string)",
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Reemplaza todas las ocurrencias en vez de exigir match único",
+                        "default": False,
+                    },
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        ),
+        types.Tool(
             name="search_notes",
             description="Busca notas por contenido con grep recursivo en el vault.",
             inputSchema={
@@ -101,8 +133,16 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_context",
-            description="Devuelve las convenciones del vault: estructura de carpetas, cuándo usar arquitectura/ vs decisiones/, formatos de notas. Llamar siempre antes de crear o buscar notas.",
-            inputSchema={"type": "object", "properties": {}},
+            description="Devuelve las convenciones globales del vault (wiki/CONTEXT.md): estructura de carpetas, cuándo usar arquitectura/ vs decisiones/, topología de islas, formatos de notas. Llamar siempre antes de crear o buscar notas. Si se pasa 'org', concatena además el portal de esa organización (<org>/CONTEXT.md).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "org": {
+                        "type": "string",
+                        "description": "Organización cuyo portal concatenar al final (ej: melquiades, lait). Opcional.",
+                    },
+                },
+            },
         ),
         types.Tool(
             name="delete_note",
@@ -116,6 +156,29 @@ async def list_tools() -> list[types.Tool]:
                     },
                 },
                 "required": ["path"],
+            },
+        ),
+        types.Tool(
+            name="add_attachment",
+            description="Copia un archivo binario (imagen, PDF, etc.) al vault para referenciarlo desde notas. Retorna la sintaxis Obsidian para insertar en una nota.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source_path": {
+                        "type": "string",
+                        "description": "Ruta absoluta al archivo en el sistema de archivos",
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Nombre con el que se guardará en el vault (ej: karpathy-wiki-diagram.png)",
+                    },
+                    "folder": {
+                        "type": "string",
+                        "description": "Carpeta destino relativa al vault (por defecto: wiki/attachments)",
+                        "default": "wiki/attachments",
+                    },
+                },
+                "required": ["source_path", "filename"],
             },
         ),
     ]
@@ -141,6 +204,37 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             with open(p, "a", encoding="utf-8") as f:
                 f.write("\n" + arguments["content"])
             output = f"Contenido agregado a: {arguments['path']}"
+
+        elif name == "edit_note":
+            p = _ensure_md(_resolve(arguments["path"]))
+            if not p.exists():
+                raise FileNotFoundError(f"La nota no existe: {arguments['path']}")
+            old = arguments["old_string"]
+            new = arguments["new_string"]
+            if not old:
+                raise ValueError("old_string no puede estar vacío.")
+            if old == new:
+                raise ValueError("old_string y new_string son idénticos: nada que cambiar.")
+            text = p.read_text(encoding="utf-8")
+            count = text.count(old)
+            if count == 0:
+                raise ValueError(
+                    "old_string no se encontró en la nota (debe coincidir exactamente, "
+                    "incluyendo indentación y saltos de línea)."
+                )
+            if arguments.get("replace_all"):
+                text = text.replace(old, new)
+                p.write_text(text, encoding="utf-8")
+                output = f"Reemplazadas {count} ocurrencia(s) en: {arguments['path']}"
+            else:
+                if count > 1:
+                    raise ValueError(
+                        f"old_string aparece {count} veces; agrega más contexto para que sea "
+                        "único o usa replace_all=true."
+                    )
+                text = text.replace(old, new, 1)
+                p.write_text(text, encoding="utf-8")
+                output = f"Nota editada: {arguments['path']}"
 
         elif name == "search_notes":
             folder = arguments.get("folder") or ""
@@ -189,11 +283,33 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 output = f"Nota eliminada: {arguments['path']}"
 
         elif name == "get_context":
-            context_file = VAULT / "CONTEXT.md"
+            context_file = VAULT / "wiki" / "CONTEXT.md"
             if context_file.exists():
                 output = context_file.read_text(encoding="utf-8")
             else:
-                output = "CONTEXT.md no encontrado en la raíz del vault."
+                output = "wiki/CONTEXT.md no encontrado en el vault."
+            org = (arguments.get("org") or "").strip().strip("/")
+            if org:
+                org_file = VAULT / org / "CONTEXT.md"
+                if org_file.exists():
+                    output += "\n\n---\n\n" + org_file.read_text(encoding="utf-8")
+                else:
+                    output += f"\n\n---\n\n(Portal {org}/CONTEXT.md no encontrado.)"
+
+        elif name == "add_attachment":
+            src = Path(arguments["source_path"]).expanduser().resolve()
+            if not src.exists():
+                raise FileNotFoundError(f"Archivo no encontrado: {arguments['source_path']}")
+            if not src.is_file():
+                raise ValueError(f"El path no es un archivo: {arguments['source_path']}")
+            folder = arguments.get("folder") or "wiki/attachments"
+            dest_dir = (VAULT / folder.lstrip("/")).resolve()
+            dest_dir.relative_to(VAULT)  # seguridad: debe estar dentro del vault
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / arguments["filename"]
+            shutil.copy2(src, dest)
+            rel = os.path.relpath(dest, VAULT)
+            output = f"Attachment guardado: {rel}\nInsertar en nota: ![[{arguments['filename']}]]"
 
         else:
             output = f"Tool desconocido: {name}"

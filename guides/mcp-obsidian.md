@@ -13,9 +13,22 @@ El vault puede contener symlinks a directorios externos (como la memoria de Clau
 | `read_note`    | Lee el contenido de una nota (path relativo al vault)         |
 | `write_note`   | Crea o reemplaza una nota completa                            |
 | `append_note`  | Agrega contenido al final de una nota existente               |
+| `edit_note`    | Edición quirúrgica por `old_string`/`new_string` (str_replace); no reescribe todo |
 | `delete_note`  | Elimina una nota o carpeta entera (recursivo)                 |
 | `search_notes` | Busca notas por contenido (grep recursivo, sigue symlinks)    |
 | `list_notes`   | Lista archivos `.md` de una carpeta del vault (recursivo)     |
+| `add_attachment` | Copia un binario (imagen/PDF) al vault y retorna el wikilink |
+
+### `edit_note` — cuándo usarla
+
+Reemplaza una ocurrencia exacta de `old_string` por `new_string` sin reescribir la nota
+completa. Es la herramienta correcta para modificar contenido **en medio** del documento y
+ahorra tokens frente a `write_note` (que obliga a reconstruir todo el archivo).
+
+- **Modificar:** `old_string` = texto actual, `new_string` = texto nuevo.
+- **Insertar:** usa una línea ancla como `old_string` y repítela en `new_string` seguida del texto a insertar.
+- **Eliminar:** deja `new_string` vacío.
+- Por defecto exige que `old_string` aparezca **exactamente una vez** (incluye contexto suficiente para que sea único). Usa `replace_all=true` para reemplazar todas las ocurrencias.
 
 ## Argumentos del servidor
 
