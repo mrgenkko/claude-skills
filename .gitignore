@@ -8,7 +8,8 @@ __pycache__/
 scripts/secrets.json
 
 # Contexto personal de Claude (usa CLAUDE.example.md como plantilla)
-.claude/
+.claude/settings.json
+.claude/settings.local.json
 CLAUDE.md
 pendientes/
 
