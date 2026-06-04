@@ -82,6 +82,8 @@ def build_mcp_servers(servers_config: list) -> dict:
                 args.append(f"--key-file={entry['key_file']}")
             elif entry.get("password"):
                 args.append(f"--password={entry['password']}")
+            if entry.get("sudo_password"):
+                args.append(f"--sudo-password={entry['sudo_password']}")
 
         elif kind == "obsidian":
             args = [

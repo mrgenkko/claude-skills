@@ -16,16 +16,34 @@ El mismo binario (`server.py`) sirve para múltiples servidores — se diferenci
 
 ## Argumentos del servidor
 
-| Argumento     | Requerido | Descripción                                        |
-|---------------|-----------|----------------------------------------------------|
-| `--host`      | Sí        | IP o hostname del servidor (ej: `192.168.1.100`)   |
-| `--port`      | No        | Puerto SSH (default: `22`)                         |
-| `--user`      | Sí        | Usuario SSH (ej: `ubuntu`, `root`)                 |
-| `--key-file`  | No*       | Ruta a la clave privada SSH (recomendado)          |
-| `--password`  | No*       | Password SSH (alternativa a `--key-file`)          |
-| `--name`      | No        | Nombre descriptivo del servidor para los tools     |
+| Argumento        | Requerido | Descripción                                        |
+|------------------|-----------|----------------------------------------------------|
+| `--host`         | Sí        | IP o hostname del servidor (ej: `192.168.1.100`)   |
+| `--port`         | No        | Puerto SSH (default: `22`)                         |
+| `--user`         | Sí        | Usuario SSH (ej: `ubuntu`, `root`)                 |
+| `--key-file`     | No*       | Ruta a la clave privada SSH (recomendado)          |
+| `--password`     | No*       | Password SSH (alternativa a `--key-file`)          |
+| `--sudo-password`| No        | Password de sudo en el servidor remoto             |
+| `--name`         | No        | Nombre descriptivo del servidor para los tools     |
 
 *Se debe proveer `--key-file` o `--password`.
+
+### Sudo
+
+Si se pasa `--sudo-password`, el tool `shell` detecta automáticamente comandos que comienzan con `sudo`, inserta `-S` y alimenta la contraseña por stdin. Ejemplo:
+
+```bash
+# Claude puede invocar esto sin configuración extra:
+sudo -u postgres psql -c "CREATE DATABASE mi_bd;"
+sudo systemctl restart nginx
+```
+
+Alternativa más segura: configurar `NOPASSWD` en sudoers del servidor para comandos específicos y omitir `--sudo-password`:
+
+```
+# /etc/sudoers.d/mcp-user
+tu-usuario ALL=(postgres) NOPASSWD: /usr/bin/psql
+```
 
 ## Autenticación recomendada: clave SSH
 
@@ -62,9 +80,12 @@ ssh -i ~/.ssh/id_ed25519 usuario@ip-servidor
   "port": 22,
   "user": "ubuntu",
   "key_file": "/home/melquiades/.ssh/claude_mcp",
-  "password": null
+  "password": null,
+  "sudo_password": null
 }
 ```
+
+Reemplaza `null` por la contraseña si el usuario SSH requiere sudo con password.
 
 ### 2. Registrar con el script automático
 
@@ -88,6 +109,7 @@ python3 "~/Mrgenkko Skills/scripts/add-mcp-to-project.py" /ruta/al/proyecto
             "--port=22",
             "--user=ubuntu",
             "--key-file=/home/melquiades/.ssh/claude_mcp",
+            "--sudo-password=tu-contraseña-sudo",
             "--name=mi-servidor"
           ],
           "env": {}
