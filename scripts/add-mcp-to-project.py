@@ -85,6 +85,21 @@ def build_mcp_servers(servers_config: list) -> dict:
             if entry.get("sudo_password"):
                 args.append(f"--sudo-password={entry['sudo_password']}")
 
+        elif kind == "redis":
+            server_label = name.removeprefix("redis-") or entry["host"]
+            args = [
+                f"{MCP_SERVERS_DIR}/redis/server.py",
+                f"--host={entry['host']}",
+                f"--port={entry.get('port', 6379)}",
+                f"--db={entry.get('db', 0)}",
+                f"--name={server_label}",
+            ]
+            if entry.get("password"):
+                args.append(f"--password={entry['password']}")
+            # FLUSHALL/FLUSHDB bloqueados por defecto; opt-in explícito por instancia.
+            if entry.get("allow_flush"):
+                args.append("--allow-flush")
+
         elif kind == "obsidian":
             args = [
                 f"{MCP_SERVERS_DIR}/obsidian/server.py",
