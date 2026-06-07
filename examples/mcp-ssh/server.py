@@ -23,6 +23,7 @@ parser.add_argument("--port", type=int, default=22)
 parser.add_argument("--user", required=True)
 parser.add_argument("--key-file", default=None)
 parser.add_argument("--password", default=None)
+parser.add_argument("--sudo-password", default=None)
 args, _ = parser.parse_known_args()
 
 app = Server(f"ssh-{args.host}")
@@ -45,7 +46,7 @@ async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name="shell",
-            description=f"Ejecuta un comando bash en {args.host} vía SSH.",
+            description=f"Ejecuta un comando bash en {args.host} vía SSH. Los comandos con sudo se manejan automáticamente: el servidor inyecta la contraseña vía stdin (sudo -S) sin necesidad de incluirla en el comando.",
             inputSchema={
                 "type": "object",
                 "properties": {

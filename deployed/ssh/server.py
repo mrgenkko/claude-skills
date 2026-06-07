@@ -15,6 +15,7 @@ parser.add_argument("--port", type=int, default=22)
 parser.add_argument("--user", required=True)
 parser.add_argument("--key-file", default=None)
 parser.add_argument("--password", default=None)
+parser.add_argument("--sudo-password", default=None)
 parser.add_argument("--name", default=None)
 args, _ = parser.parse_known_args()
 
@@ -40,7 +41,7 @@ async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name="shell",
-            description=f"Ejecuta un comando de shell en {SERVER_LABEL} vía SSH.",
+            description=f"Ejecuta un comando de shell en {SERVER_LABEL} vía SSH. Los comandos con sudo se manejan automáticamente: el servidor inyecta la contraseña vía stdin (sudo -S) sin necesidad de incluirla en el comando.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -93,7 +94,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
         if name == "shell":
             timeout = arguments.get("timeout", 60)
-            _, stdout, stderr = client.exec_command(arguments["command"], timeout=timeout)
+            command = arguments["command"]
+            if args.sudo_password and "sudo" in command and "sudo -S" not in command:
+                command = command.replace("sudo", "sudo -S", 1)
+            stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+            if args.sudo_password and "sudo -S" in command:
+                stdin.write(args.sudo_password + "\n")
+                stdin.flush()
             out = stdout.read().decode("utf-8", errors="replace").strip()
             err = stderr.read().decode("utf-8", errors="replace").strip()
             exit_code = stdout.channel.recv_exit_status()
