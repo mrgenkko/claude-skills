@@ -106,6 +106,14 @@ def build_mcp_servers(servers_config: list) -> dict:
                 f"--vault-path={entry['vault_path']}",
             ]
 
+        elif kind == "obsidian-a2a":
+            args = [f"{MCP_SERVERS_DIR}/obsidian-a2a/server.py"]
+            env = {
+                "A2A_GATEWAY_URL": entry["gateway_url"],
+                "A2A_GATEWAY_KEY": entry["gateway_key"],
+                "OBSIDIAN_VAULT": entry["vault_path"],
+            }
+
         else:
             print(f"WARN: tipo desconocido '{kind}' para '{name}', ignorando.")
             continue
