@@ -27,18 +27,21 @@ Mrgenkko Skills/
 │   ├── mcp-blender.md          ← Blender Lab oficial (add-on + servidor MCP)
 │   ├── mcp-gcloud.md           ← cómo crear MCPs para Google Cloud
 │   ├── mcp-lottie-creator.md   ← LottieFiles Creator (npm + browser bridge)
-│   ├── mcp-obsidian.md         ← MCP vault Obsidian
+│   ├── mcp-obsidian.md         ← MCP vault Obsidian raw (legacy/fallback)
+│   ├── mcp-obsidian-a2a.md     ← MCP vault Obsidian vía gateway a2a (reads + writes)
 │   └── mcp-ssh.md              ← cómo crear MCPs para servidores SSH
 ├── examples/
-│   ├── mcp-database/server.py  ← MCP mínimo para PostgreSQL
-│   ├── mcp-gcloud/server.py    ← MCP mínimo para gcloud CLI
-│   ├── mcp-ssh/server.py       ← MCP mínimo para SSH
-│   └── mcp-obsidian/server.py  ← MCP mínimo para vault de Obsidian
+│   ├── mcp-database/server.py      ← MCP mínimo para PostgreSQL
+│   ├── mcp-gcloud/server.py        ← MCP mínimo para gcloud CLI
+│   ├── mcp-ssh/server.py           ← MCP mínimo para SSH
+│   ├── mcp-obsidian/server.py      ← MCP mínimo para vault de Obsidian (raw)
+│   └── mcp-obsidian-a2a/server.py  ← MCP cliente del gateway a2a (reads + writes)
 └── deployed/
     ├── gcloud/server.py        ← servidor gcloud (multi-proyecto)
     ├── postgres/server.py      ← servidor postgres (read + write)
     ├── ssh/server.py           ← servidor SSH (shell + SFTP)
-    └── obsidian/server.py      ← servidor Obsidian (read/write/search notas)
+    ├── obsidian/server.py      ← servidor Obsidian raw (legacy/fallback)
+    └── obsidian-a2a/server.py  ← servidor Obsidian vía gateway a2a (reads + writes auditados)
 ```
 
 ---
@@ -132,19 +135,30 @@ Autenticación por clave privada (`--key-file`) o contraseña (`--password`).
 | `write_file` | Escribe contenido a un archivo remoto (SFTP)     |
 | `list_dir`   | Lista el contenido de un directorio remoto       |
 
-### obsidian (`deployed/obsidian/server.py`)
+### obsidian-a2a (`deployed/obsidian-a2a/server.py`)
 
-Servidor Python para leer y escribir notas en un vault de Obsidian local.  
-Argumento `--vault-path` apunta al directorio raíz del vault.  
-Soporta symlinks dentro del vault (útil para exponer la memoria de Claude como notas).
+Cliente HTTP del `a2a-obsidian-gateway`. **Reemplazo completo** del MCP `obsidian` raw:
+reads y writes del vault pasan por el gateway (audit trail + GraphRAG). Configurado por
+variables de entorno (`A2A_GATEWAY_URL`, `A2A_GATEWAY_KEY`, `OBSIDIAN_VAULT`).
+Ver `guides/mcp-obsidian-a2a.md`.
 
-| Tool           | Descripción                                          |
-|----------------|------------------------------------------------------|
-| `read_note`    | Lee el contenido de una nota (path relativo al vault) |
-| `write_note`   | Crea o reemplaza una nota completa                   |
-| `append_note`  | Agrega contenido al final de una nota existente      |
-| `search_notes` | Busca notas por contenido (grep recursivo)           |
-| `list_notes`   | Lista archivos .md de una carpeta del vault          |
+| Tool             | Descripción                                                      |
+|------------------|------------------------------------------------------------------|
+| `get_context`    | CONTEXT.md del vault + global de `wiki` — llamar siempre primero  |
+| `read_note`      | Lee un doc + entidades GraphRAG + documentos relacionados         |
+| `list_notes`     | Lista docs indexados de un vault (índice Postgres)               |
+| `search_notes`   | Búsqueda semántica GraphRAG (pregunta en lenguaje natural)        |
+| `write_note`     | Crea o reemplaza un doc (propose+apply, audit, commit+push)       |
+| `append_note`    | Agrega contenido al final (lee + reescribe completo)             |
+| `delete_note`    | Elimina un doc (requiere `id` en frontmatter + indexado)          |
+| `add_attachment` | Copia un binario al vault y retorna el wikilink `![[...]]`        |
+
+### obsidian (`deployed/obsidian/server.py`) — legacy/fallback
+
+Servidor Python raw que lee y escribe notas directo al filesystem de un vault local
+(`--vault-path`). Reemplazado por `obsidian-a2a` en los proyectos activos; se conserva
+solo como fallback local. Tools: `read_note`, `write_note`, `append_note`, `edit_note`,
+`search_notes` (grep), `list_notes`, `delete_note`, `add_attachment`.
 
 ### lottiefiles-creator (npm oficial)
 
@@ -187,8 +201,9 @@ La configuración por proyecto se guarda en `~/.claude.json` (también fuera del
     └── mcp-servers/
         ├── gcloud/server.py    ← servidor gcloud activo
         ├── postgres/server.py  ← servidor postgres activo
-        ├── ssh/server.py       ← servidor SSH activo
-        ├── obsidian/server.py  ← servidor Obsidian activo
+        ├── ssh/server.py        ← servidor SSH activo
+        ├── obsidian-a2a/server.py ← servidor Obsidian activo (vía gateway a2a, reads + writes)
+        ├── obsidian/server.py   ← servidor Obsidian raw (legacy/fallback)
         ├── lottie/             ← npm: @lottiefiles/creator-mcp (node_modules/…/dist/index.mjs)
         └── blender/            ← instalación local del servidor MCP oficial (si usas stdio en vez de `.mcpb`)
 ```

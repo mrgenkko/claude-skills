@@ -1,4 +1,10 @@
-# Guía: MCP de Obsidian
+# Guía: MCP de Obsidian (raw — **legacy**)
+
+> ⚠️ **Legacy.** Desde junio 2026 los proyectos activos usan el MCP **`obsidian-a2a`**
+> (vía `a2a-obsidian-gateway`), que reemplaza por completo a este servidor raw para
+> lecturas y escrituras — ver `guides/mcp-obsidian-a2a.md`. Este `obsidian` raw escribe
+> directo al filesystem (sin frontmatter canónico, sin audit trail, sin commit+push) y
+> se conserva solo como **fallback local**. No registrar en proyectos nuevos.
 
 ## ¿Qué hace el servidor Obsidian?
 

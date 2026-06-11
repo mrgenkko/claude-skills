@@ -1,13 +1,25 @@
 #!/usr/bin/env python3
-"""MCP obsidian-a2a: reemplazo completo de obsidian-raw vía el a2a-obsidian-gateway.
+"""MCP obsidian-a2a — cliente HTTP del a2a-obsidian-gateway (ejemplo base).
 
-Lecturas y escrituras pasan por el gateway HTTP (puerto 7680 en dev):
+Wrapper ligero que expone lecturas y escrituras del vault Obsidian a través del
+gateway. Reemplaza por completo al MCP `obsidian` raw (acceso directo al filesystem).
 
 - Lecturas (`read_note`, `get_context`, `list_notes`, `search_notes`) consultan el
   gateway → contenido + entidades GraphRAG + documentos relacionados del grafo Neo4j.
 - Escrituras (`write_note`, `append_note`, `delete_note`) usan propose+apply →
   frontmatter canónico, audit trail y commit+push a GitHub.
 - `add_attachment` copia binarios al vault directamente (no son docs gobernados).
+
+Uso:
+    A2A_GATEWAY_URL=http://localhost:7680 \\
+    A2A_GATEWAY_KEY=a2a_<KEY> \\
+    OBSIDIAN_VAULT=/ruta/al/ObsidianVault \\
+    python3 server.py
+
+Dependencias:
+    pip install httpx mcp
+
+Ajusta `_KNOWN_VAULTS` a los vaults de tu instalación.
 """
 
 import hashlib
@@ -24,7 +36,7 @@ mcp = FastMCP("obsidian-a2a")
 
 GATEWAY_URL = os.environ.get("A2A_GATEWAY_URL", "http://localhost:7680")
 GATEWAY_KEY = os.environ["A2A_GATEWAY_KEY"]
-VAULT_ROOT = Path(os.environ.get("OBSIDIAN_VAULT", "/home/melquiades/ObsidianVault"))
+VAULT_ROOT = Path(os.environ.get("OBSIDIAN_VAULT", os.path.expanduser("~/ObsidianVault")))
 
 _HEADERS = {"X-Agent-Key": GATEWAY_KEY, "Content-Type": "application/json"}
 _TIMEOUT = 60.0  # propose y graphrag pueden tardar por el LLM
