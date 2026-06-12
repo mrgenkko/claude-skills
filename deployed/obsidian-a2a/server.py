@@ -3,10 +3,12 @@
 
 Lecturas y escrituras pasan por el gateway HTTP (puerto 7680 en dev):
 
-- Lecturas (`read_note`, `get_context`, `list_notes`, `search_notes`) consultan el
-  gateway → contenido + entidades GraphRAG + documentos relacionados del grafo Neo4j.
-- Escrituras (`write_note`, `append_note`, `delete_note`) usan propose+apply →
-  frontmatter canónico, audit trail y commit+push a GitHub.
+- Lecturas (`read_note` [con enrich opcional], `get_context`, `list_notes`,
+  `search_notes`, `get_contracts`) consultan el gateway → contenido + entidades
+  GraphRAG + documentos relacionados del grafo Neo4j + bloques tipados.
+- Escrituras (`write_note`, `append_note`, `delete_note`, `link_notes`) usan el
+  pipeline gobernado → frontmatter canónico, audit trail y commit+push a GitHub.
+- `push_vault` empuja commits locales pendientes (push fallido / commits manuales).
 - `add_attachment` copia binarios al vault directamente (no son docs gobernados).
 """
 
@@ -160,7 +162,7 @@ def _read_body(obs_path: str) -> str:
 
 
 @mcp.tool()
-async def read_note(path: str) -> dict:
+async def read_note(path: str, enrich: bool = False) -> dict:
     """Lee un documento del vault con contexto GraphRAG enriquecido.
 
     Devuelve raw_content + entidades extraídas + documentos relacionados por el grafo.
@@ -168,14 +170,16 @@ async def read_note(path: str) -> dict:
 
     Args:
         path: ruta relativa al ObsidianVault (ej. "lait/proyectos/mi-proj/index.md")
+        enrich: si true, añade `graph_summary` — síntesis LLM del documento en
+            relación con sus related_docs (+1-3s de latencia; úsalo solo cuando
+            necesites entender el contexto del doc, no para lecturas rutinarias)
     """
     vault, rel = _vault_and_relpath(path)
+    params: dict = {"vault": vault, "path": rel}
+    if enrich:
+        params["enrich"] = "true"
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.get(
-            f"{GATEWAY_URL}/v1/read",
-            headers=_HEADERS,
-            params={"vault": vault, "path": rel},
-        )
+        resp = await client.get(f"{GATEWAY_URL}/v1/read", headers=_HEADERS, params=params)
         resp.raise_for_status()
         return resp.json()
 
@@ -404,6 +408,105 @@ async def delete_note(path: str, reason: str = "Borrado vía MCP") -> dict:
                 "idempotency_key": _idempotency_key(path, doc_id, "delete"),
             },
         )
+        resp.raise_for_status()
+        return resp.json()
+
+
+_DOC_ID_RE = re.compile(r"^[A-Z]+-[A-Z]+-\d+$")
+
+
+def _resolve_doc_id(path_or_id: str) -> str | None:
+    """Acepta un doc_id canónico directo (MEL-DEC-001) o un path del vault."""
+    if _DOC_ID_RE.match(path_or_id):
+        return path_or_id
+    return _read_doc_id(path_or_id)
+
+
+@mcp.tool()
+async def link_notes(source: str, target: str, relation: str = "related") -> dict:
+    """Crea un cross-link gobernado entre dos documentos (frontmatter + grafo).
+
+    Añade el doc_id del target a la lista frontmatter `relation` del documento
+    ORIGEN, con commit+push y audit trail. El watcher re-ingesta el doc y el
+    link se materializa en el grafo Neo4j. Idempotente: si el link ya existe
+    no duplica ni genera commits de ruido.
+
+    Args:
+        source: doc origen — doc_id canónico (ej. "MEL-ARCH-022") o ruta
+            relativa al ObsidianVault (ej. "melquiades/proyectos/x/index.md")
+        target: doc destino — doc_id canónico o ruta, igual que source
+        relation: clave de frontmatter donde anotar el link (default "related";
+            también p.ej. "depends_on", "exposes" — minúsculas/dígitos/guion bajo)
+    """
+    source_id = _resolve_doc_id(source)
+    target_id = _resolve_doc_id(target)
+    missing = [p for p, d in ((source, source_id), (target, target_id)) if not d]
+    if missing:
+        return {
+            "status": "error",
+            "message": f"No se pudo resolver doc_id de: {', '.join(missing)} "
+            "(¿sin 'id' en frontmatter o aún no indexado?)",
+        }
+
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(
+            f"{GATEWAY_URL}/v1/write/link",
+            headers=_HEADERS,
+            json={
+                "request_id": str(uuid4()),
+                "source_doc_id": source_id,
+                "target_doc_id": target_id,
+                "relation": relation,
+                "idempotency_key": _idempotency_key(source_id, target_id, relation),
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+@mcp.tool()
+async def push_vault(vault: str) -> dict:
+    """Empuja a GitHub los commits locales pendientes de un vault.
+
+    En el flujo normal cada escritura ya pushea sola; esto cubre el caso de
+    commits que quedaron sin pushear (push fallido por red/credenciales,
+    commits manuales en el checkout). Si el remoto está al día devuelve
+    `pushed: false` sin tocar nada.
+
+    Args:
+        vault: wiki | lait | melquiades
+    """
+    if vault not in _KNOWN_VAULTS:
+        raise ValueError(
+            f"Vault desconocido: '{vault}'. Válidos: {', '.join(sorted(_KNOWN_VAULTS))}"
+        )
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(
+            f"{GATEWAY_URL}/v1/sync/push", headers=_HEADERS, json={"vault": vault}
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+@mcp.tool()
+async def get_contracts(doc: str, role: str = "") -> dict:
+    """Bloques tipados (capa máquina) de un documento: schemas, ejemplos, configs.
+
+    Devuelve los bloques de código json/yaml/openapi/proto/mermaid que el ingest
+    extrajo del documento, listos para consumo programático (sin parsear el MD).
+
+    Args:
+        doc: doc_id canónico (ej. "MEL-HTTP-050") o ruta relativa al ObsidianVault
+        role: filtro opcional por rol del bloque (schema | example | config | …)
+    """
+    doc_id = _resolve_doc_id(doc)
+    if not doc_id:
+        return {"status": "error", "message": f"No se pudo resolver doc_id de: {doc}"}
+    url = f"{GATEWAY_URL}/v1/contracts/{doc_id}"
+    if role:
+        url += f"/{role}"
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(url, headers=_HEADERS)
         resp.raise_for_status()
         return resp.json()
 

@@ -24,12 +24,15 @@ registrado en los proyectos activos. El binario `obsidian` raw se conserva en
 | Tool | Endpoint gateway | Descripción |
 |---|---|---|
 | `get_context(vault)` | `GET /v1/read?path=CONTEXT.md` | CONTEXT.md del vault + (para `lait`/`melquiades`) concatena el global de `wiki`. Llamar **siempre** antes de crear o buscar notas. `vault`: wiki \| lait \| melquiades |
-| `read_note(path)` | `GET /v1/read` | Contenido del doc + entidades GraphRAG + documentos relacionados del grafo. `path` relativo al vault con prefijo (ej. `lait/proyectos/x/index.md`) |
+| `read_note(path, enrich=False)` | `GET /v1/read` | Contenido del doc + entidades GraphRAG + documentos relacionados del grafo. Con `enrich=true` añade `graph_summary` (síntesis LLM del neighborhood, +1-3s — solo cuando necesites entender el contexto del doc). `path` relativo al vault con prefijo (ej. `lait/proyectos/x/index.md`) |
 | `list_notes(vault, path_prefix, kind, limit)` | `GET /v1/list` | Lista docs indexados (índice Postgres, no filesystem). Filtros opcionales. Latencia ~15s tras un write |
 | `search_notes(query, vault, top_n)` | `POST /v1/graphrag/query` | Búsqueda **semántica** (vector + grafo + BM25 + reranker): una pregunta en lenguaje natural. `vault` (scope): wiki \| lait \| melquiades \| all (default `all`) |
+| `get_contracts(doc, role="")` | `GET /v1/contracts/{doc_id}[/{role}]` | Bloques tipados (json/yaml/openapi/proto/mermaid) del doc, listos para consumo máquina. `doc` acepta doc_id canónico o path; `role` filtra (schema \| example \| config…) |
 | `write_note(path, body)` | `propose` + `apply` | Crea/reemplaza un doc. `body` es **siempre** el documento completo (no hay edición por str_replace) |
 | `append_note(path, content)` | `read` + `propose` + `apply` | Agrega contenido al final (lee el body actual y reescribe completo) |
 | `delete_note(path, reason)` | `POST /v1/write/delete` | Borra un doc (requiere `id` en frontmatter + estar indexado en GraphRAG) |
+| `link_notes(source, target, relation="related")` | `POST /v1/write/link` | Cross-link gobernado: añade el doc_id del target a la lista frontmatter `relation` del doc ORIGEN (commit+push+audit; el watcher lo materializa en el grafo). `source`/`target` aceptan doc_id o path. Idempotente |
+| `push_vault(vault)` | `POST /v1/sync/push` | Empuja commits locales pendientes a GitHub (push fallido / commits manuales). Al día → `pushed: false`. Requiere scope `sync` |
 | `add_attachment(source_path, filename, folder)` | — (filesystem directo) | Copia un binario (imagen/PDF) al vault y retorna el wikilink `![[...]]`. Los attachments no son docs gobernados |
 
 > **Cambio respecto al MCP raw:** `edit_note` (str_replace) **ya no existe** — el gateway
@@ -89,9 +92,12 @@ Los vaults conocidos están en `_KNOWN_VAULTS = {"wiki", "lait", "melquiades"}`.
 cd /home/melquiades/a2a-obsidian-gateway
 uv run a2a-gateway agent create \
   --name mcp-obsidian-a2a \
-  --scopes "read,propose,apply" \
+  --scopes "read,propose,apply,sync" \
   --rate-limit 120
 ```
+
+> `sync` es necesario para `push_vault` (añadido 2026-06-12; al agente existente
+> se le agregó vía UPDATE en `a2a_ops.agents` — la CLI no edita scopes).
 
 La key se muestra **una sola vez**. Para rotarla:
 
@@ -161,12 +167,13 @@ Después: **reiniciar Claude Code en VSCode** para que cargue el MCP.
 
 ## Latencia esperada
 
-- `read_note` / `get_context` / `list_notes`: < 1s (índice Postgres + grafo).
-- `search_notes`: 2–6s (retrieval híbrido + reranker + LLM de síntesis).
+- `read_note` / `get_context` / `list_notes` / `get_contracts`: < 1s (índice Postgres + grafo).
+- `read_note(enrich=true)`: +1–3s (síntesis LLM del neighborhood).
+- `search_notes`: 7–8s (retrieval híbrido + reranker en GPU + LLM de síntesis).
 - `write_note` nuevo doc con kind inferible de la ruta: 1–3s (sin LLM, solo git push).
 - `write_note` nuevo doc con ruta ambigua: 2–5s (LLM de clasificación + git push).
-- `write_note` update: 1–3s (reutiliza `doc_id`, sin clasificación LLM).
-- `delete_note`: ~1s.
+- `write_note` update / `link_notes`: 1–3s (sin clasificación LLM).
+- `delete_note` / `push_vault`: ~1s.
 
 ## Smoke test
 
