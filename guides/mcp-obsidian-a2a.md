@@ -51,12 +51,35 @@ Los vaults conocidos están en `_KNOWN_VAULTS = {"wiki", "lait", "melquiades"}`.
 ## Comportamiento de los writes
 
 1. `write_note` lee el `id` del frontmatter del doc existente (si lo hay → update con
-   `target_doc_id`; si no → create con clasificación LLM).
-2. Llama `POST /v1/write/propose` con el body completo y `hints` (`target_vault`,
-   `project`, y `org` para vaults de organización).
-3. Si la respuesta trae `violations` → retorna `{"status": "rejected", ...}` sin aplicar.
-4. Llama `POST /v1/write/apply` → commit+push a GitHub.
-5. Retorna `{status, doc_id, path, commit}`.
+   `target_doc_id`, que preserva doc_id y path; si no → create).
+2. Para creates **infiere el `kind` de la ruta pedida** y lo pasa como hint — con
+   `doc_kind` + `target_vault` + `project` completos el gateway clasifica de forma
+   **determinista (sin LLM)** y el doc cae en la carpeta pedida:
+
+   | Ruta pedida | kind inferido |
+   |---|---|
+   | `CONTEXT.md` / `index.md` (raíz) | portal / index |
+   | `proyectos/<p>/{index,arquitectura,glosario}.md` | index / architecture / glossary |
+   | `proyectos/<p>/decisiones/` | decision |
+   | `proyectos/<p>/instructivos/{http,ws,grpc,cli,sdk}/` | instructivo_* |
+   | `proyectos/<p>/{runbooks,propuestas,pendientes}/` | runbook / proposal / pending |
+   | `<org>/ecosistema/` · `<org>/integraciones/` | ecosystem / integration |
+   | wiki: `conceptos/ patrones/ herramientas/ tutoriales/ referencia/ personas/` | concept / pattern / tool / tutorial / reference / person |
+   | wiki: `log.md` | log |
+
+   Ruta ambigua (sin match) → clasificación LLM como antes.
+3. El **nombre final del archivo** lo computa el gateway como slug del `intent`; el
+   wrapper construye el intent desde el **nombre de archivo pedido** (o el título H1
+   si el nombre es muy corto), así el slug queda fiel a lo pedido. En ADRs el prefijo
+   numérico lo pone el gateway con la secuencia del doc_id.
+4. Llama `POST /v1/write/propose` con el body completo y los hints.
+   - `violations` → retorna `{"status": "rejected", violations, target_path}` sin aplicar.
+   - `requires_approval` (confidence baja) → retorna `{"status": "requires_approval", ...}`
+     sin aplicar; reintentar con un path más explícito.
+5. Llama `POST /v1/write/apply` → commit+push a GitHub.
+6. Retorna `{status, doc_id, kind, path, commit}`. El `doc_id` en creates se extrae del
+   frontmatter del `rendered_preview`; el `path` viene **con prefijo de vault**
+   (ej. `melquiades/proyectos/x/pendientes/mi-nota.md`) listo para `read_note`.
 
 ## Instalación
 
@@ -140,7 +163,8 @@ Después: **reiniciar Claude Code en VSCode** para que cargue el MCP.
 
 - `read_note` / `get_context` / `list_notes`: < 1s (índice Postgres + grafo).
 - `search_notes`: 2–6s (retrieval híbrido + reranker + LLM de síntesis).
-- `write_note` nuevo doc: 2–5s (LLM de clasificación + git push).
+- `write_note` nuevo doc con kind inferible de la ruta: 1–3s (sin LLM, solo git push).
+- `write_note` nuevo doc con ruta ambigua: 2–5s (LLM de clasificación + git push).
 - `write_note` update: 1–3s (reutiliza `doc_id`, sin clasificación LLM).
 - `delete_note`: ~1s.
 

@@ -64,26 +64,100 @@ def _project(rel_path: str) -> str | None:
     return None
 
 
+# Inferencia de kind desde la ruta pedida (espejo de vault/paths.py del gateway).
+# Con doc_kind + target_vault + project en hints la clasificación es determinista
+# (el gateway salta el LLM) y el doc cae en la carpeta que el agente pidió.
+
+_PROJECT_FILE_KINDS = {
+    "index.md": "index",
+    "arquitectura.md": "architecture",
+    "glosario.md": "glossary",
+}
+_PROJECT_FOLDER_KINDS = {
+    "decisiones": "decision",
+    "runbooks": "runbook",
+    "propuestas": "proposal",
+    "pendientes": "pending",
+}
+_INSTRUCTIVO_KINDS = {p: f"instructivo_{p}" for p in ("http", "ws", "grpc", "cli", "sdk")}
+_WIKI_FOLDER_KINDS = {
+    "conceptos": "concept",
+    "patrones": "pattern",
+    "herramientas": "tool",
+    "tutoriales": "tutorial",
+    "referencia": "reference",
+    "personas": "person",
+}
+
+
+def _infer_kind(vault: str, rel: str) -> str | None:
+    """Kind canónico inferido de la ruta pedida; None si es genuinamente ambiguo."""
+    if rel == "CONTEXT.md":
+        return "portal"
+    if rel == "index.md":
+        return "index"
+    segs = rel.split("/")
+    if vault == "wiki":
+        if rel == "log.md":
+            return "log"
+        return _WIKI_FOLDER_KINDS.get(segs[0])
+    if segs[0] == "ecosistema":
+        return "ecosystem"
+    if segs[0] == "integraciones":
+        return "integration"
+    if segs[0] == "proyectos" and len(segs) >= 3:
+        inner = segs[2:]
+        if len(inner) == 1:
+            return _PROJECT_FILE_KINDS.get(inner[0])
+        if inner[0] == "instructivos" and len(inner) >= 2:
+            return _INSTRUCTIVO_KINDS.get(inner[1])
+        return _PROJECT_FOLDER_KINDS.get(inner[0])
+    return None
+
+
+def _build_intent(rel: str, body: str) -> str:
+    """Intent para propose. El gateway deriva el slug del archivo desde el intent
+    (title_to_slug), así que se construye desde el nombre pedido — o el título H1
+    si el nombre es muy corto (el gateway exige intent ≥ 10 chars)."""
+    stem = rel.rsplit("/", 1)[-1].removesuffix(".md")
+    words = re.sub(r"[-_]+", " ", stem).strip()
+    # ADRs llevan prefijo numérico en el nombre ("042-auth-jwt"); el gateway re-añade
+    # la secuencia del doc_id, así que se quita aquí para no duplicarla en el slug.
+    words = re.sub(r"^\d+\s*", "", words).strip()
+    if len(words) >= 10:
+        return words[:500]
+    m = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
+    title = m.group(1).strip() if m else ""
+    candidate = title or words
+    if len(candidate) < 10:
+        candidate = f"Documento {rel}"
+    return candidate[:500]
+
+
+def _extract_fm_id(content: str) -> str | None:
+    """Campo 'id' del frontmatter YAML de un documento (None si no hay)."""
+    m = re.search(r"^---\n(.*?)\n---", content, re.DOTALL)
+    if not m:
+        return None
+    for line in m.group(1).splitlines():
+        if line.startswith("id:"):
+            return line.split(":", 1)[1].strip() or None
+    return None
+
+
 def _idempotency_key(*parts: str) -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:36]
 
 
 def _read_doc_id(obs_path: str) -> str | None:
-    """Lee el campo 'id' del frontmatter YAML de un doc del vault."""
+    """Lee el campo 'id' del frontmatter YAML de un doc del vault (desde disco)."""
     try:
         full = VAULT_ROOT / obs_path.lstrip("/")
         if not full.suffix:
             full = full.with_suffix(".md")
-        content = full.read_text(encoding="utf-8", errors="replace")[:2048]
-        m = re.search(r"^---\n(.*?)\n---", content, re.DOTALL)
-        if not m:
-            return None
-        for line in m.group(1).splitlines():
-            if line.startswith("id:"):
-                return line.split(":", 1)[1].strip()
+        return _extract_fm_id(full.read_text(encoding="utf-8", errors="replace")[:2048])
     except (OSError, UnicodeDecodeError):
-        pass
-    return None
+        return None
 
 
 def _read_body(obs_path: str) -> str:
@@ -217,21 +291,30 @@ async def write_note(path: str, body: str) -> dict:
 
     Garantiza frontmatter canónico, audit trail y commit+push a GitHub. Si el doc
     ya existe (tiene 'id' en frontmatter), hace un update gobernado reutilizando el
-    doc_id. No hay edición por str_replace: el `body` es siempre el documento completo.
+    doc_id y su path. No hay edición por str_replace: el `body` es siempre el
+    documento completo.
+
+    En creates el path FINAL lo gobierna el gateway: la carpeta sale del kind
+    (inferido de la ruta pedida: decisiones/ → decision, runbooks/ → runbook,
+    instructivos/<proto>/, pendientes/, propuestas/, etc.) y el nombre del archivo
+    del nombre pedido (o del título H1 si el nombre es muy corto). La respuesta
+    incluye el `path` definitivo — úsalo para lecturas posteriores.
 
     Args:
         path: ruta relativa al ObsidianVault (ej. "lait/proyectos/mi-proj/index.md")
         body: contenido completo del documento en Markdown
     """
     vault, rel = _vault_and_relpath(path)
-    project = _project(rel)
     request_id = str(uuid4())
     target_doc_id = _read_doc_id(path)
 
     # org sólo aplica a vaults de organización (no a la wiki transversal).
-    hints: dict = {"target_vault": vault, "project": project}
+    hints: dict = {"target_vault": vault, "project": _project(rel)}
     if vault in {"lait", "melquiades"}:
         hints["org"] = vault
+    kind = _infer_kind(vault, rel)
+    if kind:
+        hints["doc_kind"] = kind
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         propose_resp = await client.post(
@@ -239,7 +322,7 @@ async def write_note(path: str, body: str) -> dict:
             headers=_HEADERS,
             json={
                 "request_id": request_id,
-                "intent": f"write_note via MCP: {path}",
+                "intent": _build_intent(rel, body),
                 "content": body,
                 "source_agent": "mcp-obsidian-a2a",
                 "hints": hints,
@@ -250,7 +333,21 @@ async def write_note(path: str, body: str) -> dict:
         proposal = propose_resp.json()
 
         if proposal.get("violations"):
-            return {"status": "rejected", "violations": proposal["violations"]}
+            return {
+                "status": "rejected",
+                "violations": proposal["violations"],
+                "target_path": proposal.get("target_path"),
+            }
+        if proposal.get("requires_approval"):
+            return {
+                "status": "requires_approval",
+                "proposal_id": proposal["proposal_id"],
+                "target_path": proposal.get("target_path"),
+                "message": (
+                    "La propuesta requiere aprobación manual (confidence baja del "
+                    "clasificador); no se aplicó. Reintenta con un path más explícito."
+                ),
+            }
 
         ik = _idempotency_key(path, body, request_id)
         apply_resp = await client.post(
@@ -260,10 +357,14 @@ async def write_note(path: str, body: str) -> dict:
         )
         apply_resp.raise_for_status()
         result = apply_resp.json()
+        # En updates el doc_id es el target; en creates viene en el frontmatter
+        # del preview renderizado (propose no lo devuelve como campo propio).
+        doc_id = target_doc_id or _extract_fm_id(proposal.get("rendered_preview", ""))
         return {
             "status": result["status"],
-            "doc_id": proposal.get("classification", {}).get("doc_id"),
-            "path": result["final_path"],
+            "doc_id": doc_id,
+            "kind": proposal.get("classification", {}).get("kind"),
+            "path": f"{vault}/{result['final_path']}",
             "commit": result["commit_sha"],
         }
 
