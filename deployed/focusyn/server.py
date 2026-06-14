@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""MCP obsidian-a2a — cliente HTTP del a2a-obsidian-gateway (ejemplo base).
+"""MCP focusyn: reemplazo completo de obsidian-raw vía el focusyn.
 
-Wrapper ligero que expone lecturas y escrituras del vault Obsidian a través del
-gateway. Reemplaza por completo al MCP `obsidian` raw (acceso directo al filesystem).
+Lecturas y escrituras pasan por el gateway HTTP (puerto 7680 en dev):
 
 - Lecturas (`read_note` [con enrich opcional], `get_context`, `list_notes`,
   `search_notes`, `get_contracts`) consultan el gateway → contenido + entidades
@@ -11,21 +10,9 @@ gateway. Reemplaza por completo al MCP `obsidian` raw (acceso directo al filesys
   pipeline gobernado → frontmatter canónico, audit trail y commit+push a GitHub.
 - `push_vault` empuja commits locales pendientes (push fallido / commits manuales).
 - `add_attachment` copia binarios al vault directamente (no son docs gobernados).
-
-Uso:
-    A2A_GATEWAY_URL=http://localhost:7680 \\
-    A2A_GATEWAY_KEY=a2a_<KEY> \\
-    OBSIDIAN_VAULT=/ruta/al/ObsidianVault \\
-    python3 server.py
-
-Dependencias:
-    pip install httpx mcp
-
-Ajusta `_KNOWN_VAULTS` a los vaults de tu instalación. El agente del gateway
-necesita scopes read,propose,apply y, para `push_vault`, también sync.
 """
 
-
+import asyncio
 import hashlib
 import os
 import re
@@ -36,11 +23,11 @@ from uuid import uuid4
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("obsidian-a2a")
+mcp = FastMCP("focusyn")
 
-GATEWAY_URL = os.environ.get("A2A_GATEWAY_URL", "http://localhost:7680")
-GATEWAY_KEY = os.environ["A2A_GATEWAY_KEY"]
-VAULT_ROOT = Path(os.environ.get("OBSIDIAN_VAULT", os.path.expanduser("~/ObsidianVault")))
+GATEWAY_URL = os.environ.get("FOCUSYN_GATEWAY_URL", "http://localhost:7680")
+GATEWAY_KEY = os.environ["FOCUSYN_GATEWAY_KEY"]
+VAULT_ROOT = Path(os.environ.get("OBSIDIAN_VAULT", "/home/melquiades/ObsidianVault"))
 
 _HEADERS = {"X-Agent-Key": GATEWAY_KEY, "Content-Type": "application/json"}
 _TIMEOUT = 60.0  # propose y graphrag pueden tardar por el LLM
@@ -291,6 +278,23 @@ async def search_notes(query: str, vault: str = "all", top_n: int = 8) -> dict:
 # ── ESCRITURAS (vía gateway: propose + apply) ───────────────────────────────────
 
 
+def _gateway_error(resp: httpx.Response, stage: str, **extra: object) -> dict:
+    """Expone el cuerpo de error del gateway al agente (code, message, request_id)
+    en vez de tragárselo con raise_for_status — sin esto un 404/409/410 llega como
+    status HTTP pelado y es indiagnosticable desde la sesión."""
+    try:
+        detail = resp.json()
+    except Exception:
+        detail = {"raw": resp.text[:500]}
+    return {
+        "status": "error",
+        "stage": stage,
+        "http_status": resp.status_code,
+        "gateway_error": detail,
+        **extra,
+    }
+
+
 @mcp.tool()
 async def write_note(path: str, body: str) -> dict:
     """Crea o reemplaza un documento en el vault vía el gateway a2a.
@@ -330,12 +334,13 @@ async def write_note(path: str, body: str) -> dict:
                 "request_id": request_id,
                 "intent": _build_intent(rel, body),
                 "content": body,
-                "source_agent": "mcp-obsidian-a2a",
+                "source_agent": "focusyn",
                 "hints": hints,
                 "target_doc_id": target_doc_id,
             },
         )
-        propose_resp.raise_for_status()
+        if propose_resp.status_code >= 400:
+            return _gateway_error(propose_resp, "propose", path=path)
         proposal = propose_resp.json()
 
         if proposal.get("violations"):
@@ -356,12 +361,25 @@ async def write_note(path: str, body: str) -> dict:
             }
 
         ik = _idempotency_key(path, body, request_id)
+        apply_payload = {"proposal_id": proposal["proposal_id"], "idempotency_key": ik}
         apply_resp = await client.post(
-            f"{GATEWAY_URL}/v1/write/apply",
-            headers=_HEADERS,
-            json={"proposal_id": proposal["proposal_id"], "idempotency_key": ik},
+            f"{GATEWAY_URL}/v1/write/apply", headers=_HEADERS, json=apply_payload
         )
-        apply_resp.raise_for_status()
+        # El gateway responde el propose ANTES de que el commit del proposal sea
+        # visible en Postgres; con bodies grandes (~70 KB) la ventana supera el
+        # turnaround del apply y devuelve PROPOSAL_NOT_FOUND transitorio. Retry
+        # corto hasta que el commit aterrice (idempotente por idempotency_key).
+        for _ in range(4):
+            if apply_resp.status_code != 404:
+                break
+            await asyncio.sleep(0.3)
+            apply_resp = await client.post(
+                f"{GATEWAY_URL}/v1/write/apply", headers=_HEADERS, json=apply_payload
+            )
+        if apply_resp.status_code >= 400:
+            return _gateway_error(
+                apply_resp, "apply", proposal_id=proposal["proposal_id"], path=path
+            )
         result = apply_resp.json()
         # En updates el doc_id es el target; en creates viene en el frontmatter
         # del preview renderizado (propose no lo devuelve como campo propio).

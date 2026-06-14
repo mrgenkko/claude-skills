@@ -1,12 +1,12 @@
-# MCP `obsidian-a2a`
+# MCP `focusyn`
 
-Cliente HTTP del `a2a-obsidian-gateway`. **Reemplazo completo** del MCP `obsidian` raw:
+Cliente HTTP del `focusyn`. **Reemplazo completo** del MCP `obsidian` raw:
 lecturas y escrituras del vault pasan por el gateway (audit trail + GraphRAG).
 
 ## Por qué existe
 
 El MCP `obsidian` (raw) leía/escribía directamente al filesystem, sin frontmatter
-canónico, sin audit trail y sin commit+push a GitHub. `obsidian-a2a` envuelve el gateway
+canónico, sin audit trail y sin commit+push a GitHub. `focusyn` envuelve el gateway
 que garantiza todo eso y, además, enriquece las lecturas con el grafo de conocimiento:
 
 - Las **escrituras** pasan por `propose` + `apply` → frontmatter canónico, governance
@@ -15,7 +15,7 @@ que garantiza todo eso y, además, enriquece las lecturas con el grafo de conoci
   devuelve el contenido **más** las entidades extraídas y los documentos relacionados;
   `search_notes` es una búsqueda **semántica** GraphRAG, no un grep.
 
-A partir de la migración de junio 2026, `obsidian-a2a` es el único MCP de Obsidian
+A partir de la migración de junio 2026, `focusyn` es el único MCP de Obsidian
 registrado en los proyectos activos. El binario `obsidian` raw se conserva en
 `~/.claude/mcp-servers/obsidian/` solo como fallback local.
 
@@ -89,9 +89,9 @@ Los vaults conocidos están en `_KNOWN_VAULTS = {"wiki", "lait", "melquiades"}`.
 ### 1. Crear la key del agente en el gateway
 
 ```bash
-cd /home/melquiades/a2a-obsidian-gateway
-uv run a2a-gateway agent create \
-  --name mcp-obsidian-a2a \
+cd /home/melquiades/focusyn
+uv run focusyn agent create \
+  --name focusyn \
   --scopes "read,propose,apply,sync" \
   --rate-limit 120
 ```
@@ -102,13 +102,13 @@ uv run a2a-gateway agent create \
 La key se muestra **una sola vez**. Para rotarla:
 
 ```bash
-uv run a2a-gateway agent rotate-key mcp-obsidian-a2a
+uv run focusyn agent rotate-key focusyn
 ```
 
 ### 2. Arrancar el gateway
 
 ```bash
-cd /home/melquiades/a2a-obsidian-gateway
+cd /home/melquiades/focusyn
 make dev          # uvicorn a2a_gateway.main:app --reload --port 7680
 ```
 
@@ -122,17 +122,17 @@ curl -s http://localhost:7680/v1/capabilities
 ### 3. Copiar el servidor MCP
 
 ```bash
-mkdir -p ~/.claude/mcp-servers/obsidian-a2a
-cp "~/Mrgenkko Skills/deployed/obsidian-a2a/server.py" \
-   ~/.claude/mcp-servers/obsidian-a2a/server.py
+mkdir -p ~/.claude/mcp-servers/focusyn
+cp "~/Mrgenkko Skills/deployed/focusyn/server.py" \
+   ~/.claude/mcp-servers/focusyn/server.py
 ```
 
 ### 4. Registrar en `scripts/secrets.json`
 
 ```json
 {
-  "name": "obsidian-a2a",
-  "type": "obsidian-a2a",
+  "name": "focusyn",
+  "type": "focusyn",
   "gateway_url": "http://localhost:7680",
   "gateway_key": "a2a_<KEY>",
   "vault_path": "/home/melquiades/ObsidianVault"
@@ -140,19 +140,19 @@ cp "~/Mrgenkko Skills/deployed/obsidian-a2a/server.py" \
 ```
 
 `add-mcp-to-project.py` construye la entrada con estos campos como variables de entorno
-(`A2A_GATEWAY_URL`, `A2A_GATEWAY_KEY`, `OBSIDIAN_VAULT`).
+(`FOCUSYN_GATEWAY_URL`, `FOCUSYN_GATEWAY_KEY`, `OBSIDIAN_VAULT`).
 
 ### 5. Registrar en un proyecto (reemplaza al raw)
 
 ```bash
-/mcp-project add <proyecto> obsidian-a2a      # agrega obsidian-a2a
+/mcp-project add <proyecto> focusyn      # agrega focusyn
 /mcp-project remove <proyecto> obsidian       # quita el raw
 ```
 
 O vía script directamente:
 
 ```bash
-python3 "scripts/add-mcp-to-project.py" /ruta/proyecto --only obsidian-a2a
+python3 "scripts/add-mcp-to-project.py" /ruta/proyecto --only focusyn
 ```
 
 Después: **reiniciar Claude Code en VSCode** para que cargue el MCP.
@@ -161,8 +161,8 @@ Después: **reiniciar Claude Code en VSCode** para que cargue el MCP.
 
 | Variable | Valor dev | Descripción |
 |---|---|---|
-| `A2A_GATEWAY_URL` | `http://localhost:7680` | URL base del gateway |
-| `A2A_GATEWAY_KEY` | `a2a_<...>` | API key del agente MCP (header `X-Agent-Key`) |
+| `FOCUSYN_GATEWAY_URL` | `http://localhost:7680` | URL base del gateway |
+| `FOCUSYN_GATEWAY_KEY` | `a2a_<...>` | API key del agente MCP (header `X-Agent-Key`) |
 | `OBSIDIAN_VAULT` | `/home/melquiades/ObsidianVault` | Raíz del vault en el host (para leer el `id` del frontmatter y para `add_attachment`) |
 
 ## Latencia esperada
@@ -180,9 +180,9 @@ Después: **reiniciar Claude Code en VSCode** para que cargue el MCP.
 Con el gateway corriendo y la key en el entorno:
 
 ```bash
-A2A_GATEWAY_KEY="a2a_<KEY>" python3 - <<'PY'
+FOCUSYN_GATEWAY_KEY="a2a_<KEY>" python3 - <<'PY'
 import asyncio, importlib.util
-spec = importlib.util.spec_from_file_location("srv", "/home/melquiades/.claude/mcp-servers/obsidian-a2a/server.py")
+spec = importlib.util.spec_from_file_location("srv", "/home/melquiades/.claude/mcp-servers/focusyn/server.py")
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 fn = lambda t: (t.fn if hasattr(t, "fn") else t)
 async def main():
@@ -199,7 +199,7 @@ PY
 ## Monitoreo del audit trail
 
 ```bash
-cd /home/melquiades/a2a-obsidian-gateway
+cd /home/melquiades/focusyn
 uv run python -c "
 import asyncio
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -222,8 +222,8 @@ asyncio.run(main())
 
 ## Archivos
 
-- Binario instalado: `~/.claude/mcp-servers/obsidian-a2a/server.py`
-- Fuente desplegada: `deployed/obsidian-a2a/server.py`
-- Ejemplo base público: `examples/mcp-obsidian-a2a/server.py`
-- Gateway: `/home/melquiades/a2a-obsidian-gateway/`
+- Binario instalado: `~/.claude/mcp-servers/focusyn/server.py`
+- Fuente desplegada: `deployed/focusyn/server.py`
+- Ejemplo base público: `examples/mcp-focusyn/server.py`
+- Gateway: `/home/melquiades/focusyn/`
 - MCP raw (legacy, fallback): `guides/mcp-obsidian.md`

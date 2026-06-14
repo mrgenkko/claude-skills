@@ -28,20 +28,20 @@ Mrgenkko Skills/
 │   ├── mcp-gcloud.md           ← cómo crear MCPs para Google Cloud
 │   ├── mcp-lottie-creator.md   ← LottieFiles Creator (npm + browser bridge)
 │   ├── mcp-obsidian.md         ← MCP vault Obsidian raw (legacy/fallback)
-│   ├── mcp-obsidian-a2a.md     ← MCP vault Obsidian vía gateway a2a (reads + writes)
+│   ├── focusyn.md     ← MCP vault Obsidian vía gateway a2a (reads + writes)
 │   └── mcp-ssh.md              ← cómo crear MCPs para servidores SSH
 ├── examples/
 │   ├── mcp-database/server.py      ← MCP mínimo para PostgreSQL
 │   ├── mcp-gcloud/server.py        ← MCP mínimo para gcloud CLI
 │   ├── mcp-ssh/server.py           ← MCP mínimo para SSH
 │   ├── mcp-obsidian/server.py      ← MCP mínimo para vault de Obsidian (raw)
-│   └── mcp-obsidian-a2a/server.py  ← MCP cliente del gateway a2a (reads + writes)
+│   └── focusyn/server.py  ← MCP cliente del gateway a2a (reads + writes)
 └── deployed/
     ├── gcloud/server.py        ← servidor gcloud (multi-proyecto)
     ├── postgres/server.py      ← servidor postgres (read + write)
     ├── ssh/server.py           ← servidor SSH (shell + SFTP)
     ├── obsidian/server.py      ← servidor Obsidian raw (legacy/fallback)
-    └── obsidian-a2a/server.py  ← servidor Obsidian vía gateway a2a (reads + writes auditados)
+    └── focusyn/server.py  ← servidor Obsidian vía gateway a2a (reads + writes auditados)
 ```
 
 ---
@@ -135,12 +135,12 @@ Autenticación por clave privada (`--key-file`) o contraseña (`--password`).
 | `write_file` | Escribe contenido a un archivo remoto (SFTP)     |
 | `list_dir`   | Lista el contenido de un directorio remoto       |
 
-### obsidian-a2a (`deployed/obsidian-a2a/server.py`)
+### focusyn (`deployed/focusyn/server.py`)
 
-Cliente HTTP del `a2a-obsidian-gateway`. **Reemplazo completo** del MCP `obsidian` raw:
+Cliente HTTP del `focusyn`. **Reemplazo completo** del MCP `obsidian` raw:
 reads y writes del vault pasan por el gateway (audit trail + GraphRAG). Configurado por
-variables de entorno (`A2A_GATEWAY_URL`, `A2A_GATEWAY_KEY`, `OBSIDIAN_VAULT`).
-Ver `guides/mcp-obsidian-a2a.md`.
+variables de entorno (`FOCUSYN_GATEWAY_URL`, `FOCUSYN_GATEWAY_KEY`, `OBSIDIAN_VAULT`).
+Ver `guides/mcp-focusyn.md`.
 
 | Tool             | Descripción                                                      |
 |------------------|------------------------------------------------------------------|
@@ -156,7 +156,7 @@ Ver `guides/mcp-obsidian-a2a.md`.
 ### obsidian (`deployed/obsidian/server.py`) — legacy/fallback
 
 Servidor Python raw que lee y escribe notas directo al filesystem de un vault local
-(`--vault-path`). Reemplazado por `obsidian-a2a` en los proyectos activos; se conserva
+(`--vault-path`). Reemplazado por `focusyn` en los proyectos activos; se conserva
 solo como fallback local. Tools: `read_note`, `write_note`, `append_note`, `edit_note`,
 `search_notes` (grep), `list_notes`, `delete_note`, `add_attachment`.
 
@@ -202,7 +202,7 @@ La configuración por proyecto se guarda en `~/.claude.json` (también fuera del
         ├── gcloud/server.py    ← servidor gcloud activo
         ├── postgres/server.py  ← servidor postgres activo
         ├── ssh/server.py        ← servidor SSH activo
-        ├── obsidian-a2a/server.py ← servidor Obsidian activo (vía gateway a2a, reads + writes)
+        ├── focusyn/server.py ← servidor Obsidian activo (vía gateway a2a, reads + writes)
         ├── obsidian/server.py   ← servidor Obsidian raw (legacy/fallback)
         ├── lottie/             ← npm: @lottiefiles/creator-mcp (node_modules/…/dist/index.mjs)
         └── blender/            ← instalación local del servidor MCP oficial (si usas stdio en vez de `.mcpb`)

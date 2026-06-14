@@ -106,11 +106,11 @@ def build_mcp_servers(servers_config: list) -> dict:
                 f"--vault-path={entry['vault_path']}",
             ]
 
-        elif kind == "obsidian-a2a":
-            args = [f"{MCP_SERVERS_DIR}/obsidian-a2a/server.py"]
+        elif kind == "focusyn":
+            args = [f"{MCP_SERVERS_DIR}/focusyn/server.py"]
             env = {
-                "A2A_GATEWAY_URL": entry["gateway_url"],
-                "A2A_GATEWAY_KEY": entry["gateway_key"],
+                "FOCUSYN_GATEWAY_URL": entry["gateway_url"],
+                "FOCUSYN_GATEWAY_KEY": entry["gateway_key"],
                 "OBSIDIAN_VAULT": entry["vault_path"],
             }
 

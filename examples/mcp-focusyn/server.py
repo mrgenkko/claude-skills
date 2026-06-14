@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""MCP obsidian-a2a: reemplazo completo de obsidian-raw vía el a2a-obsidian-gateway.
+"""MCP focusyn — cliente HTTP del focusyn (ejemplo base).
 
-Lecturas y escrituras pasan por el gateway HTTP (puerto 7680 en dev):
+Wrapper ligero que expone lecturas y escrituras del vault Obsidian a través del
+gateway. Reemplaza por completo al MCP `obsidian` raw (acceso directo al filesystem).
 
 - Lecturas (`read_note` [con enrich opcional], `get_context`, `list_notes`,
   `search_notes`, `get_contracts`) consultan el gateway → contenido + entidades
@@ -10,7 +11,20 @@ Lecturas y escrituras pasan por el gateway HTTP (puerto 7680 en dev):
   pipeline gobernado → frontmatter canónico, audit trail y commit+push a GitHub.
 - `push_vault` empuja commits locales pendientes (push fallido / commits manuales).
 - `add_attachment` copia binarios al vault directamente (no son docs gobernados).
+
+Uso:
+    FOCUSYN_GATEWAY_URL=http://localhost:7680 \\
+    FOCUSYN_GATEWAY_KEY=a2a_<KEY> \\
+    OBSIDIAN_VAULT=/ruta/al/ObsidianVault \\
+    python3 server.py
+
+Dependencias:
+    pip install httpx mcp
+
+Ajusta `_KNOWN_VAULTS` a los vaults de tu instalación. El agente del gateway
+necesita scopes read,propose,apply y, para `push_vault`, también sync.
 """
+
 
 import hashlib
 import os
@@ -22,11 +36,11 @@ from uuid import uuid4
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("obsidian-a2a")
+mcp = FastMCP("focusyn")
 
-GATEWAY_URL = os.environ.get("A2A_GATEWAY_URL", "http://localhost:7680")
-GATEWAY_KEY = os.environ["A2A_GATEWAY_KEY"]
-VAULT_ROOT = Path(os.environ.get("OBSIDIAN_VAULT", "/home/melquiades/ObsidianVault"))
+GATEWAY_URL = os.environ.get("FOCUSYN_GATEWAY_URL", "http://localhost:7680")
+GATEWAY_KEY = os.environ["FOCUSYN_GATEWAY_KEY"]
+VAULT_ROOT = Path(os.environ.get("OBSIDIAN_VAULT", os.path.expanduser("~/ObsidianVault")))
 
 _HEADERS = {"X-Agent-Key": GATEWAY_KEY, "Content-Type": "application/json"}
 _TIMEOUT = 60.0  # propose y graphrag pueden tardar por el LLM
@@ -316,7 +330,7 @@ async def write_note(path: str, body: str) -> dict:
                 "request_id": request_id,
                 "intent": _build_intent(rel, body),
                 "content": body,
-                "source_agent": "mcp-obsidian-a2a",
+                "source_agent": "focusyn",
                 "hints": hints,
                 "target_doc_id": target_doc_id,
             },
