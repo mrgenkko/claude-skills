@@ -165,20 +165,20 @@ def _read_doc_id(obs_path: str) -> str | None:
 
 
 @mcp.tool()
-async def read_note(path: str, enrich: bool = False) -> dict:
-    """Lee un documento del vault con contexto GraphRAG enriquecido.
+async def read_note(path: str, graph: bool = False, enrich: bool = False) -> dict:
+    """Lee un documento del vault (raw_content + frontmatter).
 
-    Devuelve raw_content + entidades extraídas + documentos relacionados por el grafo.
-    Recibes el contexto relevante en una sola llamada (no necesitas búsquedas extra).
+    Lectura lean por defecto. `graph=true` añade entities + related_docs (contexto
+    GraphRAG en una sola llamada); `enrich=true` añade además `graph_summary`
+    (síntesis LLM, +1-3s; implica graph). Usa los flags solo cuando necesites
+    razonar sobre el entorno del doc, no para lecturas rutinarias.
 
-    Args:
-        path: ruta relativa al ObsidianVault (ej. "lait/proyectos/mi-proj/index.md")
-        enrich: si true, añade `graph_summary` — síntesis LLM del documento en
-            relación con sus related_docs (+1-3s de latencia; úsalo solo cuando
-            necesites entender el contexto del doc, no para lecturas rutinarias)
+    path: ruta relativa al ObsidianVault (ej. "lait/proyectos/mi-proj/index.md").
     """
     vault, rel = _vault_and_relpath(path)
     params: dict = {"vault": vault, "path": rel}
+    if graph:
+        params["graph"] = "true"
     if enrich:
         params["enrich"] = "true"
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
@@ -189,13 +189,9 @@ async def read_note(path: str, enrich: bool = False) -> dict:
 
 @mcp.tool()
 async def get_context(vault: str) -> dict:
-    """Lee el CONTEXT.md del vault. Para vaults de org (lait/melquiades) concatena
-    además el CONTEXT.md global de `wiki` (convenciones transversales + portal de la org).
+    """Convenciones del vault: su CONTEXT.md (+ el global de `wiki` si es org).
 
-    Llamar SIEMPRE antes de crear o buscar notas.
-
-    Args:
-        vault: wiki | lait | melquiades
+    Llamar SIEMPRE antes de crear o buscar notas. vault: wiki | lait | melquiades.
     """
     if vault not in _KNOWN_VAULTS:
         raise ValueError(
@@ -227,13 +223,10 @@ async def list_notes(
     kind: str = "",
     limit: int = 100,
 ) -> dict:
-    """Lista documentos indexados de un vault (consulta el índice Postgres, no el disco).
+    """Lista documentos indexados de un vault (índice Postgres, no el disco).
 
-    Args:
-        vault: wiki | lait | melquiades
-        path_prefix: filtro opcional (ej. "proyectos/gz-")
-        kind: filtro opcional (index, decision, runbook, concept…)
-        limit: máximo de resultados (1-500)
+    vault: wiki|lait|melquiades. Filtros opcionales: path_prefix (ej. "proyectos/gz-"),
+    kind (index|decision|runbook|concept…), limit (1-500).
     """
     params: dict = {"vault": vault, "limit": limit}
     if path_prefix:
@@ -247,17 +240,14 @@ async def list_notes(
 
 
 @mcp.tool()
-async def search_notes(query: str, vault: str = "all", top_n: int = 8) -> dict:
-    """Búsqueda semántica híbrida GraphRAG (vector + grafo + BM25 + reranker).
+async def search_notes(
+    query: str, vault: str = "all", top_n: int = 8, verbose: bool = False
+) -> dict:
+    """Búsqueda semántica híbrida GraphRAG: una PREGUNTA en lenguaje natural, no un grep.
 
-    Es una PREGUNTA en lenguaje natural, no un grep. Devuelve una respuesta
-    sintetizada con evidencia del grafo (evidence_docs/edges). Más potente que
-    listar y filtrar — úsalo para "cómo funciona X", "qué decisión se tomó sobre Y".
-
-    Args:
-        query: pregunta o descripción en lenguaje natural
-        vault: ámbito de búsqueda — wiki | lait | melquiades | all (default all)
-        top_n: número de documentos a rerankear (1-20, default 8)
+    Devuelve una respuesta sintetizada con evidencia (evidence_docs). Úsala para
+    "cómo funciona X" / "qué se decidió sobre Y". vault: wiki|lait|melquiades|all.
+    top_n: docs a rerankear (1-20). verbose=true añade la traza de razonamiento.
     """
     # El gateway acepta scope ∈ {wiki, lait, melquiades, all}. Pasamos el vault
     # directo para acotar; "all" es el default seguro ante valores desconocidos.
@@ -271,6 +261,7 @@ async def search_notes(query: str, vault: str = "all", top_n: int = 8) -> dict:
                 "question": query,
                 "scope": scope,
                 "top_n_rerank": top_n,
+                "verbose": verbose,
             },
         )
         resp.raise_for_status()
@@ -289,15 +280,11 @@ async def search_notes(query: str, vault: str = "all", top_n: int = 8) -> dict:
 
 @mcp.tool()
 async def lint_vault(vault: str = "", kind: str = "") -> dict:
-    """Lista los documentos indexados que violan el schema vigente (deuda de frontmatter).
+    """Documentos indexados que violan el schema vigente (deuda de frontmatter).
 
-    Revela los docs que se leen bien pero fallan cualquier escritura porque el
-    schema endureció campos requeridos y nunca se migraron. Sáldalos con
-    ``patch_frontmatter``. Sin filtros audita los 3 vaults.
-
-    Args:
-        vault: acota a un vault (wiki|lait|melquiades); vacío = todos
-        kind: acota a un kind (architecture, tool…); vacío = todos
+    Revela docs que se leen bien pero fallan al escribir por campos requeridos sin
+    migrar; sáldalos con patch_frontmatter. Sin filtros audita los 3 vaults.
+    Filtros opcionales: vault (wiki|lait|melquiades), kind (architecture, tool…).
     """
     params: dict = {}
     if vault:
@@ -313,15 +300,10 @@ async def lint_vault(vault: str = "", kind: str = "") -> dict:
 
 @mcp.tool()
 async def peek_id(vault: str, kind: str) -> dict:
-    """Consulta el último/próximo doc_id para (vault, kind) SIN consumir uno.
+    """Último/próximo doc_id para (vault, kind) SIN consumir uno (fuente autoritativa).
 
-    Fuente autoritativa (no cuentes a mano: se presta a errores). El gateway sigue
-    asignando el id real en la escritura; esto es para planear paths/cross-links o
-    validar el conteo. ``in_sync=false`` señala drift entre el contador y el índice.
-
-    Args:
-        vault: wiki | lait | melquiades
-        kind: kind canónico (decision, architecture, tool, runbook…)
+    Para planear paths/cross-links sin contar a mano. `in_sync=false` señala drift.
+    vault: wiki|lait|melquiades. kind: canónico (decision|architecture|tool|runbook…).
     """
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         resp = await client.get(
@@ -732,14 +714,10 @@ async def push_vault(vault: str) -> dict:
 
 @mcp.tool()
 async def get_contracts(doc: str, role: str = "") -> dict:
-    """Bloques tipados (capa máquina) de un documento: schemas, ejemplos, configs.
+    """Bloques tipados (json/yaml/openapi/proto/mermaid) que el ingest extrajo del doc.
 
-    Devuelve los bloques de código json/yaml/openapi/proto/mermaid que el ingest
-    extrajo del documento, listos para consumo programático (sin parsear el MD).
-
-    Args:
-        doc: doc_id canónico (ej. "MEL-HTTP-050") o ruta relativa al ObsidianVault
-        role: filtro opcional por rol del bloque (schema | example | config | …)
+    Para consumo programático sin parsear el MD. doc: doc_id canónico (ej.
+    "MEL-HTTP-050") o ruta. role: filtro opcional (schema|example|config|…).
     """
     doc_id = _resolve_doc_id(doc)
     if not doc_id:
@@ -762,13 +740,8 @@ async def add_attachment(
 ) -> dict:
     """Copia un binario (imagen, PDF) al vault y retorna el wikilink Obsidian.
 
-    Los attachments no pasan por el gateway (no son documentos gobernados): se
-    copian directamente al vault en disco.
-
-    Args:
-        source_path: ruta absoluta al archivo en el filesystem
-        filename: nombre con el que se guardará (ej. "diagrama.png")
-        folder: carpeta destino relativa al vault (default "wiki/attachments")
+    No pasa por el gateway (no es doc gobernado): copia directa al disco. source_path:
+    ruta absoluta. filename: nombre destino. folder: default "wiki/attachments".
     """
     src = Path(source_path).expanduser().resolve()
     if not src.is_file():
