@@ -4,10 +4,14 @@
 Lecturas y escrituras pasan por el gateway HTTP (puerto 7680 en dev):
 
 - Lecturas (`read_note` [con enrich opcional], `get_context`, `list_notes`,
-  `search_notes`, `get_contracts`) consultan el gateway → contenido + entidades
-  GraphRAG + documentos relacionados del grafo Neo4j + bloques tipados.
-- Escrituras (`write_note`, `append_note`, `delete_note`, `link_notes`) usan el
-  pipeline gobernado → frontmatter canónico, audit trail y commit+push a GitHub.
+  `search_notes`, `get_contracts`, `lint_vault`, `peek_id`) consultan el gateway →
+  contenido + entidades GraphRAG + documentos relacionados + bloques tipados +
+  deuda de frontmatter + contador autoritativo de doc_id.
+- Escrituras gobernadas (frontmatter canónico, audit, commit+push):
+  - `write_note` (crear/reemplazar completo), `delete_note`, `link_notes`.
+  - Edición quirúrgica server-side (lee el checkout del gateway, NO disco local;
+    no revalida el frontmatter → funciona con deuda): `edit_note` (str_replace del
+    body), `append_note` (concatena al body), `patch_frontmatter` (saldar deuda).
 - `push_vault` empuja commits locales pendientes (push fallido / commits manuales).
 - `add_attachment` copia binarios al vault directamente (no son docs gobernados).
 """
@@ -151,12 +155,10 @@ def _read_doc_id(obs_path: str) -> str | None:
         return None
 
 
-def _read_body(obs_path: str) -> str:
-    """Lee el contenido completo de un doc del vault desde disco."""
-    full = VAULT_ROOT / obs_path.lstrip("/")
-    if not full.suffix:
-        full = full.with_suffix(".md")
-    return full.read_text(encoding="utf-8") if full.exists() else ""
+# Nota (migración a server): las escrituras quirúrgicas (edit_note/append_note/
+# patch_frontmatter) NO leen disco local — el gateway lee SU checkout. Solo queda
+# _read_doc_id (usado por write_note/delete_note) acoplado al disco del agente;
+# se moverá al gateway (resolución por path) en la migración.
 
 
 # ── LECTURAS (vía gateway) ──────────────────────────────────────────────────────
@@ -272,6 +274,63 @@ async def search_notes(query: str, vault: str = "all", top_n: int = 8) -> dict:
             },
         )
         resp.raise_for_status()
+        data = resp.json()
+        # answer_status distingue una respuesta real de una degradación. Si la
+        # síntesis falló, NO leas 'answer' como respuesta (viene vacío): la
+        # recuperación sí funcionó, usa evidence_docs.
+        if data.get("answer_status") == "synthesis_failed":
+            data["message"] = (
+                "La recuperación funcionó (ver evidence_docs) pero la síntesis del "
+                f"LLM falló ({data.get('synthesis_error')}). No uses 'answer' como "
+                "respuesta; léela de evidence_docs."
+            )
+        return data
+
+
+@mcp.tool()
+async def lint_vault(vault: str = "", kind: str = "") -> dict:
+    """Lista los documentos indexados que violan el schema vigente (deuda de frontmatter).
+
+    Revela los docs que se leen bien pero fallan cualquier escritura porque el
+    schema endureció campos requeridos y nunca se migraron. Sáldalos con
+    ``patch_frontmatter``. Sin filtros audita los 3 vaults.
+
+    Args:
+        vault: acota a un vault (wiki|lait|melquiades); vacío = todos
+        kind: acota a un kind (architecture, tool…); vacío = todos
+    """
+    params: dict = {}
+    if vault:
+        params["vault"] = vault
+    if kind:
+        params["kind"] = kind
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(f"{GATEWAY_URL}/v1/lint", headers=_HEADERS, params=params)
+        if resp.status_code >= 400:
+            return _gateway_error(resp, "lint", vault=vault)
+        return resp.json()
+
+
+@mcp.tool()
+async def peek_id(vault: str, kind: str) -> dict:
+    """Consulta el último/próximo doc_id para (vault, kind) SIN consumir uno.
+
+    Fuente autoritativa (no cuentes a mano: se presta a errores). El gateway sigue
+    asignando el id real en la escritura; esto es para planear paths/cross-links o
+    validar el conteo. ``in_sync=false`` señala drift entre el contador y el índice.
+
+    Args:
+        vault: wiki | lait | melquiades
+        kind: kind canónico (decision, architecture, tool, runbook…)
+    """
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(
+            f"{GATEWAY_URL}/v1/ids/peek",
+            headers=_HEADERS,
+            params={"vault": vault, "kind": kind},
+        )
+        if resp.status_code >= 400:
+            return _gateway_error(resp, "peek_id", vault=vault, kind=kind)
         return resp.json()
 
 
@@ -344,9 +403,32 @@ async def write_note(path: str, body: str) -> dict:
         proposal = propose_resp.json()
 
         if proposal.get("violations"):
+            viols = proposal["violations"]
+            missing = [
+                v.get("field")
+                for v in viols
+                if v.get("code") == "MISSING_FRONTMATTER" and v.get("field")
+            ]
+            # En un update con campos requeridos faltantes, el contenido del agente
+            # es válido — el bloqueo es deuda de frontmatter del doc. Reencuadra el
+            # error como accionable (no como "tu contenido es inválido").
+            if target_doc_id and missing:
+                return {
+                    "status": "frontmatter_debt",
+                    "doc_id": target_doc_id,
+                    "missing_fields": missing,
+                    "violations": viols,
+                    "target_path": proposal.get("target_path"),
+                    "message": (
+                        f"El doc {target_doc_id} tiene deuda de frontmatter: faltan "
+                        f"{', '.join(missing)} (campos que el schema vigente exige). Tu "
+                        "contenido es válido; sáldalos con patch_frontmatter(path, "
+                        "set={...}) y reintenta. No reescribas el doc entero."
+                    ),
+                }
             return {
                 "status": "rejected",
-                "violations": proposal["violations"],
+                "violations": viols,
                 "target_path": proposal.get("target_path"),
             }
         if proposal.get("requires_approval"):
@@ -384,28 +466,156 @@ async def write_note(path: str, body: str) -> dict:
         # En updates el doc_id es el target; en creates viene en el frontmatter
         # del preview renderizado (propose no lo devuelve como campo propio).
         doc_id = target_doc_id or _extract_fm_id(proposal.get("rendered_preview", ""))
-        return {
+        out = {
             "status": result["status"],
             "doc_id": doc_id,
             "kind": proposal.get("classification", {}).get("kind"),
             "path": f"{vault}/{result['final_path']}",
             "commit": result["commit_sha"],
         }
+        # Deuda de frontmatter preexistente (ratchet): la escritura pasó, pero el
+        # doc arrastra campos faltantes. Se informa para que se saneé con
+        # patch_frontmatter cuando convenga (no bloquea).
+        debt = proposal.get("frontmatter_debt")
+        if debt:
+            out["frontmatter_debt"] = debt
+        return out
 
 
 @mcp.tool()
 async def append_note(path: str, content: str) -> dict:
-    """Agrega contenido al final de un documento existente vía el gateway a2a.
+    """Agrega contenido al final de un documento existente vía el gateway.
 
-    Lee el cuerpo actual, concatena el nuevo contenido y hace un write_note completo.
+    Append gobernado server-side: el gateway lee el cuerpo de SU checkout y
+    concatena (no reescribe el doc entero ni revalida el frontmatter), así que
+    funciona aunque el doc tenga deuda de frontmatter. Preserva el frontmatter.
+
+    Args:
+        path: ruta relativa al ObsidianVault (ej. "lait/proyectos/mi-proj/index.md")
+        content: contenido a agregar al final
+    """
+    vault, rel = _vault_and_relpath(path)
+    request_id = str(uuid4())
+    ik = _idempotency_key(path, content, request_id)
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(
+            f"{GATEWAY_URL}/v1/write/append",
+            headers=_HEADERS,
+            json={
+                "request_id": request_id,
+                "vault": vault,
+                "path": rel,
+                "content": content,
+                "idempotency_key": ik,
+            },
+        )
+        if resp.status_code >= 400:
+            return _gateway_error(resp, "append", path=path)
+        result = resp.json()
+        return {
+            "status": result["status"],
+            "doc_id": result.get("doc_id"),
+            "path": f"{vault}/{result['final_path']}",
+            "commit": result["commit_sha"],
+        }
+
+
+@mcp.tool()
+async def edit_note(
+    path: str, old_string: str, new_string: str, replace_all: bool = False
+) -> dict:
+    """Edita un documento reemplazando ``old_string`` por ``new_string`` (como el Edit tool).
+
+    Edición quirúrgica del CUERPO sin reinsertar el doc entero: el gateway lee su
+    checkout, aplica el reemplazo y commitea+pushea. No revalida el frontmatter
+    (funciona sobre docs con deuda). Para cambiar campos del frontmatter usa
+    ``patch_frontmatter``, no esto.
+
+    - old_string debe aparecer EXACTO (espacios/indentación incluidos).
+    - Si aparece 0 veces → error STRING no encontrado.
+    - Si aparece >1 vez y replace_all=False → error de match ambiguo (amplía el
+      contexto del old_string o pasa replace_all=True).
 
     Args:
         path: ruta relativa al ObsidianVault
-        content: contenido a agregar al final
+        old_string: texto exacto a reemplazar (en el body)
+        new_string: texto nuevo
+        replace_all: si True, reemplaza todas las ocurrencias
     """
-    existing_body = _read_body(path)
-    new_body = (existing_body.rstrip() + "\n\n" + content) if existing_body else content
-    return await write_note(path, new_body)
+    vault, rel = _vault_and_relpath(path)
+    request_id = str(uuid4())
+    ik = _idempotency_key(path, old_string, new_string, request_id)
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(
+            f"{GATEWAY_URL}/v1/write/patch",
+            headers=_HEADERS,
+            json={
+                "request_id": request_id,
+                "vault": vault,
+                "path": rel,
+                "edits": [
+                    {
+                        "old_string": old_string,
+                        "new_string": new_string,
+                        "replace_all": replace_all,
+                    }
+                ],
+                "idempotency_key": ik,
+            },
+        )
+        if resp.status_code >= 400:
+            return _gateway_error(resp, "patch", path=path)
+        result = resp.json()
+        return {
+            "status": result["status"],
+            "doc_id": result.get("doc_id"),
+            "path": f"{vault}/{result['final_path']}",
+            "commit": result["commit_sha"],
+        }
+
+
+@mcp.tool()
+async def patch_frontmatter(
+    path: str, set: dict | None = None, unset: list | None = None
+) -> dict:
+    """Arregla SOLO campos del frontmatter de un doc (saldar deuda), sin tocar el cuerpo.
+
+    Úsalo cuando una escritura falla con MISSING_FRONTMATTER porque el doc es viejo
+    y el schema endureció los campos requeridos de su kind (ej. architecture exige
+    depends_on/exposes; tool exige vendor/license/version_seen). Tras corregir, el
+    doc vuelve a aceptar write_note/edit_note/append_note normalmente.
+
+    No puede tocar claves de identidad (id/vault/org/project/kind/...). Devuelve
+    ``remaining_debt`` con lo que el schema aún exige.
+
+    Args:
+        path: ruta relativa al ObsidianVault
+        set: dict de campos a fijar/añadir (ej. {"depends_on": [], "exposes": []})
+        unset: lista de campos a borrar
+    """
+    vault, rel = _vault_and_relpath(path)
+    request_id = str(uuid4())
+    set_fields = set or {}
+    unset_fields = unset or []
+    ik = _idempotency_key(
+        path, str(sorted(set_fields)), str(sorted(unset_fields)), request_id
+    )
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(
+            f"{GATEWAY_URL}/v1/write/patch-frontmatter",
+            headers=_HEADERS,
+            json={
+                "request_id": request_id,
+                "vault": vault,
+                "path": rel,
+                "set": set_fields,
+                "unset": unset_fields,
+                "idempotency_key": ik,
+            },
+        )
+        if resp.status_code >= 400:
+            return _gateway_error(resp, "patch_frontmatter", path=path)
+        return resp.json()
 
 
 @mcp.tool()

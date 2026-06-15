@@ -28,16 +28,28 @@ registrado en los proyectos activos. El binario `obsidian` raw se conserva en
 | `list_notes(vault, path_prefix, kind, limit)` | `GET /v1/list` | Lista docs indexados (índice Postgres, no filesystem). Filtros opcionales. Latencia ~15s tras un write |
 | `search_notes(query, vault, top_n)` | `POST /v1/graphrag/query` | Búsqueda **semántica** (vector + grafo + BM25 + reranker): una pregunta en lenguaje natural. `vault` (scope): wiki \| lait \| melquiades \| all (default `all`) |
 | `get_contracts(doc, role="")` | `GET /v1/contracts/{doc_id}[/{role}]` | Bloques tipados (json/yaml/openapi/proto/mermaid) del doc, listos para consumo máquina. `doc` acepta doc_id canónico o path; `role` filtra (schema \| example \| config…) |
-| `write_note(path, body)` | `propose` + `apply` | Crea/reemplaza un doc. `body` es **siempre** el documento completo (no hay edición por str_replace) |
-| `append_note(path, content)` | `read` + `propose` + `apply` | Agrega contenido al final (lee el body actual y reescribe completo) |
+| `write_note(path, body)` | `propose` + `apply` | Crea/reemplaza un doc completo. `body` es **siempre** el documento entero. Para cambios puntuales usa `edit_note`/`append_note`/`patch_frontmatter` |
+| `edit_note(path, old_string, new_string, replace_all=False)` | `POST /v1/write/patch` | **Edición quirúrgica del body** (como el Edit tool): reemplaza `old_string`→`new_string` sin reinsertar el doc. El gateway lee SU checkout (no disco local). No revalida el frontmatter → funciona con deuda. old_string debe ser exacto; ambiguo → usa `replace_all` |
+| `append_note(path, content)` | `POST /v1/write/append` | Concatena `content` al final del body (server-side, no reescribe el doc ni revalida el frontmatter) |
+| `patch_frontmatter(path, set={}, unset=[])` | `POST /v1/write/patch-frontmatter` | **Salda deuda de frontmatter**: fija/borra campos sin tocar el body. Para arreglar docs viejos que fallan por `MISSING_FRONTMATTER`. No toca claves de identidad. Devuelve `remaining_debt` |
 | `delete_note(path, reason)` | `POST /v1/write/delete` | Borra un doc (requiere `id` en frontmatter + estar indexado en GraphRAG) |
 | `link_notes(source, target, relation="related")` | `POST /v1/write/link` | Cross-link gobernado: añade el doc_id del target a la lista frontmatter `relation` del doc ORIGEN (commit+push+audit; el watcher lo materializa en el grafo). `source`/`target` aceptan doc_id o path. Idempotente |
+| `lint_vault(vault="", kind="")` | `GET /v1/lint` | Lista docs indexados que violan el schema vigente (deuda de frontmatter). Sin filtros audita los 3 vaults. Sáldalos con `patch_frontmatter` |
+| `peek_id(vault, kind)` | `GET /v1/ids/peek` | Último/próximo doc_id para `(vault, kind)` SIN consumir uno (no cuentes a mano). `in_sync=false` señala drift contador↔índice |
 | `push_vault(vault)` | `POST /v1/sync/push` | Empuja commits locales pendientes a GitHub (push fallido / commits manuales). Al día → `pushed: false`. Requiere scope `sync` |
 | `add_attachment(source_path, filename, folder)` | — (filesystem directo) | Copia un binario (imagen/PDF) al vault y retorna el wikilink `![[...]]`. Los attachments no son docs gobernados |
 
-> **Cambio respecto al MCP raw:** `edit_note` (str_replace) **ya no existe** — el gateway
-> no soporta ediciones parciales. Para un cambio puntual: `read_note` (traer el body
-> actual) y luego `write_note` con el body completo modificado.
+> **Edición quirúrgica gobernada (Fase 8):** `edit_note` (str_replace del body),
+> `append_note` y `patch_frontmatter` editan en puntos específicos vía
+> `apply_transform` del gateway — **no reinsertas el doc entero**. El gateway lee SU
+> checkout (no el disco local del agente → robusto ante la migración a server) y
+> **no revalida el frontmatter**, así que funcionan aunque el doc arrastre deuda. Si
+> una escritura falla con `MISSING_FRONTMATTER`, sáldala con `patch_frontmatter` y
+> reintenta; `lint_vault` revela qué docs tienen deuda.
+
+> **`search_notes` — degradación explícita:** la respuesta incluye `answer_status`
+> (`ok` | `no_evidence` | `synthesis_failed`). Si es `synthesis_failed`, NO uses
+> `answer` (viene vacío): la recuperación sí funcionó, lee `evidence_docs`.
 
 ## Traducción de paths
 
