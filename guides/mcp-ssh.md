@@ -7,12 +7,56 @@ El mismo binario (`server.py`) sirve para múltiples servidores — se diferenci
 
 ## Tools disponibles
 
-| Tool         | Descripción                                              |
-|--------------|----------------------------------------------------------|
-| `shell`      | Ejecuta un comando bash arbitrario en el servidor remoto |
-| `read_file`  | Lee el contenido de un archivo remoto (SFTP)             |
-| `write_file` | Escribe contenido a un archivo remoto (SFTP)             |
-| `list_dir`   | Lista el contenido de un directorio remoto               |
+| Tool            | Descripción                                                        |
+|-----------------|-------------------------------------------------------------------|
+| `shell`         | Ejecuta un comando bash arbitrario en el servidor remoto          |
+| `read_file`     | Lee un archivo de **texto** remoto (SFTP). Binarios/grandes → redirige a `download_file` |
+| `write_file`    | Escribe **texto** a un archivo remoto (SFTP)                      |
+| `download_file` | Descarga un archivo remoto a disco local (SFTP, disco-a-disco)    |
+| `upload_file`   | Sube un archivo local al servidor remoto (SFTP, disco-a-disco)    |
+| `list_dir`      | Lista el contenido de un directorio remoto                        |
+
+## Transferencia de archivos (binarios y archivos grandes)
+
+`read_file`/`write_file` son **solo para texto**: el contenido pasa por el contexto del modelo,
+así que no sirven para binarios (se corrompen al decodificar como UTF-8) ni para archivos de varios MB.
+
+Para **cualquier** archivo —especialmente binarios de decenas de MB— usar siempre `download_file` /
+`upload_file`. Estas tools transfieren vía SFTP **disco-a-disco en la máquina local** (igual que `scp`,
+pero dentro del MCP auditable): los bytes nunca tocan el chat, solo se devuelve la ruta, el tamaño y el
+sha256. Esto evita tener que salirse a `scp` nativo.
+
+### `download_file`
+
+| Parámetro     | Requerido | Descripción                                                                 |
+|---------------|-----------|-----------------------------------------------------------------------------|
+| `remote_path` | Sí        | Ruta absoluta del archivo en el servidor remoto                             |
+| `local_path`  | No        | Ruta local destino. Si se omite → `<download-dir>/<nombre>` (default `/tmp`) |
+| `verify`      | No        | Si `true`, compara el sha256 local contra el `sha256sum` remoto             |
+
+```
+# Bajar un binario de ~20 MB y verificar integridad contra el remoto:
+download_file(remote_path="/tmp/trader-bro-data.tgz", verify=true)
+# → Descargado: /tmp/trader-bro-data.tgz → /tmp/trader-bro-data.tgz
+#   bytes: 20658176
+#   sha256: <hash>
+#   verified: true (remoto <hash>)
+```
+
+### `upload_file`
+
+| Parámetro     | Requerido | Descripción                                                       |
+|---------------|-----------|-------------------------------------------------------------------|
+| `local_path`  | Sí        | Ruta del archivo local a subir                                    |
+| `remote_path` | Sí        | Ruta absoluta destino en el remoto (se crea el directorio padre)  |
+| `verify`      | No        | Si `true`, compara el sha256 local contra el `sha256sum` remoto   |
+
+```
+upload_file(local_path="~/build/app.bin", remote_path="/opt/app/app.bin", verify=true)
+```
+
+Guard de `read_file`: si el archivo supera 256 KB o contiene bytes nulos, devuelve un mensaje que
+redirige a `download_file` en vez de texto corrupto.
 
 ## Argumentos del servidor
 
@@ -24,6 +68,7 @@ El mismo binario (`server.py`) sirve para múltiples servidores — se diferenci
 | `--key-file`     | No*       | Ruta a la clave privada SSH (recomendado)          |
 | `--password`     | No*       | Password SSH (alternativa a `--key-file`)          |
 | `--sudo-password`| No        | Password de sudo en el servidor remoto             |
+| `--download-dir` | No        | Destino por defecto de `download_file` (default `/tmp`) |
 | `--name`         | No        | Nombre descriptivo del servidor para los tools     |
 
 *Se debe proveer `--key-file` o `--password`.

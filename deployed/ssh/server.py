@@ -3,6 +3,9 @@
 
 import argparse
 import asyncio
+import hashlib
+import os
+import shlex
 import stat
 import paramiko
 from mcp.server import Server
@@ -16,12 +19,34 @@ parser.add_argument("--user", required=True)
 parser.add_argument("--key-file", default=None)
 parser.add_argument("--password", default=None)
 parser.add_argument("--sudo-password", default=None)
+parser.add_argument("--download-dir", default="/tmp")
 parser.add_argument("--name", default=None)
 args, _ = parser.parse_known_args()
 
 SERVER_LABEL = args.name or args.host
 
+# Umbral por encima del cual read_file deja de devolver texto y redirige a download_file.
+READ_TEXT_LIMIT = 256 * 1024  # 256 KB
+
 app = Server(f"ssh-{SERVER_LABEL}")
+
+
+def _sha256(path: str) -> str:
+    """sha256 de un archivo local leyendo en bloques (no carga todo en RAM)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _remote_sha256(client: paramiko.SSHClient, remote_path: str) -> str | None:
+    """sha256 del archivo remoto vía `sha256sum`; None si no se pudo calcular."""
+    _, stdout, _ = client.exec_command(f"sha256sum {shlex.quote(remote_path)}", timeout=120)
+    out = stdout.read().decode("utf-8", errors="replace").strip()
+    if stdout.channel.recv_exit_status() != 0 or not out:
+        return None
+    return out.split()[0]
 
 
 def _connect() -> paramiko.SSHClient:
@@ -53,7 +78,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="read_file",
-            description=f"Lee el contenido de un archivo en {SERVER_LABEL}.",
+            description=f"Lee el contenido de un archivo de texto en {SERVER_LABEL}. Solo para texto: si el archivo es binario o grande (>256 KB) la herramienta redirige a download_file en vez de devolver el contenido.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -64,7 +89,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="write_file",
-            description=f"Escribe contenido a un archivo en {SERVER_LABEL}.",
+            description=f"Escribe contenido de texto a un archivo en {SERVER_LABEL}. Solo para texto. Para binarios o archivos grandes usá upload_file.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -72,6 +97,32 @@ async def list_tools() -> list[types.Tool]:
                     "content": {"type": "string", "description": "Contenido a escribir"},
                 },
                 "required": ["path", "content"],
+            },
+        ),
+        types.Tool(
+            name="download_file",
+            description=f"Descarga un archivo desde {SERVER_LABEL} a la máquina local vía SFTP (disco-a-disco). Es la vía correcta para CUALQUIER archivo —incluidos binarios de decenas de MB—: los bytes no pasan por el chat, solo se devuelve la ruta local y metadata. Usar esto en vez de read_file/scp para traer binarios.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "remote_path": {"type": "string", "description": "Ruta absoluta del archivo en el servidor remoto"},
+                    "local_path": {"type": "string", "description": f"Ruta local destino. Si se omite, se usa <download-dir>/<nombre> (download-dir actual: {args.download_dir})"},
+                    "verify": {"type": "boolean", "default": False, "description": "Si true, compara el sha256 local contra el sha256sum remoto y reporta verified"},
+                },
+                "required": ["remote_path"],
+            },
+        ),
+        types.Tool(
+            name="upload_file",
+            description=f"Sube un archivo local a {SERVER_LABEL} vía SFTP (disco-a-disco). Es la vía correcta para CUALQUIER archivo —incluidos binarios de decenas de MB—: los bytes no pasan por el chat. Crea el directorio remoto destino si no existe. Usar esto en vez de write_file/scp para subir binarios.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "local_path": {"type": "string", "description": "Ruta del archivo local a subir"},
+                    "remote_path": {"type": "string", "description": "Ruta absoluta destino en el servidor remoto"},
+                    "verify": {"type": "boolean", "default": False, "description": "Si true, compara el sha256 local contra el sha256sum remoto y reporta verified"},
+                },
+                "required": ["local_path", "remote_path"],
             },
         ),
         types.Tool(
@@ -110,10 +161,78 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 output = out or err or "(sin output)"
 
         elif name == "read_file":
+            path = arguments["path"]
             sftp = client.open_sftp()
-            with sftp.open(arguments["path"], "r") as f:
-                output = f.read().decode("utf-8", errors="replace")
+            size = sftp.stat(path).st_size
+            if size > READ_TEXT_LIMIT:
+                sftp.close()
+                output = (
+                    f"Archivo demasiado grande para texto ({size} bytes). "
+                    f"Usá download_file(remote_path={path!r}) para traerlo a disco sin pasarlo por el contexto."
+                )
+            else:
+                with sftp.open(path, "r") as f:
+                    raw = f.read()
+                sftp.close()
+                if b"\x00" in raw:
+                    output = (
+                        f"El archivo parece binario ({size} bytes). "
+                        f"Usá download_file(remote_path={path!r}) para traerlo a disco sin pasarlo por el contexto."
+                    )
+                else:
+                    output = raw.decode("utf-8", errors="replace")
+
+        elif name == "download_file":
+            remote_path = arguments["remote_path"]
+            local_path = arguments.get("local_path") or os.path.join(
+                args.download_dir, os.path.basename(remote_path.rstrip("/"))
+            )
+            local_path = os.path.abspath(os.path.expanduser(local_path))
+            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+            sftp = client.open_sftp()
+            sftp.get(remote_path, local_path)
             sftp.close()
+            size = os.path.getsize(local_path)
+            sha = _sha256(local_path)
+            lines = [
+                f"Descargado: {remote_path} → {local_path}",
+                f"bytes: {size}",
+                f"sha256: {sha}",
+            ]
+            if arguments.get("verify"):
+                remote_sha = _remote_sha256(client, remote_path)
+                if remote_sha is None:
+                    lines.append("verified: desconocido (no se pudo calcular sha256sum remoto)")
+                else:
+                    lines.append(f"verified: {str(remote_sha == sha).lower()} (remoto {remote_sha})")
+            output = "\n".join(lines)
+
+        elif name == "upload_file":
+            local_path = os.path.abspath(os.path.expanduser(arguments["local_path"]))
+            remote_path = arguments["remote_path"]
+            if not os.path.isfile(local_path):
+                raise FileNotFoundError(f"No existe el archivo local: {local_path}")
+            remote_dir = os.path.dirname(remote_path.rstrip("/"))
+            if remote_dir:
+                _, mk_out, _ = client.exec_command(f"mkdir -p {shlex.quote(remote_dir)}")
+                mk_out.channel.recv_exit_status()  # esperar a que mkdir termine
+            sftp = client.open_sftp()
+            sftp.put(local_path, remote_path)
+            sftp.close()
+            size = os.path.getsize(local_path)
+            sha = _sha256(local_path)
+            lines = [
+                f"Subido: {local_path} → {remote_path}",
+                f"bytes: {size}",
+                f"sha256: {sha}",
+            ]
+            if arguments.get("verify"):
+                remote_sha = _remote_sha256(client, remote_path)
+                if remote_sha is None:
+                    lines.append("verified: desconocido (no se pudo calcular sha256sum remoto)")
+                else:
+                    lines.append(f"verified: {str(remote_sha == sha).lower()} (remoto {remote_sha})")
+            output = "\n".join(lines)
 
         elif name == "write_file":
             sftp = client.open_sftp()
