@@ -114,6 +114,32 @@ def build_mcp_servers(servers_config: list) -> dict:
                 "OBSIDIAN_VAULT": entry["vault_path"],
             }
 
+        elif kind == "webprobe":
+            args = [
+                f"{MCP_SERVERS_DIR}/webprobe/server.py",
+                f"--browser={entry.get('browser', 'chromium')}",
+                f"--name={entry['name']}",
+            ]
+            if entry.get("base_url"):
+                args.append(f"--base-url={entry['base_url']}")
+            if entry.get("headless", True):
+                args.append("--headless")
+            else:
+                args.append("--headed")
+            # headed conmutable en runtime salvo opt-out explícito (estilo allow_flush de redis).
+            if entry.get("allow_headed", True) is False:
+                args.append("--forbid-headed")
+            if entry.get("persistent_profile"):
+                args.append(f"--persistent-profile={entry['persistent_profile']}")
+            for k, flag in (("max_tabs", "--max-tabs"),
+                            ("tab_idle_timeout", "--tab-idle-timeout"),
+                            ("browser_idle_timeout", "--browser-idle-timeout"),
+                            ("artifact_dir", "--artifact-dir"),
+                            ("artifact_ttl", "--artifact-ttl"),
+                            ("max_artifacts", "--max-artifacts")):
+                if entry.get(k) is not None:
+                    args.append(f"{flag}={entry[k]}")
+
         else:
             print(f"WARN: tipo desconocido '{kind}' para '{name}', ignorando.")
             continue

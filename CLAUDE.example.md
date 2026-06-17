@@ -24,7 +24,8 @@ Skills/
 │   ├── mcp-gcloud.md            ← cómo crear MCP de Google Cloud
 │   ├── mcp-lottie-creator.md    ← LottieFiles Creator (npm + browser)
 │   ├── mcp-obsidian.md          ← vault Obsidian
-│   └── mcp-ssh.md               ← cómo crear MCP para servidores SSH
+│   ├── mcp-ssh.md               ← cómo crear MCP para servidores SSH
+│   └── mcp-webprobe.md          ← diagnóstico de landings (Playwright)
 ├── examples/
 │   ├── mcp-database/server.py   ← MCP mínimo para PostgreSQL
 │   ├── mcp-gcloud/server.py     ← MCP mínimo para gcloud
@@ -34,7 +35,8 @@ Skills/
     ├── gcloud/server.py         ← servidor gcloud en producción
     ├── postgres/server.py       ← servidor postgres en producción
     ├── ssh/server.py            ← servidor SSH en producción
-    └── obsidian/server.py       ← servidor Obsidian en producción
+    ├── obsidian/server.py       ← servidor Obsidian en producción
+    └── webprobe/server.py       ← diagnóstico de landings (Playwright)
 ```
 
 ## MCPs activos
@@ -50,12 +52,14 @@ Completar con los MCPs propios. Ejemplo de estructura:
 | `ssh-servidor-01`   | Python custom | 192.168.1.100              |
 | `obsidian`              | Python custom | Vault: ~/ObsidianVault     |
 | `lottiefiles-creator`   | npm oficial   | Creator + `~/.claude/mcp-servers/lottie/` |
+| `webprobe`              | Python custom | Diagnóstico de landings (Playwright): FPS/jank/INP/latencia de botón + entrance-check |
 
 El servidor gcloud está en: `~/.claude/mcp-servers/gcloud/server.py`  
 El servidor postgres está en: `~/.claude/mcp-servers/postgres/server.py`  
 El servidor SSH está en: `~/.claude/mcp-servers/ssh/server.py`  
 El servidor Obsidian está en: `~/.claude/mcp-servers/obsidian/server.py`  
 Lottie: `~/.claude/mcp-servers/lottie/node_modules/@lottiefiles/creator-mcp/dist/index.mjs` (instalar con `scripts/install-lottie-mcp.sh`).  
+El servidor webprobe está en: `~/.claude/mcp-servers/webprobe/server.py` (instalar con `scripts/install-webprobe-mcp.sh`; agrega `playwright` al venv + `playwright install chromium`). Una sola instancia genérica; el agente pasa la URL en `goto`. Ver `guides/mcp-webprobe.md`.  
 Ambas instancias gcloud usan el mismo binario con distintos `--project` y `--account`.  
 Ambas instancias postgres usan el mismo binario con distintos `--db`.  
 En **Cursor**, Lottie y Obsidian suelen ir en `~/.cursor/mcp.json` (global). Ver `guides/mcp-lottie-creator.md` y `guides/cursor.md`.
