@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MCP focusyn: reemplazo completo de obsidian-raw vía el focusyn.
 
-Lecturas y escrituras pasan por el gateway HTTP (puerto 7680 en dev):
+Lecturas y escrituras pasan por el gateway HTTP (puerto 7415 en dev):
 
 - Lecturas (`read_note` [con enrich opcional], `get_context`, `list_notes`,
   `search_notes`, `get_contracts`, `lint_vault`, `peek_id`) consultan el gateway →
@@ -29,7 +29,7 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("focusyn")
 
-GATEWAY_URL = os.environ.get("FOCUSYN_GATEWAY_URL", "http://localhost:7680")
+GATEWAY_URL = os.environ.get("FOCUSYN_GATEWAY_URL", "http://localhost:7415")
 GATEWAY_KEY = os.environ["FOCUSYN_GATEWAY_KEY"]
 VAULT_ROOT = Path(os.environ.get("OBSIDIAN_VAULT", "/home/melquiades/ObsidianVault"))
 

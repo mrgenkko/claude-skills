@@ -13,7 +13,7 @@ gateway. Reemplaza por completo al MCP `obsidian` raw (acceso directo al filesys
 - `add_attachment` copia binarios al vault directamente (no son docs gobernados).
 
 Uso:
-    FOCUSYN_GATEWAY_URL=http://localhost:7680 \\
+    FOCUSYN_GATEWAY_URL=http://localhost:7415 \\
     FOCUSYN_GATEWAY_KEY=a2a_<KEY> \\
     OBSIDIAN_VAULT=/ruta/al/ObsidianVault \\
     python3 server.py
@@ -38,7 +38,7 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("focusyn")
 
-GATEWAY_URL = os.environ.get("FOCUSYN_GATEWAY_URL", "http://localhost:7680")
+GATEWAY_URL = os.environ.get("FOCUSYN_GATEWAY_URL", "http://localhost:7415")
 GATEWAY_KEY = os.environ["FOCUSYN_GATEWAY_KEY"]
 VAULT_ROOT = Path(os.environ.get("OBSIDIAN_VAULT", os.path.expanduser("~/ObsidianVault")))
 

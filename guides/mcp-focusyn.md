@@ -121,14 +121,14 @@ uv run focusyn agent rotate-key focusyn
 
 ```bash
 cd /home/melquiades/focusyn
-make dev          # uvicorn a2a_gateway.main:app --reload --port 7680
+make dev          # uvicorn a2a_gateway.main:app --reload --port 7415
 ```
 
 Verificar:
 
 ```bash
-curl -s http://localhost:7680/health        # status ok + dependencias
-curl -s http://localhost:7680/v1/capabilities
+curl -s http://localhost:7415/health        # status ok + dependencias
+curl -s http://localhost:7415/v1/capabilities
 ```
 
 ### 3. Copiar el servidor MCP
@@ -145,7 +145,7 @@ cp "~/Mrgenkko Skills/deployed/focusyn/server.py" \
 {
   "name": "focusyn",
   "type": "focusyn",
-  "gateway_url": "http://localhost:7680",
+  "gateway_url": "http://localhost:7415",
   "gateway_key": "a2a_<KEY>",
   "vault_path": "/home/melquiades/ObsidianVault"
 }
@@ -173,7 +173,7 @@ Después: **reiniciar Claude Code en VSCode** para que cargue el MCP.
 
 | Variable | Valor dev | Descripción |
 |---|---|---|
-| `FOCUSYN_GATEWAY_URL` | `http://localhost:7680` | URL base del gateway |
+| `FOCUSYN_GATEWAY_URL` | `http://localhost:7415` | URL base del gateway |
 | `FOCUSYN_GATEWAY_KEY` | `a2a_<...>` | API key del agente MCP (header `X-Agent-Key`) |
 | `OBSIDIAN_VAULT` | `/home/melquiades/ObsidianVault` | Raíz del vault en el host (para leer el `id` del frontmatter y para `add_attachment`) |
 
