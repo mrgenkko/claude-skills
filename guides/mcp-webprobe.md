@@ -27,7 +27,7 @@ encaja con gcloud/postgres/ssh/redis.
 | Sesión | `status` | Estado (running, tabs, url, modo). Barato: **no** arranca el browser. |
 | Sesión | `goto` | Navega a una URL (relativa a `--base-url` o completa). Arranca el browser solo. |
 | Sesión | `reload`, `set_viewport` | Recargar / cambiar viewport. |
-| Sesión | `set_mode` | headless↔headed en runtime (gate `allow_headed`). |
+| Sesión | `set_mode` | `headed` (headless↔headed en runtime, gate `allow_headed`) y/o `reduced_motion` (`reduce`\|`no-preference`, emula prefers-reduced-motion sin relanzar — valida la rama `useReducedMotion` del DS). |
 | Pestañas | `open_tab`, `list_tabs`, `switch_tab`, `close_tab` | Multi-pestaña (comparar variantes lado a lado). |
 | Pestañas | `close_browser` | Cierra todo y libera RAM. |
 | Inspección | `inspect_buttons` | **Resumen** de un DS: `{total, warns, signatures[], offenders[]}` — agrupa botones idénticos por firma (NO devuelve 153 clones), detalla solo los ofensores (motion+transform o `transition:all` con duración >0). `include_all` para el array completo. |
@@ -38,14 +38,14 @@ encaja con gcloud/postgres/ssh/redis.
 | **Perf** | `button_latency` | Latencia click→repaint (INP-like). `nth` para desambiguar; avisa si el click navega. `verdict: good\|ok\|slow`. |
 | **Perf** | `long_tasks` | Long tasks / LoAF que bloquean el render + top-3 ofensores. |
 | **Perf** | `entrance_animation_check` | ¿La animación de entrada **on-load** dispara o el elemento aparece estático? + reduced-motion (`nth` opcional). |
-| **Perf** | `interaction_animation` | Animación por **click/hover** (modal/drawer): todos los ejes (translateX/Y+scale, scale normalizado por tamaño), `settle_ms`+`opacity_settle_ms`, overshoot **con magnitud** (%), `nth` en trigger/target, `reset` (escape/reload/none) para destapar el siguiente. Target **opcional** → mide el propio trigger (hover sobre un botón). Verdict ok/overshoot_leve(>5%)/overshoot_fuerte(>15%)/opacity_incompleta. |
+| **Perf** | `interaction_animation` | Animación por **click/hover** (modal/drawer): todos los ejes (translateX/Y+scale, scale normalizado por tamaño), `settle_ms`+`opacity_settle_ms`, overshoot **con magnitud** (%), `nth` en trigger/target, `reset` (escape/reload/none) para destapar el siguiente. Target **opcional** → mide el propio trigger (hover sobre un botón). `target_within_trigger` (CSS relativo al trigger ya resuelto) para transform propagado padre→hijo: sigue a `trigger_nth` sin nth global desalineado. Verdict ok/overshoot_leve(>5%)/overshoot_fuerte(>15%)/opacity_incompleta. |
 | **Perf** | `web_vitals` | LCP, CLS, INP, TBT. |
 | Captura | `screenshot` | PNG: `return=path` (disco, barato) o `return=inline` (base64, cliente remoto). |
 | Captura | `record_trace` | Playwright trace (pesado, opt-in) a `--artifact-dir`. |
 
 Todas las tools de inspección/perf aceptan `tab` opcional (default: la activa).
 
-**Selección por texto/rol** (clave para no depender de selectores estructurales frágiles): las tools de acción (`button_latency`, `entrance_animation_check`, `interaction_animation` trigger, `get_computed_style`, `outer_html`) aceptan, además de CSS, los engines de Playwright: `text="Abrir Modal"`, `role=button[name="Guardar"]`, `button:has-text("right")`. "El botón que dice X" es estable ante cambios de layout. (El `target_selector` de `interaction_animation` es la excepción: solo CSS, porque se sondea en vivo.)
+**Selección por texto/rol** (clave para no depender de selectores estructurales frágiles): las tools de acción (`button_latency`, `entrance_animation_check`, `interaction_animation` trigger, `get_computed_style`, `outer_html`) aceptan, además de CSS, los engines de Playwright: `text="Abrir Modal"`, `role=button[name="Guardar"]`, `button:has-text("right")`. "El botón que dice X" es estable ante cambios de layout. (El `target_selector` de `interaction_animation` es la excepción: solo CSS puro, porque se inyecta a `querySelectorAll`; si le pasás un engine no-CSS falla con un mensaje explícito desde el primer intento y sugiere `target_within_trigger`.)
 
 ## Ciclo de vida del browser (3 capas)
 
@@ -67,6 +67,18 @@ runtime con `set_mode(headed=true/false)` (hace teardown + relaunch). El gate es
 capacidad `allow_headed` (default `true`): si la ponés en `false` (ej. server sin
 display), `set_mode(headed=true)` se rechaza. **Patrón idéntico al `allow_flush` de
 redis.** En esta máquina hay WSLg, así que headed abre ventana real.
+
+## prefers-reduced-motion (a11y)
+
+`set_mode(reduced_motion="reduce")` emula la media query `prefers-reduced-motion: reduce`
+sin relanzar el browser (se aplica por page con `emulateMedia`, y `matchMedia` la refleja).
+Sirve para validar que el DS respeta la rama `useReducedMotion`: en `reduce`, una animación
+gateada debe quedar **estática** (`interaction_animation` reporta `axes: (sin movimiento)` y
+`entrance_animation_check` reporta `reduced_motion_active: true`). El patrón de test es
+medir baseline (`no-preference`) → `set_mode(reduced_motion="reduce")` → re-medir el mismo
+target: la diferencia (ej. `scale Δ0.12` vs `Δ0`) prueba que el componente respeta la
+preferencia. El override persiste a tabs nuevas y a un relaunch por cambio de `headed`.
+También se puede fijar el modo de arranque con `--reduced-motion reduce` en el registro.
 
 ## Artefactos (screenshots / traces) y transporte
 
@@ -149,8 +161,15 @@ measure_fps(action="scroll", duration_ms=3000)   # ¿scroll a tirones? (Lenis/pi
 entrance_animation_check("section.hero h1")      # ¿el reveal on-load dispara?
 interaction_animation('text="Abrir Modal"', ".shadow-xl")   # modal: settle/opacity/overshoot (target CSS)
 interaction_animation('text="Lift"', event="hover")          # hover sobre el botón (target omitido = self)
+# transform propagado padre→hijo (Motion whileHover en el <a>, medido en su <svg> hijo):
+interaction_animation("nav ul li a", trigger_nth=2,
+                      target_within_trigger="span svg", event="hover")  # sigue a trigger_nth, sin nth global
 button_latency('text="Empezar"')        # latencia click→repaint (text/role estable, no frágil)
 web_vitals()                            # LCP/CLS/INP/TBT
+# validar la rama reduced-motion del DS (useReducedMotion): debe quedar estático
+set_mode(reduced_motion="reduce")                          # emula prefers-reduced-motion sin relanzar
+interaction_animation("main span.inline-flex", event="hover")  # mismo target → axes: (sin movimiento)
+set_mode(reduced_motion="no-preference")                   # volver a baseline
 set_mode(headed=true)                   # (opcional) ver a ojo con ventana real (WSLg)
 ```
 

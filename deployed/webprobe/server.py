@@ -13,6 +13,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import time
 
 from mcp.server import Server
@@ -54,7 +55,7 @@ SERVER_LABEL = args.name or "webprobe"
 # Bump en cada cambio de comportamiento. El agente lo ve en status() para saber si el
 # proceso MCP está stale (un MCP es de vida larga; editar server.py NO recarga el proceso
 # vivo — hay que reiniciar Claude Code / recargar la ventana de VSCode).
-WEBPROBE_VERSION = "0.3.2"
+WEBPROBE_VERSION = "0.3.3"
 app = Server(f"webprobe-{SERVER_LABEL}")
 
 
@@ -69,6 +70,7 @@ class _State:
     active = None            # tab_id activo
     last_activity = 0.0      # time.monotonic() del último tool call
     headless_current = args.headless
+    reduced_motion_current = args.reduced_motion   # None | "reduce" | "no-preference" (override runtime)
     tab_counter = 0
     artifact_counter = 0
 
@@ -143,8 +145,8 @@ async def _ensure_browser_locked():
         "viewport": {"width": args.viewport_w, "height": args.viewport_h},
         "device_scale_factor": args.dpr,
     }
-    if args.reduced_motion:
-        ctx_kwargs["reduced_motion"] = args.reduced_motion
+    if _state.reduced_motion_current:
+        ctx_kwargs["reduced_motion"] = _state.reduced_motion_current
 
     if args.persistent_profile:
         _state.context = await launcher.launch_persistent_context(
@@ -168,6 +170,13 @@ async def _ensure_browser_locked():
 
 async def _new_tab_locked(label: str = None) -> str:
     page = await _state.context.new_page()
+    # el context ya nace con reduced_motion del estado runtime; pero si se cambió en
+    # caliente (sin relanzar browser), el context conserva el valor viejo → reaplicar por page.
+    if _state.reduced_motion_current:
+        try:
+            await page.emulate_media(reduced_motion=_state.reduced_motion_current)
+        except Exception:
+            pass
     tid = _new_tab_id()
     _state.tabs[tid] = {"page": page, "label": label or "", "last_used": time.monotonic()}
     _state.active = tid
@@ -207,6 +216,22 @@ async def _ensure_page(tab: str = None):
             _state.active = tab_id
             _state.last_activity = time.monotonic()
     return page
+
+
+# motores de selector de Playwright que NO son CSS puro (no los entiende querySelectorAll).
+_NON_CSS_PREFIX = re.compile(r"^\s*(text|role|xpath|css|id|data-testid|alt|title|placeholder)\s*=")
+_NON_CSS_PSEUDOS = (":has-text(", ":text(", ":text-is(", ":text-matches(",
+                    ":visible", ":nth-match(", ":right-of(", ":left-of(", ":near(", ">>")
+
+
+def _looks_non_css(sel: str) -> bool:
+    """¿El selector usa un motor de Playwright (text=/role=/:has-text(...)) que el JS
+    inyectado no puede pasar a querySelectorAll? Sirve para fallar con mensaje claro."""
+    if not sel:
+        return False
+    if _NON_CSS_PREFIX.match(sel):
+        return True
+    return any(p in sel for p in _NON_CSS_PSEUDOS)
 
 
 async def _handle(page, selector: str, nth: int = 0, timeout: int = 4000):
@@ -437,6 +462,12 @@ _JS_INTERACTION_ANIM = r"""
   // ancestro clickable/motion: es quien recibe whileHover/onClick (no el span interno).
   const clickable = trigger.closest('button, a, [role="button"], [data-projection-id]') || trigger;
   const qTarget = () => {
+    // descendiente relativo al trigger ya resuelto: sigue automáticamente a trigger_nth,
+    // sin nth global desalineado (el caso común de transform propagado padre→hijo).
+    if (args.target_within_trigger) {
+      try { return clickable.querySelectorAll(args.target_within_trigger)[args.target_nth || 0] || null; }
+      catch (e) { return null; }
+    }
     if (!args.target_selector) return clickable;   // sin target → mide el ancestro clickable (hover sobre sí mismo)
     try { return document.querySelectorAll(args.target_selector)[args.target_nth || 0] || null; }
     catch (e) { return null; }                   // selector no-CSS en target → tratado como "no encontrado"
@@ -756,19 +787,48 @@ async def _tool_set_viewport(arguments: dict) -> str:
 
 
 async def _tool_set_mode(arguments: dict) -> str:
-    headed = bool(arguments["headed"])
-    if headed and not args.allow_headed:
-        return ("set_mode(headed) deshabilitado en esta instancia (allow_headed=false). "
-                "Re-registrá sin --forbid-headed (allow_headed:true en secrets.json) para permitirlo.")
-    new_headless = not headed
-    async with _lock:
-        if (_state.headless_current == new_headless
-                and _state.browser is not None and _state.browser.is_connected()):
-            return f"sin cambios: ya está {'headed' if headed else 'headless'}"
-        _state.headless_current = new_headless
-        await _teardown_quiet_locked()
-    await _ensure_page()  # relanza ya, en el nuevo modo
-    return f"modo: {'headed' if headed else 'headless'} (browser relanzado)"
+    rm = arguments.get("reduced_motion")
+    headed_arg = arguments.get("headed")
+    if rm is None and headed_arg is None:
+        return ("set_mode: pasá 'headed' (bool, headless↔headed) y/o "
+                "'reduced_motion' ('reduce' | 'no-preference', emula prefers-reduced-motion).")
+    msgs = []
+
+    # reduced-motion: no requiere teardown — se emula por page (matchMedia lo refleja).
+    if rm is not None:
+        if rm not in ("reduce", "no-preference"):
+            return "reduced_motion debe ser 'reduce' o 'no-preference'"
+        async with _lock:
+            _state.reduced_motion_current = rm
+            pages = [info["page"] for info in _state.tabs.values()]
+        for pg in pages:
+            try:
+                await pg.emulate_media(reduced_motion=rm)
+            except Exception:
+                pass
+        msgs.append(f"reduced_motion: {rm} (aplicado a {len(pages)} tab(s) abiertas + las nuevas)")
+
+    # headed/headless: sí requiere teardown + relaunch.
+    if headed_arg is not None:
+        headed = bool(headed_arg)
+        if headed and not args.allow_headed:
+            return ("set_mode(headed) deshabilitado en esta instancia (allow_headed=false). "
+                    "Re-registrá sin --forbid-headed (allow_headed:true en secrets.json) para permitirlo.")
+        new_headless = not headed
+        relaunch = False
+        async with _lock:
+            if (_state.headless_current == new_headless
+                    and _state.browser is not None and _state.browser.is_connected()):
+                msgs.append(f"modo: ya está {'headed' if headed else 'headless'} (sin cambios)")
+            else:
+                _state.headless_current = new_headless
+                await _teardown_quiet_locked()
+                relaunch = True
+        if relaunch:
+            await _ensure_page()  # relanza ya, en el nuevo modo (conserva reduced_motion)
+            msgs.append(f"modo: {'headed' if headed else 'headless'} (browser relanzado)")
+
+    return " | ".join(msgs)
 
 
 async def _tool_open_tab(arguments: dict) -> str:
@@ -1029,16 +1089,33 @@ async def _tool_interaction_animation(arguments: dict) -> str:
     page = await _ensure_page(arguments.get("tab"))
     trig = arguments["trigger_selector"]
     tgt = arguments.get("target_selector")
-    tgt_label = tgt if tgt else "(self)"
+    twt = arguments.get("target_within_trigger")
     tnth = int(arguments.get("trigger_nth", 0))
     gnth = int(arguments.get("target_nth", 0))
     ev = arguments.get("event", "click")
     reset = arguments.get("reset", "escape")
+    # target_selector se inyecta a querySelectorAll → CSS puro. Fallar claro desde el
+    # primer intento en vez de un timeout genérico "no apareció".
+    if twt and _looks_non_css(twt):
+        return (f"target_within_trigger '{twt}' debe ser CSS puro (se resuelve con "
+                f"querySelectorAll dentro del trigger); quitá el motor text=/role=/:has-text(...).")
+    if tgt and not twt and _looks_non_css(tgt):
+        return (f"target_selector '{tgt}' usa un motor no-CSS (text=/role=/:has-text(...)); "
+                f"target_selector solo soporta CSS puro (a diferencia de trigger_selector). "
+                f"Para medir un descendiente del trigger usá target_within_trigger='<css relativo>' "
+                f"(se resuelve dentro del trigger ya resuelto y sigue a trigger_nth automáticamente), "
+                f"o pasá un selector CSS global.")
+    if twt:
+        tgt_label = f"{twt} (within trigger)"
+    elif tgt:
+        tgt_label = tgt
+    else:
+        tgt_label = "(self)"
     trigH = await _handle(page, trig, tnth, timeout=3000)
     if trigH is None:
         return f"(sin trigger '{trig}'[{tnth}])"
     r = await trigH.evaluate(_JS_INTERACTION_ANIM, {
-        "target_selector": tgt or "", "target_nth": gnth,
+        "target_selector": tgt or "", "target_within_trigger": twt or "", "target_nth": gnth,
         "event": ev, "reset": reset,
         "timeout_ms": int(arguments.get("timeout_ms", 2500)),
     })
@@ -1054,7 +1131,9 @@ async def _tool_interaction_animation(arguments: dict) -> str:
         except Exception:
             pass
     if r.get("missing") == "target":
-        return f"(el target '{tgt_label}'[{gnth}] no apareció tras {r.get('waited_ms')}ms; ¿el {ev} abre ese nodo? target debe ser CSS)"
+        hint = ("¿el descendiente existe dentro del trigger?" if twt
+                else f"¿el {ev} abre ese nodo? (target_selector debe ser CSS; para un descendiente del trigger usá target_within_trigger)")
+        return f"(el target '{tgt_label}'[{gnth}] no apareció tras {r.get('waited_ms')}ms; {hint})"
     reached = r["opacity_reached_1"]
     mo = r["max_overshoot_pct"]
     axes = r.get("axes", [])
@@ -1255,10 +1334,11 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="set_mode",
-            description="Cambia headless↔headed en runtime (teardown + relaunch). Gobernado por allow_headed: si está deshabilitado, rechaza el cambio a headed.",
+            description="Ajusta modo de runtime: 'headed' (headless↔headed, teardown+relaunch; gobernado por allow_headed) y/o 'reduced_motion' (emula prefers-reduced-motion sin relanzar — valida la rama useReducedMotion/reduced-motion del DS: en 'reduce' las animaciones gateadas quedan estáticas; matchMedia y entrance_animation_check lo reflejan). Pasá al menos uno; ambos opcionales. reduced_motion persiste a las tabs nuevas y a un relaunch por cambio de headed.",
             inputSchema={"type": "object", "properties": {
                 "headed": {"type": "boolean", "description": "true=ventana visible (WSLg), false=headless"},
-            }, "required": ["headed"]},
+                "reduced_motion": {"type": "string", "enum": ["reduce", "no-preference"], "description": "emula la media query prefers-reduced-motion ('reduce' = usuario pidió menos movimiento)"},
+            }},
         ),
         types.Tool(
             name="open_tab",
@@ -1371,12 +1451,13 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="interaction_animation",
-            description="Mide la animación disparada por una INTERACCIÓN (modal/drawer/overlay por click/hover): muestrea el target (translateX/Y + scale + opacity) desde el mismo frame. Reporta TODOS los ejes que se movieron (no solo Y → capta drawers left/right y el scale del pop), cada uno con delta + overshoot con MAGNITUD (% sobre el step, scale normalizado por tamaño del elemento). Reporta settle_ms (opacity+transform estables) y opacity_settle_ms (solo opacity, para comparar con ADRs basados en opacity), opacity_final/reached_1, max_overshoot y verdict (ok | overshoot_leve >5% | overshoot_fuerte >15% | opacity_incompleta). Cubre lo que entrance_animation_check (solo on-load) no.",
+            description="Mide la animación disparada por una INTERACCIÓN (modal/drawer/overlay por click/hover): muestrea el target (translateX/Y + scale + opacity) desde el mismo frame. Reporta TODOS los ejes que se movieron (no solo Y → capta drawers left/right y el scale del pop), cada uno con delta + overshoot con MAGNITUD (% sobre el step, scale normalizado por tamaño del elemento). Reporta settle_ms (opacity+transform estables) y opacity_settle_ms (solo opacity, para comparar con ADRs basados en opacity), opacity_final/reached_1, max_overshoot y verdict (ok | overshoot_leve >5% | overshoot_fuerte >15% | opacity_incompleta). Cubre lo que entrance_animation_check (solo on-load) no. Para un transform propagado padre→hijo usá target_within_trigger (CSS relativo al trigger) en vez de adivinar el nth global del target.",
             inputSchema={"type": "object", "properties": {
                 "trigger_selector": {"type": "string", "description": "elemento que se clickea/hover. Soporta CSS, `text=...`, `role=...`, `:has-text(...)`"},
                 "trigger_nth": {"type": "integer", "default": 0, "description": "índice si el trigger matchea varios"},
-                "target_selector": {"type": "string", "description": "elemento animado a medir (CSS; se sondea en vivo porque puede montarse tras el evento). OMITIR para medir el propio trigger (ej. hover sobre un botón)"},
-                "target_nth": {"type": "integer", "default": 0},
+                "target_selector": {"type": "string", "description": "elemento animado a medir (CSS PURO — se inyecta a querySelectorAll; NO acepta text=/role=/:has-text(...) como trigger_selector; se sondea en vivo porque puede montarse tras el evento). OMITIR para medir el propio trigger (ej. hover sobre un botón)"},
+                "target_within_trigger": {"type": "string", "description": "CSS relativo al trigger YA RESUELTO (clickable.querySelectorAll) — para el caso común de transform propagado padre→hijo (Motion whileHover en un <a>, medido en su <span>/<svg> hijo). Sigue a trigger_nth automáticamente: cambiar trigger_nth mueve el target al icono de ESE trigger sin reindexar nth global (evita el falso negativo por desalineación). Tiene precedencia sobre target_selector"},
+                "target_nth": {"type": "integer", "default": 0, "description": "índice del match (global con target_selector; dentro del trigger con target_within_trigger — normalmente 0)"},
                 "event": {"type": "string", "enum": ["click", "hover"], "default": "click"},
                 "reset": {"type": "string", "enum": ["escape", "reload", "none"], "default": "escape", "description": "cierra el overlay tras medir para destapar el próximo trigger (escape rápido pero app-dependiente; reload siempre funciona)"},
                 "timeout_ms": {"type": "integer", "default": 2500},
