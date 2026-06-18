@@ -27,7 +27,30 @@ from uuid import uuid4
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("focusyn")
+mcp = FastMCP(
+    "focusyn",
+    instructions="""\
+Gateway del vault del ecosistema — memoria larga, no un destino opcional. Úsalo, no lo saltes.
+
+ANTES de crear o buscar: get_context(vault) (convenciones + portal de la org). El vault y el schema del proyecto los nombra su CLAUDE.md.
+
+LECTURA lean por defecto: read_note(path)=raw_content+frontmatter. graph=true solo para "entender X y su entorno"; enrich=true síntesis. search_notes = PREGUNTA semántica, NO grep.
+
+ESCRITURA — no reescribas el doc para cambios puntuales:
+- write_note(path,body): crear (SIN id) / reemplazar (CON id). Devuelve next_actions (recordatorios).
+- edit_note / append_note: edición quirúrgica del body / al final
+- patch_frontmatter(set/unset): salda deuda; rechaza valores fuera de enum
+- link_notes(src,tgt,relation): cross-link (materializa arista)
+- supersede_note(nuevo,viejo): superseder ADR (back-pointer+status:deprecated atómico). NO a mano.
+- delete_note(path,reason)
+
+IDs los asigna el gateway: crear→OMITE id; actualizar→INCLUYE el id; planear→peek_id(vault,kind). NUNCA inventes contadores ni grepees el disco.
+
+REGLAS DURAS:
+- Tras crear un ADR: referencialo desde el index del proyecto (el next_actions lo recuerda).
+- Wikilinks [[...]] solo dentro del mismo vault; cross-vault solo por doc_id en related_ids (materializa arista).
+- El grafo es índice (mapa), NO verdad: verifica leyendo el archivo real.""",
+)
 
 GATEWAY_URL = os.environ.get("FOCUSYN_GATEWAY_URL", "http://localhost:7415")
 GATEWAY_KEY = os.environ["FOCUSYN_GATEWAY_KEY"]
@@ -461,6 +484,11 @@ async def write_note(path: str, body: str) -> dict:
         debt = proposal.get("frontmatter_debt")
         if debt:
             out["frontmatter_debt"] = debt
+        # Recordatorios accionables del gateway (ej. ADR recién creado aún no
+        # referenciado desde el index del proyecto). No bloquean.
+        next_actions = result.get("next_actions")
+        if next_actions:
+            out["next_actions"] = next_actions
         return out
 
 
@@ -685,6 +713,49 @@ async def link_notes(source: str, target: str, relation: str = "related") -> dic
             },
         )
         resp.raise_for_status()
+        return resp.json()
+
+
+@mcp.tool()
+async def supersede_note(new: str, old: str, reason: str = "") -> dict:
+    """Superseción bidireccional ATÓMICA: el ADR ``new`` reemplaza al ``old``.
+
+    En UNA operación el gateway escribe ``supersedes:[old]`` en el nuevo y
+    ``superseded_by:[new]`` + ``status:deprecated`` en el viejo (cada lado con
+    commit+push+audit). Úsala SIEMPRE para superseder — NO marques el back-pointer
+    ni el status a mano: el gateway garantiza la coherencia y rechaza un status
+    inválido. Ambos deben ser kind decision/proposal. Idempotente: reintentar no
+    duplica.
+
+    Args:
+        new: ADR/propuesta NUEVO (el que supersede) — doc_id canónico (ej.
+            "MEL-DEC-046") o ruta relativa al ObsidianVault.
+        old: ADR/propuesta VIEJO (el superseído) — doc_id canónico o ruta.
+        reason: motivo (queda en el audit trail).
+    """
+    new_id = _resolve_doc_id(new)
+    old_id = _resolve_doc_id(old)
+    missing = [p for p, d in ((new, new_id), (old, old_id)) if not d]
+    if missing:
+        return {
+            "status": "error",
+            "message": f"No se pudo resolver doc_id de: {', '.join(missing)} "
+            "(¿sin 'id' en frontmatter o aún no indexado?)",
+        }
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(
+            f"{GATEWAY_URL}/v1/write/supersede",
+            headers=_HEADERS,
+            json={
+                "request_id": str(uuid4()),
+                "new_doc_id": new_id,
+                "old_doc_id": old_id,
+                "reason": reason,
+                "idempotency_key": _idempotency_key(new_id, old_id, "supersede"),
+            },
+        )
+        if resp.status_code >= 400:
+            return _gateway_error(resp, "supersede", new=new_id, old=old_id)
         return resp.json()
 
 

@@ -34,6 +34,7 @@ registrado en los proyectos activos. El binario `obsidian` raw se conserva en
 | `patch_frontmatter(path, set={}, unset=[])` | `POST /v1/write/patch-frontmatter` | **Salda deuda de frontmatter**: fija/borra campos sin tocar el body. Para arreglar docs viejos que fallan por `MISSING_FRONTMATTER`. No toca claves de identidad. Devuelve `remaining_debt` |
 | `delete_note(path, reason)` | `POST /v1/write/delete` | Borra un doc (requiere `id` en frontmatter + estar indexado en GraphRAG) |
 | `link_notes(source, target, relation="related")` | `POST /v1/write/link` | Cross-link gobernado: añade el doc_id del target a la lista frontmatter `relation` del doc ORIGEN (commit+push+audit; el watcher lo materializa en el grafo). `source`/`target` aceptan doc_id o path. Idempotente |
+| `supersede_note(new, old, reason="")` | `POST /v1/write/supersede` | **Superseción bidireccional ATÓMICA**: el ADR `new` reemplaza al `old`. Escribe `supersedes:[old]` en el nuevo y `superseded_by:[new]` + `status:deprecated` en el viejo, en una sola operación (cada lado con commit+audit). Úsala SIEMPRE para superseder — no marques el back-pointer ni el status a mano. Ambos kind decision/proposal. Idempotente |
 | `lint_vault(vault="", kind="")` | `GET /v1/lint` | Lista docs indexados que violan el schema vigente (deuda de frontmatter). Sin filtros audita los 3 vaults. Sáldalos con `patch_frontmatter` |
 | `peek_id(vault, kind)` | `GET /v1/ids/peek` | Último/próximo doc_id para `(vault, kind)` SIN consumir uno (no cuentes a mano). `in_sync=false` señala drift contador↔índice |
 | `push_vault(vault)` | `POST /v1/sync/push` | Empuja commits locales pendientes a GitHub (push fallido / commits manuales). Al día → `pushed: false`. Requiere scope `sync` |
@@ -50,6 +51,16 @@ registrado en los proyectos activos. El binario `obsidian` raw se conserva en
 > **`search_notes` — degradación explícita:** la respuesta incluye `answer_status`
 > (`ok` | `no_evidence` | `synthesis_failed`). Si es `synthesis_failed`, NO uses
 > `answer` (viene vacío): la recuperación sí funcionó, lee `evidence_docs`.
+
+> **Invariantes relacionales gobernados por el gateway (no por el agente):**
+> - **Superseder**: usar `supersede_note(new, old)` — el back-pointer y el `status:deprecated`
+>   los pone el gateway de forma atómica. `patch_frontmatter` ahora **rechaza** un `status`
+>   fuera del enum (antes lo dejaba pasar).
+> - **Cross-refs en el grafo**: `related_ids`/`link_notes`/`supersede_note` se materializan
+>   como aristas `LINKS_TO` en el ingest (antes solo contaban los doc_id en el cuerpo).
+> - **`apply` devuelve `next_actions`**: si un ADR recién creado aún no está referenciado
+>   desde el `index.md` del proyecto, lo recuerda en la respuesta — cerrar el cross-link con
+>   `edit_note`/`link_notes`.
 
 ## Traducción de paths
 
