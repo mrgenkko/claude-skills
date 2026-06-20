@@ -28,6 +28,14 @@ encaja con gcloud/postgres/ssh/redis.
 | Sesión | `goto` | Navega a una URL (relativa a `--base-url` o completa). Arranca el browser solo. |
 | Sesión | `reload`, `set_viewport` | Recargar / cambiar viewport. |
 | Sesión | `set_mode` | `headed` (headless↔headed en runtime, gate `allow_headed`) y/o `reduced_motion` (`reduce`\|`no-preference`, emula prefers-reduced-motion sin relanzar — valida la rama `useReducedMotion` del DS). |
+| **Interacción** | `click` | Click en un elemento (botón Entrar/Generar/Aplicar/Aprobar). Selector CSS/`text=`/`role=`; `nth` desambigua. Reporta si navegó (URL+title) o cambió estado. **`force=true`** dispara el click a nivel DOM (dispatchEvent) para targets tapados por un overlay/canvas WebGL (ver gotcha abajo). |
+| **Interacción** | `fill` | Escribe en un input/textarea (usuario/contraseña/intent/body). Limpia+setea+dispara `input` (React lo capta). **No hace eco del valor** (secreto): solo longitud. |
+| **Interacción** | `type` | Teclea tecla-a-tecla (keydown/keyup reales) — para inputs que ignoran `fill` (máscaras, handlers por tecla). `clear`+`delay_ms`. Preferí `fill` salvo que no dispare el framework. |
+| **Interacción** | `press` | Pulsa tecla/combo (`Enter` para submit, `Escape`, `Control+a`, `Tab`). Con `selector` la enfoca; sin él va al foco actual. |
+| **Interacción** | `select_option` | Elige opción de un `<select>` nativo por value/label/index. Dropdown custom (divs) → `click` para abrir + `click` la opción. |
+| **Interacción** | `set_input_files` | Sube archivo(s) a un `<input type=file>` (Adjuntar/subir), sin abrir el picker del SO. Valida que las rutas existan. |
+| **Interacción** | `evaluate` | Ejecuta JS arbitrario y devuelve el resultado (JSON, capado). Escape hatch: **sembrar un token y saltar el login** en test, leer storage/DOM, disparar handlers. `arg` JSON opcional → función (no interpola secretos). |
+| **Sync** | `wait_for` | Espera que un selector llegue a `visible`/`hidden`/`attached`/`detached` — sincroniza pasos del flujo (tras Aplicar, esperar el toast / que el spinner desaparezca). No muta (no requiere `allow_interact`). |
 | Pestañas | `open_tab`, `list_tabs`, `switch_tab`, `close_tab` | Multi-pestaña (comparar variantes lado a lado). |
 | Pestañas | `close_browser` | Cierra todo y libera RAM. |
 | Inspección | `inspect_buttons` | **Resumen** de un DS: `{total, warns, signatures[], offenders[]}` — agrupa botones idénticos por firma (NO devuelve 153 clones), detalla solo los ofensores (motion+transform o `transition:all` con duración >0). `include_all` para el array completo. |
@@ -46,6 +54,61 @@ encaja con gcloud/postgres/ssh/redis.
 Todas las tools de inspección/perf aceptan `tab` opcional (default: la activa).
 
 **Selección por texto/rol** (clave para no depender de selectores estructurales frágiles): las tools de acción (`button_latency`, `entrance_animation_check`, `interaction_animation` trigger, `get_computed_style`, `outer_html`) aceptan, además de CSS, los engines de Playwright: `text="Abrir Modal"`, `role=button[name="Guardar"]`, `button:has-text("right")`. "El botón que dice X" es estable ante cambios de layout. (El `target_selector` de `interaction_animation` es la excepción: solo CSS puro, porque se inyecta a `querySelectorAll`; si le pasás un engine no-CSS falla con un mensaje explícito desde el primer intento y sugiere `target_within_trigger`.)
+
+## Primitivas de interacción (happy-paths autenticados)
+
+El resto del MCP mide/inspecciona; estas **mutan la page** para validar un flujo de
+punta a punta — pasar el login y recorrer crear → previsualizar → aplicar → aprobar.
+(No es un cambio de naturaleza: `button_latency`/`interaction_animation`/`measure_fps`
+**ya** disparaban click/pointer events para medir; esto solo lo expone explícito.)
+
+| Tool | Firma | Notas |
+|---|---|---|
+| `click` | `click(selector, nth?, force?, timeout_ms?)` | auto-wait; reporta navegación (espera la async con poll + early-exit). `force=true` → click DOM (overlays). |
+| `fill` | `fill(selector, value, nth?, force?)` | clear+set+`input` event. Solo loguea longitud (secretos). |
+| `type` | `type(selector, text, clear?, delay_ms?)` | tecla-a-tecla; fallback de `fill`. |
+| `press` | `press(key, selector?, nth?, force?)` | `Enter`/`Escape`/combos; selector opcional. |
+| `select_option` | `select_option(selector, value?, label?, index?)` | solo `<select>` nativo. |
+| `set_input_files` | `set_input_files(selector, files)` | sube a `<input type=file>`; valida rutas. |
+| `evaluate` | `evaluate(expression, arg?, max_len?)` | JS arbitrario; `arg` JSON → función. |
+| `wait_for` | `wait_for(selector, state?, nth?)` | sincroniza pasos; **no muta** (sin gate). |
+
+**Gate `allow_interact`** (default `true`, patrón del `allow_headed`): registrá con
+`--forbid-interact` (`allow_interact:false` en `secrets.json`) para una instancia
+**solo-medición** que rechaza las tools que mutan (no a `wait_for`, que solo espera).
+`status()` muestra `interact=true|false`.
+
+### Gotcha: botones bajo un `<canvas>` WebGL (three.js/R3F)
+
+Si la app tiene un fondo WebGL a pantalla completa (`<canvas fixed inset-0>`), `click`
+normal **da timeout**: aunque el canvas esté en `-z-10`, gana el hit-test por coordenada
+(`elementFromPoint` devuelve el canvas) y Playwright no deja clickear "a ciegas". El
+`force` coordenada-based de Playwright **no sirve** (entregaría el evento al canvas → falso
+"ok" sin disparar el handler). Por eso **`click(force=true)` dispara el evento a nivel DOM**
+(`dispatchEvent`), que ignora el overlay y corre el handler real. Para submits de form,
+`press('Enter')` es la alternativa más simple. *(Caso real: el login de focusyn.)*
+
+**Flujo login por formulario** (validado contra focusyn, jun 2026):
+```
+goto("http://localhost:7418/login")
+fill('[aria-label="Usuario"]', "tester")
+fill('[aria-label="Contraseña"]', "Test-Focusyn-2026")
+press("Enter", '[aria-label="Contraseña"]')     # submit (o click('text="Entrar"', force=true))
+wait_for("text=\"Resumen\"")                      # esperar el dashboard
+evaluate("() => Object.keys(localStorage)")       # verifica: aparece focusyn.refresh
+```
+
+**Atajo: saltar el login sembrando el token** (lo que pidió el equipo) — útil para no
+teclear credenciales en cada corrida de test:
+```
+goto("http://localhost:7418/")
+evaluate("(t) => localStorage.setItem('focusyn.refresh', t)", arg="<refresh-token>")
+reload()                                          # la SPA arranca ya autenticada
+```
+`arg` se pasa como argumento a la función → el token no se interpola en el string.
+
+> Validado en vivo contra focusyn (jun 2026): login por form, `click(force=true)` sobre el
+> canvas, y seed-token; los tres llevan al dashboard `/` con `focusyn.refresh` en localStorage.
 
 ## Ciclo de vida del browser (3 capas)
 
@@ -97,6 +160,7 @@ el protocolo y sirve si exponés el MCP por HTTP a otra máquina sin disco.
   "browser": "chromium",
   "headless": true,
   "allow_headed": true,
+  "allow_interact": true,
   "max_tabs": 8,
   "tab_idle_timeout": 600,
   "browser_idle_timeout": 1800,

@@ -35,13 +35,15 @@ Mrgenkko Skills/
 │   ├── mcp-gcloud/server.py        ← MCP mínimo para gcloud CLI
 │   ├── mcp-ssh/server.py           ← MCP mínimo para SSH
 │   ├── mcp-obsidian/server.py      ← MCP mínimo para vault de Obsidian (raw)
-│   └── focusyn/server.py  ← MCP cliente del gateway a2a (reads + writes)
+│   ├── focusyn/server.py  ← MCP cliente del gateway a2a (reads + writes)
+│   └── mcp-webprobe/server.py      ← MCP mínimo de diagnóstico de landings (interacción + web vitals)
 └── deployed/
     ├── gcloud/server.py        ← servidor gcloud (multi-proyecto)
     ├── postgres/server.py      ← servidor postgres (read + write)
     ├── ssh/server.py           ← servidor SSH (shell + SFTP)
     ├── obsidian/server.py      ← servidor Obsidian raw (legacy/fallback)
-    └── focusyn/server.py  ← servidor Obsidian vía gateway a2a (reads + writes auditados)
+    ├── focusyn/server.py  ← servidor Obsidian vía gateway a2a (reads + writes auditados)
+    └── webprobe/server.py      ← diagnóstico de landings (Playwright): feel/perf + interacción
 ```
 
 ---

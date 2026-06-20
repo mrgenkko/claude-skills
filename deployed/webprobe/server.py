@@ -33,6 +33,10 @@ parser.add_argument("--headless", dest="headless", action="store_true", default=
 parser.add_argument("--headed", dest="headless", action="store_false")
 parser.add_argument("--allow-headed", dest="allow_headed", action="store_true", default=True)
 parser.add_argument("--forbid-headed", dest="allow_headed", action="store_false")
+# primitivas de interacción (click/fill/type/press/evaluate). Default ON (como allow_headed);
+# --forbid-interact deja la instancia en modo solo-medición (estilo allow_flush de redis).
+parser.add_argument("--allow-interact", dest="allow_interact", action="store_true", default=True)
+parser.add_argument("--forbid-interact", dest="allow_interact", action="store_false")
 parser.add_argument("--base-url", default=None)
 parser.add_argument("--persistent-profile", default=None)
 parser.add_argument("--viewport-w", type=int, default=1440)
@@ -55,7 +59,7 @@ SERVER_LABEL = args.name or "webprobe"
 # Bump en cada cambio de comportamiento. El agente lo ve en status() para saber si el
 # proceso MCP está stale (un MCP es de vida larga; editar server.py NO recarga el proceso
 # vivo — hay que reiniciar Claude Code / recargar la ventana de VSCode).
-WEBPROBE_VERSION = "0.3.3"
+WEBPROBE_VERSION = "0.4.2"
 app = Server(f"webprobe-{SERVER_LABEL}")
 
 
@@ -761,6 +765,7 @@ def _status_line() -> str:
             pass
     parts.append(f"viewport={args.viewport_w}x{args.viewport_h}")
     parts.append(f"headless={str(_state.headless_current).lower()}")
+    parts.append(f"interact={str(bool(args.allow_interact)).lower()}")
     return " ".join(parts)
 
 
@@ -1272,8 +1277,234 @@ async def _tool_record_trace(arguments: dict) -> str:
     return f"trace saved: {path} ({size // 1024}KB)\nabrir con: npx playwright show-trace {path}"
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Primitivas de interacción (mutan la page) — gobernadas por --allow-interact.
+# El resto del MCP mide/inspecciona; estas teclean/clickean/ejecutan JS para
+# validar happy-paths autenticados (login → recorrer un flujo) end-to-end.
+# Nota: button_latency/interaction_animation/measure_fps YA disparaban click/
+# pointer events como parte de la medición; esto solo lo expone explícito.
+# ──────────────────────────────────────────────────────────────────────────
+def _interact_forbidden(tool: str) -> str:
+    return (f"{tool} deshabilitado en esta instancia (allow_interact=false → solo medición). "
+            f"Re-registrá sin --forbid-interact (allow_interact:true en secrets.json) para permitirlo.")
+
+
+async def _settle_nav(page, url0: str, poll_ms: int = 800):
+    """Tras una acción, espera una navegación ASYNC (submit → fetch → route SPA/pushState)
+    hasta poll_ms, con early-exit en cuanto la URL cambia. Sin esto, una acción que dispara
+    un login async se reporta como 'sin navegación' porque el fetch aún no resolvió. Coste:
+    una acción que NO navega paga poll_ms (es el tope, no el típico)."""
+    try:
+        await page.wait_for_url(lambda u: u != url0, timeout=poll_ms)
+    except Exception:
+        pass
+    try:
+        await page.wait_for_load_state("load", timeout=800)
+    except Exception:
+        pass
+
+
+async def _tool_click(arguments: dict) -> str:
+    if not args.allow_interact:
+        return _interact_forbidden("click")
+    page = await _ensure_page(arguments.get("tab"))
+    selector = arguments["selector"]
+    nth = int(arguments.get("nth", 0))
+    timeout = int(arguments.get("timeout_ms", 5000))
+    force = bool(arguments.get("force", False))
+    url0 = page.url
+    loc = page.locator(selector).nth(nth)
+    try:
+        if force:
+            # DOM-level: dispara el 'click' directo en el elemento (no por coordenada), así
+            # ignora overlays que ganan el hit-test — caso típico, un <canvas> WebGL a pantalla
+            # completa que intercepta el pointer aunque el botón sea clickable por el usuario.
+            # OJO: el force coordenada-based de Playwright (skip-actionability) NO sirve acá —
+            # entregaría el evento al canvas que está encima (falso "ok" sin disparar el handler).
+            await loc.dispatch_event("click", timeout=timeout)
+        else:
+            await loc.click(timeout=timeout)
+    except Exception as e:
+        first = str(e).strip().splitlines()[0]
+        hint = ""
+        if not force and ("intercept" in str(e) or "Timeout" in first):
+            hint = (" — algo tapa el target por coordenada (ej. fondo WebGL/canvas o un overlay): "
+                    "reintentá con force=true (dispara el click a nivel DOM), o press('Enter') si es un submit.")
+        return f"(no se pudo click en '{selector}'[{nth}]: {first}{hint})"
+    await _settle_nav(page, url0)
+    if page.url != url0:
+        try:
+            title = await page.title()
+        except Exception:
+            title = "?"
+        return f"click ok: {selector}[{nth}]\n→ navegó: {page.url} (title: {title})"
+    return (f"click ok: {selector}[{nth}] (sin navegación inmediata; url={page.url} "
+            f"— usá wait_for si esperás un efecto async)")
+
+
+async def _tool_fill(arguments: dict) -> str:
+    if not args.allow_interact:
+        return _interact_forbidden("fill")
+    page = await _ensure_page(arguments.get("tab"))
+    selector = arguments["selector"]
+    value = arguments.get("value", "")
+    nth = int(arguments.get("nth", 0))
+    timeout = int(arguments.get("timeout_ms", 5000))
+    force = bool(arguments.get("force", False))
+    loc = page.locator(selector).nth(nth)
+    try:
+        # fill() limpia + setea el valor y dispara el evento 'input' (React lo capta).
+        # force salta el check de editable/visibilidad (input tapado por overlay).
+        await loc.fill(value, timeout=timeout, force=force)
+    except Exception as e:
+        return f"(no se pudo fill en '{selector}'[{nth}]: {e})"
+    # NO se hace eco del valor (puede ser secreto: contraseña/token) — solo longitud
+    return f"fill ok: {selector}[{nth}] ← {len(value)} chars"
+
+
+async def _tool_type(arguments: dict) -> str:
+    if not args.allow_interact:
+        return _interact_forbidden("type")
+    page = await _ensure_page(arguments.get("tab"))
+    selector = arguments["selector"]
+    text = arguments.get("text", "")
+    nth = int(arguments.get("nth", 0))
+    delay = int(arguments.get("delay_ms", 0))
+    timeout = int(arguments.get("timeout_ms", 5000))
+    loc = page.locator(selector).nth(nth)
+    try:
+        if arguments.get("clear", False):
+            await loc.fill("", timeout=timeout)
+        # tecla-a-tecla (keydown/keyup reales): para inputs que ignoran fill (máscaras,
+        # handlers por tecla). Más lento que fill; usar solo si fill no dispara el framework.
+        await loc.press_sequentially(text, delay=delay, timeout=timeout)
+    except Exception as e:
+        return f"(no se pudo type en '{selector}'[{nth}]: {e})"
+    return f"type ok: {selector}[{nth}] ← {len(text)} chars (tecla-a-tecla)"
+
+
+async def _tool_press(arguments: dict) -> str:
+    if not args.allow_interact:
+        return _interact_forbidden("press")
+    page = await _ensure_page(arguments.get("tab"))
+    key = arguments["key"]
+    selector = arguments.get("selector")
+    nth = int(arguments.get("nth", 0))
+    timeout = int(arguments.get("timeout_ms", 5000))
+    force = bool(arguments.get("force", False))
+    url0 = page.url
+    try:
+        if selector:
+            await page.locator(selector).nth(nth).press(key, timeout=timeout, force=force)
+            where = f" en {selector}[{nth}]"
+        else:
+            await page.keyboard.press(key)
+            where = " (foco actual)"
+    except Exception as e:
+        return f"(no se pudo press '{key}': {e})"
+    await _settle_nav(page, url0)
+    msg = f"press '{key}'{where}"
+    if page.url != url0:
+        msg += f" → navegó: {page.url}"
+    return msg
+
+
+async def _tool_evaluate(arguments: dict) -> str:
+    if not args.allow_interact:
+        return _interact_forbidden("evaluate")
+    page = await _ensure_page(arguments.get("tab"))
+    expr = arguments["expression"]
+    # arg (JSON-serializable) opcional → expr debe ser una función. Útil para sembrar
+    # un token sin interpolarlo en el string: evaluate("(t)=>localStorage.setItem('k',t)", arg="...").
+    has_arg = arguments.get("arg") is not None
+    try:
+        result = await (page.evaluate(expr, arguments["arg"]) if has_arg else page.evaluate(expr))
+    except Exception as e:
+        return f"(evaluate error: {e})"
+    if result is None:
+        return "evaluate ok (resultado: null/undefined)"
+    try:
+        s = json.dumps(result, ensure_ascii=False, default=str)
+    except Exception:
+        s = str(result)
+    cap = int(arguments.get("max_len", 4000))
+    if len(s) > cap:
+        s = s[:cap] + f" …[+{len(s) - cap} chars]"
+    return s
+
+
+async def _tool_wait_for(arguments: dict) -> str:
+    # NO muta → no gateado por allow_interact: sincroniza pasos de un flujo.
+    page = await _ensure_page(arguments.get("tab"))
+    selector = arguments["selector"]
+    state = arguments.get("state", "visible")
+    nth = int(arguments.get("nth", 0))
+    timeout = int(arguments.get("timeout_ms", 8000))
+    loc = page.locator(selector).nth(nth)
+    try:
+        await loc.wait_for(state=state, timeout=timeout)
+    except Exception:
+        return f"(wait_for '{selector}'[{nth}] estado '{state}' no se cumplió en {timeout}ms; url={page.url})"
+    return f"wait_for ok: '{selector}'[{nth}] está {state} (url={page.url})"
+
+
+async def _tool_set_input_files(arguments: dict) -> str:
+    if not args.allow_interact:
+        return _interact_forbidden("set_input_files")
+    page = await _ensure_page(arguments.get("tab"))
+    selector = arguments["selector"]
+    files = arguments["files"]
+    if isinstance(files, str):
+        files = [files]
+    files = [os.path.expanduser(f) for f in files]
+    missing = [f for f in files if not os.path.isfile(f)]
+    if missing:
+        return f"(archivo(s) no encontrado(s) en disco: {', '.join(missing)})"
+    nth = int(arguments.get("nth", 0))
+    timeout = int(arguments.get("timeout_ms", 5000))
+    loc = page.locator(selector).nth(nth)
+    try:
+        # setInputFiles: setea el FileList del <input type=file> sin abrir el picker nativo.
+        await loc.set_input_files(files, timeout=timeout)
+    except Exception as e:
+        return f"(no se pudo set_input_files en '{selector}'[{nth}]: {e})"
+    return f"set_input_files ok: {selector}[{nth}] ← {len(files)} archivo(s): {', '.join(os.path.basename(f) for f in files)}"
+
+
+async def _tool_select_option(arguments: dict) -> str:
+    if not args.allow_interact:
+        return _interact_forbidden("select_option")
+    page = await _ensure_page(arguments.get("tab"))
+    selector = arguments["selector"]
+    nth = int(arguments.get("nth", 0))
+    timeout = int(arguments.get("timeout_ms", 5000))
+    kwargs = {}
+    if arguments.get("value") is not None:
+        kwargs["value"] = arguments["value"]
+    if arguments.get("label") is not None:
+        kwargs["label"] = arguments["label"]
+    if arguments.get("index") is not None:
+        kwargs["index"] = int(arguments["index"])
+    if not kwargs:
+        return "select_option: pasá al menos uno de value/label/index (solo <select> nativo; dropdown custom → click)"
+    loc = page.locator(selector).nth(nth)
+    try:
+        selected = await loc.select_option(timeout=timeout, **kwargs)
+    except Exception as e:
+        return f"(no se pudo select_option en '{selector}'[{nth}]: {e})"
+    return f"select_option ok: {selector}[{nth}] → seleccionado: {selected}"
+
+
 _DISPATCH = {
     "goto": _tool_goto,
+    "click": _tool_click,
+    "fill": _tool_fill,
+    "type": _tool_type,
+    "press": _tool_press,
+    "evaluate": _tool_evaluate,
+    "wait_for": _tool_wait_for,
+    "set_input_files": _tool_set_input_files,
+    "select_option": _tool_select_option,
     "reload": _tool_reload,
     "set_viewport": _tool_set_viewport,
     "set_mode": _tool_set_mode,
@@ -1316,6 +1547,99 @@ async def list_tools() -> list[types.Tool]:
                 "wait_until": {"type": "string", "enum": ["load", "domcontentloaded", "networkidle", "commit"], "default": "load"},
                 **tab,
             }, "required": ["url"]},
+        ),
+        types.Tool(
+            name="click",
+            description="Click en un elemento (valida happy-paths: botón Entrar/Generar/Aplicar/Aprobar). Selector soporta CSS, `text=\"Entrar\"`, `role=button[name=...]`, `:has-text(...)`; `nth` desambigua. Reporta si el click navegó (URL nueva + title) o cambió estado sin navegar. Si un overlay/canvas WebGL tapa el target por coordenada, el click normal da timeout → reintentá con force=true (dispara el click a nivel DOM, ignora el overlay), o press('Enter') si es un submit. Requiere allow_interact.",
+            inputSchema={"type": "object", "properties": {
+                "selector": {"type": "string"},
+                "nth": {"type": "integer", "default": 0, "description": "índice si el selector matchea varios"},
+                "force": {"type": "boolean", "default": False, "description": "dispara el click a nivel DOM (dispatchEvent) en vez de por coordenada — para targets tapados por un overlay/canvas que gana el hit-test"},
+                "timeout_ms": {"type": "integer", "default": 5000},
+                **tab,
+            }, "required": ["selector"]},
+        ),
+        types.Tool(
+            name="fill",
+            description="Escribe un valor en un input/textarea (usuario, contraseña, intent, body…). Limpia + setea + dispara 'input' (React controlado lo capta). NO hace eco del valor (puede ser secreto) — solo reporta longitud. Selector CSS/text/role/:has-text; `nth` desambigua. Para inputs que ignoran fill (máscaras/handlers por tecla) usá `type`. Requiere allow_interact.",
+            inputSchema={"type": "object", "properties": {
+                "selector": {"type": "string"},
+                "value": {"type": "string"},
+                "nth": {"type": "integer", "default": 0},
+                "force": {"type": "boolean", "default": False, "description": "salta el check de editable/visibilidad (input tapado)"},
+                "timeout_ms": {"type": "integer", "default": 5000},
+                **tab,
+            }, "required": ["selector", "value"]},
+        ),
+        types.Tool(
+            name="type",
+            description="Teclea texto tecla-a-tecla (keydown/keyup reales) en un input — para los que ignoran fill (máscaras, handlers por tecla). Más lento que fill; preferí fill salvo que no dispare el framework. `clear=true` limpia antes; `delay_ms` entre teclas. Requiere allow_interact.",
+            inputSchema={"type": "object", "properties": {
+                "selector": {"type": "string"},
+                "text": {"type": "string"},
+                "nth": {"type": "integer", "default": 0},
+                "clear": {"type": "boolean", "default": False, "description": "limpiar el input antes de teclear"},
+                "delay_ms": {"type": "integer", "default": 0, "description": "ms entre teclas"},
+                "timeout_ms": {"type": "integer", "default": 5000},
+                **tab,
+            }, "required": ["selector", "text"]},
+        ),
+        types.Tool(
+            name="press",
+            description="Pulsa una tecla o combo (Enter para submit, 'Control+a', 'Escape', 'Tab'…). Con `selector` la pulsa sobre ese elemento (lo enfoca); sin selector va al foco actual (page.keyboard). Reporta si navegó. Requiere allow_interact.",
+            inputSchema={"type": "object", "properties": {
+                "key": {"type": "string", "description": "tecla o combo Playwright: 'Enter', 'Escape', 'Control+a', 'ArrowDown', 'Tab'"},
+                "selector": {"type": "string", "description": "elemento a enfocar antes de pulsar (opcional; sin él, foco actual)"},
+                "nth": {"type": "integer", "default": 0},
+                "force": {"type": "boolean", "default": False, "description": "con selector: salta el actionability check al enfocar"},
+                "timeout_ms": {"type": "integer", "default": 5000},
+                **tab,
+            }, "required": ["key"]},
+        ),
+        types.Tool(
+            name="evaluate",
+            description="Ejecuta JS arbitrario en la page y devuelve el resultado (JSON, capado a max_len). Escape hatch para lo que click/fill no cubren: sembrar un token y saltar el login en test (evaluate(\"(t)=>localStorage.setItem('focusyn.refresh',t)\", arg=\"<token>\")), leer estado del DOM/storage, disparar handlers. `expression` = expresión JS o función flecha; `arg` (JSON) opcional se pasa a la función (evita interpolar secretos en el string). Requiere allow_interact.",
+            inputSchema={"type": "object", "properties": {
+                "expression": {"type": "string", "description": "expresión JS ('location.href') o función flecha ('()=>({k:localStorage.getItem(\"k\")})')"},
+                "arg": {"description": "argumento JSON-serializable pasado a la función (opcional)"},
+                "max_len": {"type": "integer", "default": 4000, "description": "cap del resultado serializado"},
+                **tab,
+            }, "required": ["expression"]},
+        ),
+        types.Tool(
+            name="wait_for",
+            description="Espera a que un elemento alcance un estado (visible|hidden|attached|detached) — sincroniza pasos de un happy-path en vez de adivinar timeouts: tras click 'Aplicar', wait_for('text=\"Guardado\"') o wait_for('.spinner', state='hidden') antes del siguiente paso. Selector CSS/text/role/:has-text. NO muta (no requiere allow_interact).",
+            inputSchema={"type": "object", "properties": {
+                "selector": {"type": "string"},
+                "state": {"type": "string", "enum": ["visible", "hidden", "attached", "detached"], "default": "visible"},
+                "nth": {"type": "integer", "default": 0},
+                "timeout_ms": {"type": "integer", "default": 8000},
+                **tab,
+            }, "required": ["selector"]},
+        ),
+        types.Tool(
+            name="set_input_files",
+            description="Sube archivo(s) a un <input type=file> (Adjuntar/subir): setInputFiles, no abre el picker nativo del SO. `files` = ruta local o lista de rutas (se valida que existan en disco). El input puede estar oculto. Requiere allow_interact.",
+            inputSchema={"type": "object", "properties": {
+                "selector": {"type": "string", "description": "el <input type=file> (puede no ser visible)"},
+                "files": {"type": ["string", "array"], "items": {"type": "string"}, "description": "ruta local o lista de rutas a subir"},
+                "nth": {"type": "integer", "default": 0},
+                "timeout_ms": {"type": "integer", "default": 5000},
+                **tab,
+            }, "required": ["selector", "files"]},
+        ),
+        types.Tool(
+            name="select_option",
+            description="Elige opción(es) de un <select> NATIVO por value, label (texto visible) o index (pasá al menos uno). Devuelve los values seleccionados. Para dropdowns custom (divs, no <select>) usá click para abrir + click en la opción. Requiere allow_interact.",
+            inputSchema={"type": "object", "properties": {
+                "selector": {"type": "string"},
+                "value": {"type": "string", "description": "value del <option>"},
+                "label": {"type": "string", "description": "texto visible del <option>"},
+                "index": {"type": "integer", "description": "índice del <option>"},
+                "nth": {"type": "integer", "default": 0},
+                "timeout_ms": {"type": "integer", "default": 5000},
+                **tab,
+            }, "required": ["selector"]},
         ),
         types.Tool(
             name="reload",
