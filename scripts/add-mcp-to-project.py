@@ -100,6 +100,23 @@ def build_mcp_servers(servers_config: list) -> dict:
             if entry.get("allow_flush"):
                 args.append("--allow-flush")
 
+        elif kind == "gh":
+            server_label = name.removeprefix("gh-") or entry["owner"]
+            args = [
+                f"{MCP_SERVERS_DIR}/gh/server.py",
+                f"--owner={entry['owner']}",
+                f"--name={server_label}",
+            ]
+            # Multi-cuenta sin deriva: GH_TOKEN por instancia hace a gh stateless
+            # (no toca ~/.config/gh/hosts.yml). config_dir es defensa en profundidad.
+            env["GH_TOKEN"] = entry["token"]
+            if entry.get("config_dir"):
+                env["GH_CONFIG_DIR"] = os.path.expanduser(entry["config_dir"])
+            # Mutaciones (merge, release, delete, workflow run...) bloqueadas por
+            # defecto; opt-in explícito por instancia.
+            if entry.get("allow_write"):
+                args.append("--allow-write")
+
         elif kind == "obsidian":
             args = [
                 f"{MCP_SERVERS_DIR}/obsidian/server.py",

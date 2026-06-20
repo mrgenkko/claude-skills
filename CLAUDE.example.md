@@ -25,6 +25,7 @@ Skills/
 │   ├── mcp-lottie-creator.md    ← LottieFiles Creator (npm + browser)
 │   ├── mcp-obsidian.md          ← vault Obsidian
 │   ├── mcp-ssh.md               ← cómo crear MCP para servidores SSH
+│   ├── mcp-gh.md                ← GitHub CLI: despliegues/Actions/PRs + escritura gated
 │   └── mcp-webprobe.md          ← diagnóstico de landings (Playwright)
 ├── examples/
 │   ├── mcp-database/server.py   ← MCP mínimo para PostgreSQL
@@ -36,6 +37,7 @@ Skills/
     ├── postgres/server.py       ← servidor postgres en producción
     ├── ssh/server.py            ← servidor SSH en producción
     ├── obsidian/server.py       ← servidor Obsidian en producción
+    ├── gh/server.py             ← GitHub CLI (despliegues/Actions/PRs + escritura gated)
     └── webprobe/server.py       ← diagnóstico de landings (Playwright)
 ```
 
@@ -52,12 +54,14 @@ Completar con los MCPs propios. Ejemplo de estructura:
 | `ssh-servidor-01`   | Python custom | 192.168.1.100              |
 | `obsidian`              | Python custom | Vault: ~/ObsidianVault     |
 | `lottiefiles-creator`   | npm oficial   | Creator + `~/.claude/mcp-servers/lottie/` |
+| `gh-*`                  | Python custom | GitHub CLI multi-account (token por org): despliegues/Actions/PRs (lectura) + merge/release (escritura gated) |
 | `webprobe`              | Python custom | Diagnóstico de landings (Playwright): FPS/jank/INP/latencia de botón + entrance-check |
 
 El servidor gcloud está en: `~/.claude/mcp-servers/gcloud/server.py`  
 El servidor postgres está en: `~/.claude/mcp-servers/postgres/server.py`  
 El servidor SSH está en: `~/.claude/mcp-servers/ssh/server.py`  
 El servidor Obsidian está en: `~/.claude/mcp-servers/obsidian/server.py`  
+El servidor gh está en: `~/.claude/mcp-servers/gh/server.py` (instalar con `scripts/install-gh-mcp.sh`). Multi-account por **token por instancia** (`GH_TOKEN`): `gh` es stateless, sin deriva de cuenta. Una instancia por org; cada llamada recibe `repo` (`owner/repo`). Mutaciones (`pr merge`, `release create`, `workflow run`...) bloqueadas salvo `allow_write: true`. Ver `guides/mcp-gh.md`.  
 Lottie: `~/.claude/mcp-servers/lottie/node_modules/@lottiefiles/creator-mcp/dist/index.mjs` (instalar con `scripts/install-lottie-mcp.sh`).  
 El servidor webprobe está en: `~/.claude/mcp-servers/webprobe/server.py` (instalar con `scripts/install-webprobe-mcp.sh`; agrega `playwright` al venv + `playwright install chromium`). Una sola instancia genérica; el agente pasa la URL en `goto`. Ver `guides/mcp-webprobe.md`.  
 Ambas instancias gcloud usan el mismo binario con distintos `--project` y `--account`.  
