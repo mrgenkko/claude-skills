@@ -13,7 +13,8 @@ que garantiza todo eso y, además, enriquece las lecturas con el grafo de conoci
   (puede rechazar con `violations`), audit trail y commit+push automático.
 - Las **lecturas** consultan el índice (Postgres) y el grafo (Neo4j): `read_note`
   devuelve el contenido **más** las entidades extraídas y los documentos relacionados;
-  `search_notes` es una búsqueda **semántica** GraphRAG, no un grep.
+  `find_notes` LOCALIZA notas rápido (lista rankeada, retrieval-only, sin LLM) y
+  `search_notes` PREGUNTA (respuesta semántica sintetizada por el LLM) — ninguno es un grep.
 
 A partir de la migración de junio 2026, `focusyn` es el único MCP de Obsidian
 registrado en los proyectos activos. El binario `obsidian` raw se conserva en
@@ -27,7 +28,8 @@ registrado en los proyectos activos. El binario `obsidian` raw se conserva en
 | `read_note(path, enrich=False)` | `GET /v1/read` | Contenido del doc + entidades GraphRAG + documentos relacionados del grafo. Con `enrich=true` añade `graph_summary` (síntesis LLM del neighborhood, +1-3s — solo cuando necesites entender el contexto del doc). `path` relativo al vault con prefijo (ej. `lait/proyectos/x/index.md`) |
 | `list_notes(vault, path_prefix, kind, limit)` | `GET /v1/list` | Lista docs indexados (índice Postgres, no filesystem). Filtros opcionales. Latencia ~15s tras un write |
 | `map_vault(vault="", path="", depth=1)` | `GET /v1/map` | Navega el árbol del vault un nivel a la vez (progressive disclosure). Sin args = los 3 vaults; desciende con `vault` + `path`; `depth` 1-4 anida `children`. `index.md` plegado como cabecera de carpeta; `CONTEXT.md` visible como doc. Complementa `list_notes` (plano/filtrado) |
-| `search_notes(query, vault, top_n)` | `POST /v1/graphrag/query` | Búsqueda **semántica** (vector + grafo + BM25 + reranker): una pregunta en lenguaje natural. `vault` (scope): wiki \| lait \| melquiades \| all (default `all`) |
+| `find_notes(query, vault, kind, top_k, rerank)` | `POST /v1/search` | **ENCONTRAR** docs rápido: lista rankeada (vector + grafo + reranker), **sin respuesta sintetizada** (retrieval-only, p95<2s). Para localizar/listar notas por relevancia. `vault`: wiki \| lait \| melquiades \| `all` (= todos; se mapea a NULL en el contrato). `kind` filtra; `top_k` 1-25 (default 10); `rerank` default true. Devuelve `{results, took_ms, mode}` |
+| `search_notes(query, vault, top_n)` | `POST /v1/graphrag/query` | **PREGUNTAR**: búsqueda **semántica** (vector + grafo + BM25 + reranker) **con respuesta sintetizada por LLM** (más lento que `find_notes`). Una pregunta en lenguaje natural. `vault` (scope): wiki \| lait \| melquiades \| all (default `all`) |
 | `get_contracts(doc, role="")` | `GET /v1/contracts/{doc_id}[/{role}]` | Bloques tipados (json/yaml/openapi/proto/mermaid) del doc, listos para consumo máquina. `doc` acepta doc_id canónico o path; `role` filtra (schema \| example \| config…) |
 | `write_note(path, body)` | `propose` + `apply` | Crea/reemplaza un doc completo. `body` es **siempre** el documento entero. Para cambios puntuales usa `edit_note`/`append_note`/`patch_frontmatter` |
 | `edit_note(path, old_string, new_string, replace_all=False)` | `POST /v1/write/patch` | **Edición quirúrgica del body** (como el Edit tool): reemplaza `old_string`→`new_string` sin reinsertar el doc. El gateway lee SU checkout (no disco local). No revalida el frontmatter → funciona con deuda. old_string debe ser exacto; ambiguo → usa `replace_all` |
@@ -194,7 +196,8 @@ Después: **reiniciar Claude Code en VSCode** para que cargue el MCP.
 
 - `read_note` / `get_context` / `list_notes` / `get_contracts`: < 1s (índice Postgres + grafo).
 - `read_note(enrich=true)`: +1–3s (síntesis LLM del neighborhood).
-- `search_notes`: 7–8s (retrieval híbrido + reranker en GPU + LLM de síntesis).
+- `find_notes`: p95 < 2s (retrieval-only: híbrido + reranker, **sin** LLM de síntesis).
+- `search_notes`: 7–8s (retrieval híbrido + reranker + LLM de síntesis).
 - `write_note` nuevo doc con kind inferible de la ruta: 1–3s (sin LLM, solo git push).
 - `write_note` nuevo doc con ruta ambigua: 2–5s (LLM de clasificación + git push).
 - `write_note` update / `link_notes`: 1–3s (sin clasificación LLM).

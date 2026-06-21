@@ -150,7 +150,8 @@ Ver `guides/mcp-focusyn.md`.
 | `read_note`      | Lee un doc + entidades GraphRAG + documentos relacionados         |
 | `list_notes`     | Lista docs indexados de un vault (índice Postgres)               |
 | `map_vault`      | Árbol del vault por nivel (progressive disclosure); sin args = los 3 vaults |
-| `search_notes`   | Búsqueda semántica GraphRAG (pregunta en lenguaje natural)        |
+| `find_notes`     | Encontrar docs rápido (lista rankeada, retrieval-only, sin LLM, p95<2s) |
+| `search_notes`   | Preguntar: búsqueda semántica GraphRAG con respuesta sintetizada (más lento) |
 | `write_note`     | Crea o reemplaza un doc (propose+apply, audit, commit+push)       |
 | `append_note`    | Agrega contenido al final (lee + reescribe completo)             |
 | `delete_note`    | Elimina un doc (requiere `id` en frontmatter + indexado)          |

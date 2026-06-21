@@ -4,8 +4,8 @@
 Lecturas y escrituras pasan por el gateway HTTP (puerto 7415 en dev):
 
 - Lecturas (`read_note` [con enrich opcional], `get_context`, `list_notes`,
-  `search_notes`, `get_contracts`, `lint_vault`, `peek_id`, `map_vault`) consultan el
-  gateway →
+  `find_notes`, `search_notes`, `get_contracts`, `lint_vault`, `peek_id`, `map_vault`)
+  consultan el gateway →
   contenido + entidades GraphRAG + documentos relacionados + bloques tipados +
   deuda de frontmatter + contador autoritativo de doc_id.
 - Escrituras gobernadas (frontmatter canónico, audit, commit+push):
@@ -37,7 +37,7 @@ Gateway del vault del ecosistema — memoria larga, no un destino opcional. Úsa
 
 ANTES de crear o buscar: get_context(vault) (convenciones + portal de la org). El vault y el schema del proyecto los nombra su CLAUDE.md.
 
-LECTURA lean por defecto: read_note(path)=raw_content+frontmatter. graph=true solo para "entender X y su entorno"; enrich=true síntesis. search_notes = PREGUNTA semántica, NO grep. map_vault() explora la ESTRUCTURA del vault un nivel a la vez (sin args = los 3 vaults).
+LECTURA lean por defecto: read_note(path)=raw_content+frontmatter. graph=true solo para "entender X y su entorno"; enrich=true síntesis. find_notes = LOCALIZAR notas rápido (lista rankeada, sin LLM, p95<2s). search_notes = PREGUNTA semántica con respuesta sintetizada (más lento). Ninguno es grep. map_vault() explora la ESTRUCTURA del vault un nivel a la vez (sin args = los 3 vaults).
 
 ESCRITURA — no reescribas el doc para cambios puntuales:
 - write_note(path,body): crear (SIN id) / reemplazar (CON id). Devuelve next_actions (recordatorios).
@@ -302,6 +302,49 @@ async def search_notes(
                 "respuesta; léela de evidence_docs."
             )
         return data
+
+
+@mcp.tool()
+async def find_notes(
+    query: str, vault: str = "all", kind: str = "", top_k: int = 10, rerank: bool = True
+) -> dict:
+    """ENCONTRAR documentos rápido: lista rankeada por relevancia, SIN respuesta sintetizada (p95<2s).
+
+    Retrieval-only (vector + grafo + reranker, sin LLM de síntesis). Úsalo para
+    LOCALIZAR/LISTAR las notas más relevantes a una consulta y decidir cuál leer.
+    Diferencia con search_notes: find_notes = ENCONTRAR (rápido, devuelve una lista
+    rankeada de hits con snippet); search_notes = PREGUNTAR (respuesta sintetizada con
+    el LLM sobre la evidencia, más lento). Si querés "qué docs hablan de X" → find_notes;
+    si querés "explicame X / qué se decidió sobre X" → search_notes.
+
+    Devuelve {results, took_ms, mode}. Cada hit: doc_id, vault, kind, path, title,
+    score, snippet (~300 chars), heading_path.
+
+    query: texto de la búsqueda (lenguaje natural o términos).
+    vault: acota el scope — wiki|lait|melquiades. "all" (o vacío) = todos los vaults.
+    kind: filtro opcional por kind canónico (decision|runbook|concept…); vacío = todos.
+    top_k: nº de hits a devolver (1-25, default 10).
+    rerank: aplica el reranker para reordenar por relevancia (default true).
+    """
+    # /v1/search usa vault=NULL para "todos" (NO acepta "all"). Mapeamos "all"/""/
+    # valor desconocido → None (omitido = todos, el default seguro); wiki|lait|
+    # melquiades se pasan tal cual.
+    body: dict = {
+        "query": query,
+        "top_k": max(1, min(top_k, 25)),
+        "rerank": rerank,
+    }
+    if vault in {"wiki", "lait", "melquiades"}:
+        body["vault"] = vault
+    if kind:
+        body["kind"] = kind
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(
+            f"{GATEWAY_URL}/v1/search", headers=_HEADERS, json=body
+        )
+        if resp.status_code >= 400:
+            return _gateway_error(resp, "search", vault=vault, kind=kind)
+        return resp.json()
 
 
 @mcp.tool()
