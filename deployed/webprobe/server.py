@@ -59,7 +59,7 @@ SERVER_LABEL = args.name or "webprobe"
 # Bump en cada cambio de comportamiento. El agente lo ve en status() para saber si el
 # proceso MCP está stale (un MCP es de vida larga; editar server.py NO recarga el proceso
 # vivo — hay que reiniciar Claude Code / recargar la ventana de VSCode).
-WEBPROBE_VERSION = "0.4.2"
+WEBPROBE_VERSION = "0.4.3"
 app = Server(f"webprobe-{SERVER_LABEL}")
 
 
@@ -431,6 +431,75 @@ _JS_OUTER_HTML = r"""
 (el, args) => {
   const s = el.outerHTML;
   return s.length > args.max_len ? s.slice(0, args.max_len) + ' …[+' + (s.length - args.max_len) + ' chars]' : s;
+}
+"""
+
+# Reporte del elemento que una acción REALMENTE tocó: box + tag de apertura + (si en su
+# centro gana el hit-test otro nodo) quién lo tapa. Cierra la clase de "falso ok" — la acción
+# reporta ok pero el valor/click cayó en otro elemento (input homónimo, botón detrás de un modal).
+_JS_TOUCH_REPORT = r"""
+(el) => {
+  const r = el.getBoundingClientRect();
+  const box = [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)];
+  const gt = el.outerHTML.indexOf('>');
+  let tag = gt !== -1 ? el.outerHTML.slice(0, gt + 1) : '<' + el.tagName.toLowerCase() + '>';
+  if (tag.length > 180) tag = tag.slice(0, 180) + '…>';
+  const out = { box: box, tag: tag };
+  const cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+  if (r.width > 0 && r.height > 0) {
+    const top = document.elementFromPoint(cx, cy);
+    if (top && top !== el && !el.contains(top) && !top.contains(el)) {
+      const desc = (n) => {
+        if (!n || !n.tagName) return '?';
+        if (n.id) return '#' + CSS.escape(n.id);
+        const s = n.tagName.toLowerCase();
+        const cls = (n.className && typeof n.className === 'string')
+          ? n.className.trim().split(/\s+/).filter(Boolean).slice(0, 2).map(CSS.escape).join('.') : '';
+        if (cls) return s + '.' + cls;
+        for (const a of ['data-testid', 'role', 'aria-label', 'name']) {
+          const v = n.getAttribute && n.getAttribute(a);
+          if (v) return s + '[' + a + '="' + v.slice(0, 24) + '"]';
+        }
+        let p = n.parentElement, hops = 0;   // overlay sin id/clase: ancla al ancestro útil más cercano
+        while (p && hops < 4) {
+          if (p.id) return '#' + CSS.escape(p.id) + ' > ' + s;
+          const pc = (p.className && typeof p.className === 'string')
+            ? p.className.trim().split(/\s+/).filter(Boolean)[0] : '';
+          if (pc) return p.tagName.toLowerCase() + '.' + CSS.escape(pc) + ' > ' + s;
+          p = p.parentElement; hops++;
+        }
+        return s;
+      };
+      out.covered_by = desc(top);
+    }
+  }
+  return out;
+}
+"""
+
+# Extrae los mismos fields que _JS_QUERY pero para UN elemento ya resuelto — usado cuando
+# query resuelve por el motor de Playwright (text=/role=/:has-text que querySelectorAll rechaza).
+_JS_QUERY_ONE = r"""
+(el, fields) => {
+  const r = el.getBoundingClientRect();
+  const cs = getComputedStyle(el);
+  const cssPath = (n) => {
+    if (n.id) return '#' + CSS.escape(n.id);
+    const cls = (n.className && typeof n.className === 'string')
+      ? '.' + n.className.trim().split(/\s+/).slice(0, 2).map(CSS.escape).join('.') : '';
+    return n.tagName.toLowerCase() + cls;
+  };
+  const out = {};
+  for (const f of fields) {
+    if (f === 'tag') out.tag = el.tagName.toLowerCase();
+    else if (f === 'txt') out.txt = (el.innerText || el.value || '').trim().slice(0, 60);
+    else if (f === 'vis') out.vis = r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+    else if (f === 'box') out.box = [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)];
+    else if (f === 'classes') out.classes = (typeof el.className === 'string' ? el.className : '').trim().slice(0, 240);
+    else if (f === 'sel') out.sel = cssPath(el);
+    else if (f === 'href') out.href = el.getAttribute('href');
+  }
+  return out;
 }
 """
 
@@ -921,17 +990,42 @@ async def _tool_inspect_buttons(arguments: dict) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
+async def _query_via_locator(page, selector: str, limit: int, fields: list):
+    """Resuelve query por el motor de Playwright (text=/role=/:has-text) — el MISMO que usan
+    click/wait_for — para que lo que se INSPECCIONA sea exactamente lo que se ACCIONA. None si
+    el selector tampoco es válido para Playwright."""
+    loc = page.locator(selector)
+    try:
+        total = await loc.count()
+    except Exception:
+        return None
+    items = []
+    for i in range(min(total, limit)):
+        try:
+            items.append(await loc.nth(i).evaluate(_JS_QUERY_ONE, fields))
+        except Exception:
+            pass
+    return {"total": total, "returned": len(items), "truncated": total > len(items),
+            "items": items, "engine": "playwright"}
+
+
 async def _tool_query(arguments: dict) -> str:
     page = await _ensure_page(arguments.get("tab"))
-    data = await page.evaluate(_JS_QUERY, {
-        "selector": arguments["selector"],
-        "limit": int(arguments.get("limit", 20)),
-        "fields": arguments.get("fields") or ["tag", "txt", "vis", "box", "classes"],
-    })
+    selector = arguments["selector"]
+    limit = int(arguments.get("limit", 20))
+    fields = arguments.get("fields") or ["tag", "txt", "vis", "box", "classes"]
+    if _looks_non_css(selector):
+        # text=/role=/:has-text(...): querySelectorAll los rechaza → motor de Playwright,
+        # el mismo de click/wait_for, así query refleja lo que se va a accionar.
+        data = await _query_via_locator(page, selector, limit, fields)
+    else:
+        data = await page.evaluate(_JS_QUERY, {"selector": selector, "limit": limit, "fields": fields})
+        if data is not None:
+            data["engine"] = "css"
     if data is None:
-        return f"(selector inválido: {arguments['selector']})"
+        return f"(selector inválido: {selector})"
     if not data.get("items"):
-        return f"(sin elementos para '{arguments['selector']}')"
+        return f"(sin elementos para '{selector}')"
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -1304,6 +1398,25 @@ async def _settle_nav(page, url0: str, poll_ms: int = 800):
         pass
 
 
+async def _touch_report(loc):
+    """Describe el elemento que una acción tocó (box + tag + covered_by). None si no se pudo."""
+    try:
+        return await loc.evaluate(_JS_TOUCH_REPORT)
+    except Exception:
+        return None
+
+
+def _fmt_touch(report) -> str:
+    """Línea compacta para anexar a la respuesta de una acción de interacción."""
+    if not report:
+        return ""
+    line = f"\n→ elemento: {report.get('tag', '?')} @ {report.get('box')}"
+    if report.get("covered_by"):
+        line += (f"\n⚠ ese elemento está TAPADO por {report['covered_by']} — verificá que la "
+                 f"acción cayó donde querías (¿nth/selector?)")
+    return line
+
+
 async def _tool_click(arguments: dict) -> str:
     if not args.allow_interact:
         return _interact_forbidden("click")
@@ -1328,18 +1441,22 @@ async def _tool_click(arguments: dict) -> str:
         first = str(e).strip().splitlines()[0]
         hint = ""
         if not force and ("intercept" in str(e) or "Timeout" in first):
-            hint = (" — algo tapa el target por coordenada (ej. fondo WebGL/canvas o un overlay): "
-                    "reintentá con force=true (dispara el click a nivel DOM), o press('Enter') si es un submit.")
+            cov = (await _touch_report(loc) or {}).get("covered_by")
+            who = f"lo tapa {cov}" if cov else "algo lo tapa (overlay/canvas)"
+            hint = (f" — {who} por coordenada: reintentá con force=true (dispara el click a "
+                    f"nivel DOM), o press('Enter') si es un submit.")
         return f"(no se pudo click en '{selector}'[{nth}]: {first}{hint})"
+    touch = await _touch_report(loc)   # capturado pre-navegación: el elemento aún existe
     await _settle_nav(page, url0)
+    suffix = _fmt_touch(touch)
     if page.url != url0:
         try:
             title = await page.title()
         except Exception:
             title = "?"
-        return f"click ok: {selector}[{nth}]\n→ navegó: {page.url} (title: {title})"
+        return f"click ok: {selector}[{nth}]\n→ navegó: {page.url} (title: {title}){suffix}"
     return (f"click ok: {selector}[{nth}] (sin navegación inmediata; url={page.url} "
-            f"— usá wait_for si esperás un efecto async)")
+            f"— usá wait_for si esperás un efecto async){suffix}")
 
 
 async def _tool_fill(arguments: dict) -> str:
@@ -1358,8 +1475,9 @@ async def _tool_fill(arguments: dict) -> str:
         await loc.fill(value, timeout=timeout, force=force)
     except Exception as e:
         return f"(no se pudo fill en '{selector}'[{nth}]: {e})"
-    # NO se hace eco del valor (puede ser secreto: contraseña/token) — solo longitud
-    return f"fill ok: {selector}[{nth}] ← {len(value)} chars"
+    # NO se hace eco del valor (puede ser secreto: contraseña/token) — solo longitud.
+    # Sí se reporta el tag+box del input tocado: detecta si el valor cayó en otro input homónimo.
+    return f"fill ok: {selector}[{nth}] ← {len(value)} chars" + _fmt_touch(await _touch_report(loc))
 
 
 async def _tool_type(arguments: dict) -> str:
@@ -1380,7 +1498,7 @@ async def _tool_type(arguments: dict) -> str:
         await loc.press_sequentially(text, delay=delay, timeout=timeout)
     except Exception as e:
         return f"(no se pudo type en '{selector}'[{nth}]: {e})"
-    return f"type ok: {selector}[{nth}] ← {len(text)} chars (tecla-a-tecla)"
+    return f"type ok: {selector}[{nth}] ← {len(text)} chars (tecla-a-tecla)" + _fmt_touch(await _touch_report(loc))
 
 
 async def _tool_press(arguments: dict) -> str:
@@ -1550,18 +1668,18 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="click",
-            description="Click en un elemento (valida happy-paths: botón Entrar/Generar/Aplicar/Aprobar). Selector soporta CSS, `text=\"Entrar\"`, `role=button[name=...]`, `:has-text(...)`; `nth` desambigua. Reporta si el click navegó (URL nueva + title) o cambió estado sin navegar. Si un overlay/canvas WebGL tapa el target por coordenada, el click normal da timeout → reintentá con force=true (dispara el click a nivel DOM, ignora el overlay), o press('Enter') si es un submit. Requiere allow_interact.",
+            description="Click en un elemento (valida happy-paths: botón Entrar/Generar/Aplicar/Aprobar). Selector soporta CSS, `text=\"Entrar\"`, `role=button[name=...]`, `:has-text(...)`; `nth` desambigua. Reporta si el click navegó (URL nueva + title) o cambió estado sin navegar. Si un overlay/canvas WebGL tapa el target por coordenada, el click normal da timeout → reintentá con force=true (dispara el click a nivel DOM, ignora el overlay), o press('Enter') si es un submit; el error nombra qué elemento lo tapa. Reporta el elemento realmente tocado (tag+box) y, si está tapado, quién — para no confiar a ciegas en el 'ok'. Requiere allow_interact.",
             inputSchema={"type": "object", "properties": {
                 "selector": {"type": "string"},
                 "nth": {"type": "integer", "default": 0, "description": "índice si el selector matchea varios"},
-                "force": {"type": "boolean", "default": False, "description": "dispara el click a nivel DOM (dispatchEvent) en vez de por coordenada — para targets tapados por un overlay/canvas que gana el hit-test"},
+                "force": {"type": "boolean", "default": False, "description": "dispara el click a nivel DOM (dispatchEvent crudo) en vez de por coordenada — IDEAL para overlays decorativos (canvas/WebGL). OJO: NO sintetiza pointer events (handlers basados en pointerdown/mousedown pueden no correr) y NO hace hit-test, así que sobre un modal puede disparar el elemento de ATRÁS — ahí usá un selector más específico, no force"},
                 "timeout_ms": {"type": "integer", "default": 5000},
                 **tab,
             }, "required": ["selector"]},
         ),
         types.Tool(
             name="fill",
-            description="Escribe un valor en un input/textarea (usuario, contraseña, intent, body…). Limpia + setea + dispara 'input' (React controlado lo capta). NO hace eco del valor (puede ser secreto) — solo reporta longitud. Selector CSS/text/role/:has-text; `nth` desambigua. Para inputs que ignoran fill (máscaras/handlers por tecla) usá `type`. Requiere allow_interact.",
+            description="Escribe un valor en un input/textarea (usuario, contraseña, intent, body…). Limpia + setea + dispara 'input' (React controlado lo capta). NO hace eco del valor (puede ser secreto) — solo reporta longitud. Selector CSS/text/role/:has-text; `nth` desambigua. Para inputs que ignoran fill (máscaras/handlers por tecla) usá `type`. Reporta el tag+box del input realmente tocado (detecta si el valor cayó en otro input homónimo). Requiere allow_interact.",
             inputSchema={"type": "object", "properties": {
                 "selector": {"type": "string"},
                 "value": {"type": "string"},
@@ -1573,7 +1691,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="type",
-            description="Teclea texto tecla-a-tecla (keydown/keyup reales) en un input — para los que ignoran fill (máscaras, handlers por tecla). Más lento que fill; preferí fill salvo que no dispare el framework. `clear=true` limpia antes; `delay_ms` entre teclas. Requiere allow_interact.",
+            description="Teclea texto tecla-a-tecla (keydown/keyup reales) en un input — para los que ignoran fill (máscaras, handlers por tecla). Más lento que fill; preferí fill salvo que no dispare el framework. `clear=true` limpia antes; `delay_ms` entre teclas. Reporta el tag+box del input tocado. Requiere allow_interact.",
             inputSchema={"type": "object", "properties": {
                 "selector": {"type": "string"},
                 "text": {"type": "string"},
@@ -1705,7 +1823,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="query",
-            description="Props clave de los elementos de un selector (sin volcar el DOM). fields: tag,txt,vis,box,classes,sel,href (classes hasta 240 chars). Devuelve {total, returned, truncated, items}.",
+            description="Props clave de los elementos de un selector (sin volcar el DOM). Acepta el MISMO motor que click/wait_for: CSS y también `text=...`, `role=button[name=...]`, `:has-text(...)` — así lo que inspeccionás es exactamente lo que accionás (`engine` indica si resolvió por css o playwright). fields: tag,txt,vis,box,classes,sel,href (classes hasta 240 chars). Devuelve {total, returned, truncated, items, engine}.",
             inputSchema={"type": "object", "properties": {
                 "selector": {"type": "string"},
                 "limit": {"type": "integer", "default": 20},
