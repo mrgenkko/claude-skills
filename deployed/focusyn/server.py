@@ -371,6 +371,59 @@ async def map_vault(vault: str = "", path: str = "", depth: int = 1) -> dict:
         return resp.json()
 
 
+@mcp.tool()
+async def suggest_entity_aliases(vault: str = "", min_cosine: float = 0.0, limit: int = 50) -> dict:
+    """Sugiere pares de entidades casi-sinónimas del grafo para alias SUPERVISADO.
+
+    Dedup de entidad CON confirmación: el gateway propone "X se parece a Y" (vecino
+    del mismo tipo por embedding de nombre, sobre el umbral, tras los guards que
+    descartan padre/hijo y hermanos enumerados). SOLO sugiere — no fusiona. Revisá
+    cada par (mirá el grado: alto = importa más) y, si es el mismo concepto,
+    confirmá con confirm_entity_alias; si no, ignorá. "Mapa, no verdad": verificá las
+    entidades reales antes de fusionar.
+
+    vault: acota a entidades de ese vault (wiki|lait|melquiades). Omitido = todas.
+    min_cosine: override del umbral (0 = usar el default del gateway, ~0.93).
+    limit: nº máx de pares (1-200, default 50), ordenados por coseno desc.
+    """
+    params: dict = {"limit": limit}
+    if vault:
+        params["vault"] = vault
+    if min_cosine > 0:
+        params["min_cosine"] = min_cosine
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(
+            f"{GATEWAY_URL}/v1/entities/alias-candidates", headers=_HEADERS, params=params
+        )
+        if resp.status_code >= 400:
+            return _gateway_error(resp, "alias_candidates", vault=vault)
+        return resp.json()
+
+
+@mcp.tool()
+async def confirm_entity_alias(keep_entity_id: str, alias_entity_id: str) -> dict:
+    """Fusiona DOS entidades confirmadas como la misma (alias supervisado).
+
+    `alias_entity_id` se funde dentro de `keep_entity_id` (survivor): el survivor
+    conserva su identidad y absorbe las relaciones del otro; el nombre del alias
+    queda en sus `aliases`. Úsalo SOLO tras revisar un par de suggest_entity_aliases
+    y confirmar que son el mismo concepto — la fusión MUTA el grafo y se revierte por
+    snapshot, no en caliente. Idempotente (re-confirmar → already_merged).
+
+    keep_entity_id: la entidad que SOBREVIVE (la canónica/de mayor grado).
+    alias_entity_id: la que se absorbe.
+    """
+    payload = {"keep_entity_id": keep_entity_id, "alias_entity_id": alias_entity_id}
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(
+            f"{GATEWAY_URL}/v1/entities/alias-confirm", headers=_HEADERS, json=payload
+        )
+        if resp.status_code >= 400:
+            return _gateway_error(resp, "alias_confirm",
+                                  keep=keep_entity_id, alias=alias_entity_id)
+        return resp.json()
+
+
 # ── ESCRITURAS (vía gateway: propose + apply) ───────────────────────────────────
 
 
