@@ -16,6 +16,8 @@ Lecturas y escrituras pasan por el gateway HTTP (puerto 7415 en dev):
 - `push_vault` empuja commits locales pendientes (push fallido / commits manuales).
 - `add_attachment` sube binarios al NAS vía el gateway (fuera de Git, referencia por
   proxy estable); con doc_id + imagen se indexa multimodal.
+- `delete_attachment` borra un binario suelto del NAS por file_id (idempotente; el
+  cascade al borrar un doc lo hace `delete_note`).
 """
 
 import asyncio
@@ -905,6 +907,23 @@ async def add_attachment(
             "content_type": result.get("content_type"),
             "size_bytes": result.get("size_bytes"),
         }
+
+
+@mcp.tool()
+async def delete_attachment(file_id: str) -> dict:
+    """Borra una imagen/binario suelto del NAS por file_id (DELETE /v1/attachment/{id}).
+
+    El file_id es el UUID que aparece en la ref markdown ![alt](/v1/attachment/{file_id}).
+    Idempotente (already_deleted si ya no está). Para borrar TODOS los adjuntos de un doc,
+    usa delete_note (cascade automático).
+    """
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.delete(
+            f"{GATEWAY_URL}/v1/attachment/{file_id}", headers=_HEADERS
+        )
+        if resp.status_code >= 400:
+            return _gateway_error(resp, "delete_attachment", file_id=file_id)
+        return resp.json()
 
 
 if __name__ == "__main__":

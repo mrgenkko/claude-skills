@@ -155,6 +155,7 @@ Ver `guides/mcp-focusyn.md`.
 | `append_note`    | Agrega contenido al final (lee + reescribe completo)             |
 | `delete_note`    | Elimina un doc (requiere `id` en frontmatter + indexado)          |
 | `add_attachment` | Sube un binario al NAS vía gateway y retorna `markdown_ref` (proxy estable) |
+| `delete_attachment` | Borra un binario suelto del NAS por `file_id` (idempotente; cascade de un doc = `delete_note`) |
 
 ### obsidian (`deployed/obsidian/server.py`) — legacy/fallback
 

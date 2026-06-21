@@ -40,6 +40,7 @@ registrado en los proyectos activos. El binario `obsidian` raw se conserva en
 | `peek_id(vault, kind)` | `GET /v1/ids/peek` | Último/próximo doc_id para `(vault, kind)` SIN consumir uno (no cuentes a mano). `in_sync=false` señala drift contador↔índice |
 | `push_vault(vault)` | `POST /v1/sync/push` | Empuja commits locales pendientes a GitHub (push fallido / commits manuales). Al día → `pushed: false`. Requiere scope `sync` |
 | `add_attachment(source_path, vault, doc_id="", alt="", filename="")` | `POST /v1/write/attachment` | Sube un binario (imagen/PDF/audio) al **NAS vía gateway** (fuera de Git). Devuelve `markdown_ref` (`![alt](/v1/attachment/{file_id})`) + `file_id` + `status`. Con `doc_id` + imagen → indexado multimodal (recuperable cross-modal por `search_notes`). Idempotente por `(vault, source_path)`. Scope `apply` |
+| `delete_attachment(file_id)` | `DELETE /v1/attachment/{file_id}` | Borra una imagen/binario **suelto** del NAS por `file_id` (el UUID de `![alt](/v1/attachment/{file_id})`): binario + fila `attachments` + chunk multimodal. Devuelve `{file_id, status}` (`deleted` \| `already_deleted`). Idempotente. Para borrar TODOS los adjuntos de un doc usa `delete_note` (cascade). Scope `apply` |
 
 > **Edición quirúrgica gobernada (Fase 8):** `edit_note` (str_replace del body),
 > `append_note` y `patch_frontmatter` editan en puntos específicos vía

@@ -13,6 +13,7 @@ gateway. Reemplaza por completo al MCP `obsidian` raw (acceso directo al filesys
 - `map_vault` navega el árbol del vault un nivel a la vez (progressive disclosure).
 - `add_attachment` sube binarios al NAS vía el gateway (fuera de Git, referencia por
   proxy estable); con doc_id + imagen se indexa multimodal.
+- `delete_attachment` borra un binario suelto del NAS por file_id (idempotente).
 
 Uso:
     FOCUSYN_GATEWAY_URL=http://localhost:7415 \\
@@ -597,6 +598,25 @@ async def add_attachment(
             headers={"X-Agent-Key": GATEWAY_KEY},
             files=files,
             data=data,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+@mcp.tool()
+async def delete_attachment(file_id: str) -> dict:
+    """Borra una imagen/binario suelto del NAS por file_id (DELETE /v1/attachment/{id}).
+
+    El file_id es el UUID de la ref markdown ![alt](/v1/attachment/{file_id}). Idempotente
+    (already_deleted si ya no está). Para borrar TODOS los adjuntos de un doc, usa
+    delete_note (cascade automático).
+
+    Args:
+        file_id: UUID del attachment a borrar.
+    """
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.delete(
+            f"{GATEWAY_URL}/v1/attachment/{file_id}", headers=_HEADERS
         )
         resp.raise_for_status()
         return resp.json()
