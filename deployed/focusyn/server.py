@@ -406,6 +406,10 @@ async def write_note(path: str, body: str) -> dict:
     del nombre pedido (o del título H1 si el nombre es muy corto). La respuesta
     incluye el `path` definitivo — úsalo para lecturas posteriores.
 
+    Si el body se parece mucho a un doc existente, la respuesta trae
+    `possible_duplicates` + `duplicate_hint` (no bloquea): confirmá superseder/
+    enlazar o ignorá.
+
     Args:
         path: ruta relativa al ObsidianVault (ej. "lait/proyectos/mi-proj/index.md")
         body: contenido completo del documento en Markdown
@@ -521,6 +525,19 @@ async def write_note(path: str, body: str) -> dict:
         next_actions = result.get("next_actions")
         if next_actions:
             out["next_actions"] = next_actions
+        # Dedup con confirmación (9.5): el gateway detectó docs existentes muy
+        # parecidos al body. NO bloquea (la escritura ya pasó); surface para que
+        # confirmes una relación o ignores. "Mapa, no verdad": verificá leyendo el
+        # doc real antes de superseder/enlazar.
+        dups = proposal.get("possible_duplicates")
+        if dups:
+            out["possible_duplicates"] = dups
+            top = dups[0]
+            out["duplicate_hint"] = (
+                f"El body se parece a {top['doc_id']} (similitud {top['similarity']}). "
+                f"Si lo reemplaza: supersede_note; si lo respalda: "
+                f"link_notes(relation='{top['suggested_relation']}'); si no, ignorá."
+            )
         return out
 
 
