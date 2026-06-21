@@ -10,7 +10,9 @@ gateway. Reemplaza por completo al MCP `obsidian` raw (acceso directo al filesys
 - Escrituras (`write_note`, `append_note`, `delete_note`, `link_notes`) usan el
   pipeline gobernado → frontmatter canónico, audit trail y commit+push a GitHub.
 - `push_vault` empuja commits locales pendientes (push fallido / commits manuales).
-- `add_attachment` copia binarios al vault directamente (no son docs gobernados).
+- `map_vault` navega el árbol del vault un nivel a la vez (progressive disclosure).
+- `add_attachment` sube binarios al NAS vía el gateway (fuera de Git, referencia por
+  proxy estable); con doc_id + imagen se indexa multimodal.
 
 Uso:
     FOCUSYN_GATEWAY_URL=http://localhost:7415 \\
@@ -29,7 +31,6 @@ necesita scopes read,propose,apply y, para `push_vault`, también sync.
 import hashlib
 import os
 import re
-import shutil
 from pathlib import Path
 from uuid import uuid4
 
@@ -288,6 +289,29 @@ async def search_notes(query: str, vault: str = "all", top_n: int = 8) -> dict:
         return resp.json()
 
 
+@mcp.tool()
+async def map_vault(vault: str = "", path: str = "", depth: int = 1) -> dict:
+    """Navega el árbol del vault un nivel a la vez (mapa jerárquico, progressive disclosure).
+
+    Empieza sin argumentos para ver los vaults; desciende pasando vault y, opcional,
+    path. Complementa list_notes (plano/filtrado) con navegación estructural.
+
+    Args:
+        vault: wiki|lait|melquiades. Omitido = raíz cross-vault (un nodo por vault).
+        path: prefijo de carpeta relativo al vault (ej. "proyectos/x"). Requiere vault.
+        depth: niveles a anidar (1-4, default 1).
+    """
+    params: dict = {"depth": depth}
+    if vault:
+        params["vault"] = vault
+    if path:
+        params["path"] = path
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(f"{GATEWAY_URL}/v1/map", headers=_HEADERS, params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+
 # ── ESCRITURAS (vía gateway: propose + apply) ───────────────────────────────────
 
 
@@ -525,33 +549,57 @@ async def get_contracts(doc: str, role: str = "") -> dict:
         return resp.json()
 
 
-# ── ATTACHMENTS (filesystem directo — no son docs gobernados) ───────────────────
+# ── ATTACHMENTS (vía gateway → NAS, fuera de Git, multimodal) ───────────────────
 
 
 @mcp.tool()
 async def add_attachment(
-    source_path: str, filename: str, folder: str = "wiki/attachments"
+    source_path: str,
+    vault: str,
+    doc_id: str = "",
+    alt: str = "",
+    filename: str = "",
 ) -> dict:
-    """Copia un binario (imagen, PDF) al vault y retorna el wikilink Obsidian.
+    """Sube un binario (imagen, PDF, audio…) al NAS vía el gateway y retorna su markdown_ref.
 
-    Los attachments no pasan por el gateway (no son documentos gobernados): se
-    copian directamente al vault en disco.
+    No copia al disco ni usa wikilinks: el binario vive fuera de Git en el NAS y se
+    referencia por un proxy estable del gateway. Con doc_id + imagen se indexa
+    multimodal (recuperable por search_notes). Idempotente por (source_path, vault).
 
     Args:
-        source_path: ruta absoluta al archivo en el filesystem
-        filename: nombre con el que se guardará (ej. "diagrama.png")
-        folder: carpeta destino relativa al vault (default "wiki/attachments")
+        source_path: ruta absoluta al archivo en el host.
+        vault: vault destino (wiki|lait|melquiades).
+        doc_id: doc_id del doc que lo referencia; requerido para indexar imágenes.
+        alt: texto alternativo que describe el contenido.
+        filename: nombre a registrar; default = nombre del source_path.
     """
+    if vault not in _KNOWN_VAULTS:
+        raise ValueError(
+            f"Vault desconocido: '{vault}'. Válidos: {', '.join(sorted(_KNOWN_VAULTS))}"
+        )
     src = Path(source_path).expanduser().resolve()
     if not src.is_file():
         return {"status": "error", "message": f"No es un archivo: {source_path}"}
-    dest_dir = (VAULT_ROOT / folder.lstrip("/")).resolve()
-    dest_dir.relative_to(VAULT_ROOT)  # seguridad: dentro del vault
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / filename
-    shutil.copy2(src, dest)
-    rel = os.path.relpath(dest, VAULT_ROOT)
-    return {"status": "ok", "path": rel, "wikilink": f"![[{filename}]]"}
+    name = filename or src.name
+    content = src.read_bytes()
+    ik = _idempotency_key(str(src), vault, "attachment")
+    # GOTCHA multipart: NO mandar _HEADERS (lleva Content-Type: application/json);
+    # httpx fija el boundary solo cuando usas files=. Solo va X-Agent-Key.
+    files = {"file": (name, content)}
+    data: dict[str, str] = {"vault": vault, "idempotency_key": ik}
+    if doc_id:
+        data["doc_id"] = doc_id
+    if alt:
+        data["alt"] = alt
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(
+            f"{GATEWAY_URL}/v1/write/attachment",
+            headers={"X-Agent-Key": GATEWAY_KEY},
+            files=files,
+            data=data,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
 
 if __name__ == "__main__":

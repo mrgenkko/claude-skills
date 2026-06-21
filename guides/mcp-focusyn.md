@@ -26,6 +26,7 @@ registrado en los proyectos activos. El binario `obsidian` raw se conserva en
 | `get_context(vault)` | `GET /v1/read?path=CONTEXT.md` | CONTEXT.md del vault + (para `lait`/`melquiades`) concatena el global de `wiki`. Llamar **siempre** antes de crear o buscar notas. `vault`: wiki \| lait \| melquiades |
 | `read_note(path, enrich=False)` | `GET /v1/read` | Contenido del doc + entidades GraphRAG + documentos relacionados del grafo. Con `enrich=true` añade `graph_summary` (síntesis LLM del neighborhood, +1-3s — solo cuando necesites entender el contexto del doc). `path` relativo al vault con prefijo (ej. `lait/proyectos/x/index.md`) |
 | `list_notes(vault, path_prefix, kind, limit)` | `GET /v1/list` | Lista docs indexados (índice Postgres, no filesystem). Filtros opcionales. Latencia ~15s tras un write |
+| `map_vault(vault="", path="", depth=1)` | `GET /v1/map` | Navega el árbol del vault un nivel a la vez (progressive disclosure). Sin args = los 3 vaults; desciende con `vault` + `path`; `depth` 1-4 anida `children`. `index.md` plegado como cabecera de carpeta; `CONTEXT.md` visible como doc. Complementa `list_notes` (plano/filtrado) |
 | `search_notes(query, vault, top_n)` | `POST /v1/graphrag/query` | Búsqueda **semántica** (vector + grafo + BM25 + reranker): una pregunta en lenguaje natural. `vault` (scope): wiki \| lait \| melquiades \| all (default `all`) |
 | `get_contracts(doc, role="")` | `GET /v1/contracts/{doc_id}[/{role}]` | Bloques tipados (json/yaml/openapi/proto/mermaid) del doc, listos para consumo máquina. `doc` acepta doc_id canónico o path; `role` filtra (schema \| example \| config…) |
 | `write_note(path, body)` | `propose` + `apply` | Crea/reemplaza un doc completo. `body` es **siempre** el documento entero. Para cambios puntuales usa `edit_note`/`append_note`/`patch_frontmatter` |
@@ -38,7 +39,7 @@ registrado en los proyectos activos. El binario `obsidian` raw se conserva en
 | `lint_vault(vault="", kind="")` | `GET /v1/lint` | Lista docs indexados que violan el schema vigente (deuda de frontmatter). Sin filtros audita los 3 vaults. Sáldalos con `patch_frontmatter` |
 | `peek_id(vault, kind)` | `GET /v1/ids/peek` | Último/próximo doc_id para `(vault, kind)` SIN consumir uno (no cuentes a mano). `in_sync=false` señala drift contador↔índice |
 | `push_vault(vault)` | `POST /v1/sync/push` | Empuja commits locales pendientes a GitHub (push fallido / commits manuales). Al día → `pushed: false`. Requiere scope `sync` |
-| `add_attachment(source_path, filename, folder)` | — (filesystem directo) | Copia un binario (imagen/PDF) al vault y retorna el wikilink `![[...]]`. Los attachments no son docs gobernados |
+| `add_attachment(source_path, vault, doc_id="", alt="", filename="")` | `POST /v1/write/attachment` | Sube un binario (imagen/PDF/audio) al **NAS vía gateway** (fuera de Git). Devuelve `markdown_ref` (`![alt](/v1/attachment/{file_id})`) + `file_id` + `status`. Con `doc_id` + imagen → indexado multimodal (recuperable cross-modal por `search_notes`). Idempotente por `(vault, source_path)`. Scope `apply` |
 
 > **Edición quirúrgica gobernada (Fase 8):** `edit_note` (str_replace del body),
 > `append_note` y `patch_frontmatter` editan en puntos específicos vía
@@ -186,7 +187,7 @@ Después: **reiniciar Claude Code en VSCode** para que cargue el MCP.
 |---|---|---|
 | `FOCUSYN_GATEWAY_URL` | `http://localhost:7415` | URL base del gateway |
 | `FOCUSYN_GATEWAY_KEY` | `a2a_<...>` | API key del agente MCP (header `X-Agent-Key`) |
-| `OBSIDIAN_VAULT` | `/home/melquiades/ObsidianVault` | Raíz del vault en el host (para leer el `id` del frontmatter y para `add_attachment`) |
+| `OBSIDIAN_VAULT` | `/home/melquiades/ObsidianVault` | Raíz del vault en el host (para leer el `id` del frontmatter en `write_note`/`delete_note`) |
 
 ## Latencia esperada
 
@@ -197,6 +198,8 @@ Después: **reiniciar Claude Code en VSCode** para que cargue el MCP.
 - `write_note` nuevo doc con ruta ambigua: 2–5s (LLM de clasificación + git push).
 - `write_note` update / `link_notes`: 1–3s (sin clasificación LLM).
 - `delete_note` / `push_vault`: ~1s.
+- `add_attachment`: 1–4s (subida al NAS; +1–2s si indexa multimodal una imagen con `doc_id`).
+- `map_vault`: < 1s (índice Postgres).
 
 ## Smoke test
 

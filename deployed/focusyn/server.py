@@ -4,7 +4,8 @@
 Lecturas y escrituras pasan por el gateway HTTP (puerto 7415 en dev):
 
 - Lecturas (`read_note` [con enrich opcional], `get_context`, `list_notes`,
-  `search_notes`, `get_contracts`, `lint_vault`, `peek_id`) consultan el gateway →
+  `search_notes`, `get_contracts`, `lint_vault`, `peek_id`, `map_vault`) consultan el
+  gateway →
   contenido + entidades GraphRAG + documentos relacionados + bloques tipados +
   deuda de frontmatter + contador autoritativo de doc_id.
 - Escrituras gobernadas (frontmatter canónico, audit, commit+push):
@@ -13,14 +14,14 @@ Lecturas y escrituras pasan por el gateway HTTP (puerto 7415 en dev):
     no revalida el frontmatter → funciona con deuda): `edit_note` (str_replace del
     body), `append_note` (concatena al body), `patch_frontmatter` (saldar deuda).
 - `push_vault` empuja commits locales pendientes (push fallido / commits manuales).
-- `add_attachment` copia binarios al vault directamente (no son docs gobernados).
+- `add_attachment` sube binarios al NAS vía el gateway (fuera de Git, referencia por
+  proxy estable); con doc_id + imagen se indexa multimodal.
 """
 
 import asyncio
 import hashlib
 import os
 import re
-import shutil
 from pathlib import Path
 from uuid import uuid4
 
@@ -34,7 +35,7 @@ Gateway del vault del ecosistema — memoria larga, no un destino opcional. Úsa
 
 ANTES de crear o buscar: get_context(vault) (convenciones + portal de la org). El vault y el schema del proyecto los nombra su CLAUDE.md.
 
-LECTURA lean por defecto: read_note(path)=raw_content+frontmatter. graph=true solo para "entender X y su entorno"; enrich=true síntesis. search_notes = PREGUNTA semántica, NO grep.
+LECTURA lean por defecto: read_note(path)=raw_content+frontmatter. graph=true solo para "entender X y su entorno"; enrich=true síntesis. search_notes = PREGUNTA semántica, NO grep. map_vault() explora la ESTRUCTURA del vault un nivel a la vez (sin args = los 3 vaults).
 
 ESCRITURA — no reescribas el doc para cambios puntuales:
 - write_note(path,body): crear (SIN id) / reemplazar (CON id). Devuelve next_actions (recordatorios).
@@ -336,6 +337,35 @@ async def peek_id(vault: str, kind: str) -> dict:
         )
         if resp.status_code >= 400:
             return _gateway_error(resp, "peek_id", vault=vault, kind=kind)
+        return resp.json()
+
+
+@mcp.tool()
+async def map_vault(vault: str = "", path: str = "", depth: int = 1) -> dict:
+    """Navega el árbol del vault UN NIVEL A LA VEZ (mapa jerárquico, progressive disclosure).
+
+    Empieza SIN argumentos para ver los 3 vaults; luego desciende pasando `vault`
+    (raíz del vault) y, opcionalmente, `path` (prefijo de carpeta dentro del vault).
+    Cada nodo trae title/description (del frontmatter) para decidir si abrirlo, y las
+    carpetas su doc_count recursivo. El index.md se pliega como cabecera de cada
+    carpeta; CONTEXT.md aparece como documento.
+
+    Complementa list_notes: list_notes da una lista PLANA filtrable; map_vault da la
+    ESTRUCTURA de carpetas para explorar sin cargar el vault entero al contexto.
+
+    vault: wiki|lait|melquiades. Omitido = raíz cross-vault (un nodo por vault).
+    path: prefijo de carpeta relativo al vault (ej. "proyectos/focusyn"). Requiere vault.
+    depth: niveles a anidar (1-4, default 1). >1 anida 'children'.
+    """
+    params: dict = {"depth": depth}
+    if vault:
+        params["vault"] = vault
+    if path:
+        params["path"] = path
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(f"{GATEWAY_URL}/v1/map", headers=_HEADERS, params=params)
+        if resp.status_code >= 400:
+            return _gateway_error(resp, "map", vault=vault, path=path)
         return resp.json()
 
 
@@ -802,28 +832,79 @@ async def get_contracts(doc: str, role: str = "") -> dict:
         return resp.json()
 
 
-# ── ATTACHMENTS (filesystem directo — no son docs gobernados) ───────────────────
+# ── ATTACHMENTS (vía gateway → NAS, fuera de Git, multimodal) ───────────────────
 
 
 @mcp.tool()
 async def add_attachment(
-    source_path: str, filename: str, folder: str = "wiki/attachments"
+    source_path: str,
+    vault: str,
+    doc_id: str = "",
+    alt: str = "",
+    filename: str = "",
 ) -> dict:
-    """Copia un binario (imagen, PDF) al vault y retorna el wikilink Obsidian.
+    """Sube un binario (imagen, PDF, audio…) al NAS vía el gateway y retorna su referencia markdown.
 
-    No pasa por el gateway (no es doc gobernado): copia directa al disco. source_path:
-    ruta absoluta. filename: nombre destino. folder: default "wiki/attachments".
+    NO copia al disco ni usa wikilinks Obsidian: el binario vive fuera de Git en el
+    NAS y se referencia por un proxy estable del gateway. Si pasas `doc_id` y el
+    archivo es una imagen, se indexa multimodal (recuperable cross-modal por
+    search_notes). Idempotente: re-subir el mismo (source_path, vault) devuelve el
+    attachment existente (status="already_uploaded") sin duplicar.
+
+    Pega `markdown_ref` en la nota (con edit_note/append_note/write_note); el alt
+    text debe describir el CONTENIDO, no el nombre del archivo.
+
+    source_path: ruta absoluta al binario en el host.
+    vault: vault destino (wiki|lait|melquiades) — aísla el storage.
+    doc_id: doc_id del doc que lo referencia (ej. "MEL-CONCEPT-012"); requerido para
+        la indexación multimodal de imágenes.
+    alt: texto alternativo que describe el contenido (va en el markdown_ref).
+    filename: nombre a registrar; default = nombre del source_path.
     """
+    if vault not in _KNOWN_VAULTS:
+        raise ValueError(
+            f"Vault desconocido: '{vault}'. Válidos: {', '.join(sorted(_KNOWN_VAULTS))}"
+        )
     src = Path(source_path).expanduser().resolve()
     if not src.is_file():
         return {"status": "error", "message": f"No es un archivo: {source_path}"}
-    dest_dir = (VAULT_ROOT / folder.lstrip("/")).resolve()
-    dest_dir.relative_to(VAULT_ROOT)  # seguridad: dentro del vault
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / filename
-    shutil.copy2(src, dest)
-    rel = os.path.relpath(dest, VAULT_ROOT)
-    return {"status": "ok", "path": rel, "wikilink": f"![[{filename}]]"}
+    name = filename or src.name
+    try:
+        content = src.read_bytes()
+    except OSError as exc:
+        return {"status": "error", "message": f"No se pudo leer {source_path}: {exc}"}
+
+    # idempotency_key determinista por (path absoluto, vault): re-subir el mismo
+    # binario desde el mismo origen devuelve el existente, no uno nuevo.
+    ik = _idempotency_key(str(src), vault, "attachment")
+
+    # GOTCHA multipart: NO mandar el Content-Type: application/json del _HEADERS
+    # global — httpx fija el boundary multipart él solo cuando usas files=. Solo
+    # va X-Agent-Key (auth); el Content-Type lo pone httpx.
+    files = {"file": (name, content)}
+    data: dict[str, str] = {"vault": vault, "idempotency_key": ik}
+    if doc_id:
+        data["doc_id"] = doc_id
+    if alt:
+        data["alt"] = alt
+
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(
+            f"{GATEWAY_URL}/v1/write/attachment",
+            headers={"X-Agent-Key": GATEWAY_KEY},
+            files=files,
+            data=data,
+        )
+        if resp.status_code >= 400:
+            return _gateway_error(resp, "attachment", source_path=source_path, vault=vault)
+        result = resp.json()
+        return {
+            "status": result["status"],
+            "file_id": result["file_id"],
+            "markdown_ref": result["markdown_ref"],
+            "content_type": result.get("content_type"),
+            "size_bytes": result.get("size_bytes"),
+        }
 
 
 if __name__ == "__main__":

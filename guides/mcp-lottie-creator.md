@@ -107,8 +107,8 @@ Usar `scripts/add-mcp-to-project.py` solo para MCPs definidos en `secrets.json` 
 Con **`obsidian`** y **`lottiefiles-creator`** activos en el mismo agente:
 
 1. **Lottie**: diseñar o editar la animación en Creator; exportar JSON o dotLottie al disco (o copiar ruta del export).
-2. **Obsidian** `add_attachment(source_path, filename)`: copiar el archivo al vault; devuelve `![[filename]]`.
-3. **Obsidian** `write_note` / `append_note`: incrustar en la nota con alt text que describa la animación, no solo el nombre del archivo.
+2. **focusyn** `add_attachment(source_path, vault, alt="<descripción>")`: sube el archivo al NAS vía el gateway (fuera de Git); devuelve `markdown_ref` (`![alt](/v1/attachment/{file_id})`).
+3. **focusyn** `write_note` / `append_note` / `edit_note`: pega el `markdown_ref` en la nota con alt text que describa la animación, no solo el nombre del archivo.
 
 Antes de crear notas nuevas, `get_context` en Obsidian (convenciones del vault). Ver `guides/mcp-obsidian.md`.
 
