@@ -27,6 +27,7 @@ encaja con gcloud/postgres/ssh/redis.
 | Sesión | `status` | Estado (running, tabs, url, modo). Barato: **no** arranca el browser. |
 | Sesión | `goto` | Navega a una URL (relativa a `--base-url` o completa). Arranca el browser solo. |
 | Sesión | `reload`, `set_viewport` | Recargar / cambiar viewport. |
+| Sesión | `save_storage_state`, `load_storage_state` | Persisten/cargan la sesión (cookies+localStorage) a disco para reusarla entre llamadas/arranques → saltar el login. No mutan (sin gate). El server además persiste la sesión en memoria entre recreaciones de context. |
 | Sesión | `set_mode` | `headed` (headless↔headed en runtime, gate `allow_headed`) y/o `reduced_motion` (`reduce`\|`no-preference`, emula prefers-reduced-motion sin relanzar — valida la rama `useReducedMotion` del DS). |
 | **Interacción** | `click` | Click en un elemento (botón Entrar/Generar/Aplicar/Aprobar). Selector CSS/`text=`/`role=`; `nth` desambigua. Reporta si navegó (URL+title) o cambió estado. **`force=true`** dispara el click a nivel DOM (dispatchEvent) para targets tapados por un overlay/canvas WebGL (ver gotcha abajo). |
 | **Interacción** | `fill` | Escribe en un input/textarea (usuario/contraseña/intent/body). Limpia+setea+dispara `input` (React lo capta). **No hace eco del valor** (secreto): solo longitud. |
@@ -48,7 +49,7 @@ encaja con gcloud/postgres/ssh/redis.
 | **Perf** | `entrance_animation_check` | ¿La animación de entrada **on-load** dispara o el elemento aparece estático? + reduced-motion (`nth` opcional). |
 | **Perf** | `interaction_animation` | Animación por **click/hover** (modal/drawer): todos los ejes (translateX/Y+scale, scale normalizado por tamaño), `settle_ms`+`opacity_settle_ms`, overshoot **con magnitud** (%), `nth` en trigger/target, `reset` (escape/reload/none) para destapar el siguiente. Target **opcional** → mide el propio trigger (hover sobre un botón). `target_within_trigger` (CSS relativo al trigger ya resuelto) para transform propagado padre→hijo: sigue a `trigger_nth` sin nth global desalineado. Verdict ok/overshoot_leve(>5%)/overshoot_fuerte(>15%)/opacity_incompleta. |
 | **Perf** | `web_vitals` | LCP, CLS, INP, TBT. |
-| Captura | `screenshot` | PNG: `return=path` (disco, barato) o `return=inline` (base64, cliente remoto). |
+| Captura | `screenshot` | PNG: `return=path` (disco, barato, reporta **dims reales**) o `return=inline` (base64, cliente remoto). `selector` recorta al elemento (un ancestro con `overflow` puede clipear → `full_page` o apuntá al contenedor scrollable). |
 | Captura | `record_trace` | Playwright trace (pesado, opt-in) a `--artifact-dir`. |
 
 Todas las tools de inspección/perf aceptan `tab` opcional (default: la activa).
@@ -65,8 +66,8 @@ punta a punta — pasar el login y recorrer crear → previsualizar → aplicar 
 | Tool | Firma | Notas |
 |---|---|---|
 | `click` | `click(selector, nth?, force?, timeout_ms?)` | auto-wait; reporta navegación (espera la async con poll + early-exit). `force=true` → click DOM (overlays). |
-| `fill` | `fill(selector, value, nth?, force?)` | clear+set+`input` event. Solo loguea longitud (secretos). |
-| `type` | `type(selector, text, clear?, delay_ms?)` | tecla-a-tecla; fallback de `fill`. |
+| `fill` | `fill(selector, value, nth?, force?)` | clear+set+`input` event. Solo loguea longitud (secretos). Alias de `value`: `text`. |
+| `type` | `type(selector, text, clear?, delay_ms?)` | tecla-a-tecla; fallback de `fill`. Alias de `text`: `value`. |
 | `press` | `press(key, selector?, nth?, force?)` | `Enter`/`Escape`/combos; selector opcional. |
 | `select_option` | `select_option(selector, value?, label?, index?)` | solo `<select>` nativo. |
 | `set_input_files` | `set_input_files(selector, files)` | sube a `<input type=file>`; valida rutas. |
@@ -98,14 +99,35 @@ wait_for("text=\"Resumen\"")                      # esperar el dashboard
 evaluate("() => Object.keys(localStorage)")       # verifica: aparece focusyn.refresh
 ```
 
-**Atajo: saltar el login sembrando el token** (lo que pidió el equipo) — útil para no
-teclear credenciales en cada corrida de test:
+**Atajo: saltar el login sembrando el token** — útil para no teclear credenciales en cada
+corrida. El shape depende de cómo guarda la SPA la sesión:
 ```
+# (a) clave plana (ej. focusyn.refresh):
 goto("http://localhost:7418/")
 evaluate("(t) => localStorage.setItem('focusyn.refresh', t)", arg="<refresh-token>")
 reload()                                          # la SPA arranca ya autenticada
+
+# (b) Zustand/Redux-persist (objeto JSON completo bajo UNA clave, ej. 'auth'):
+evaluate("(s) => localStorage.setItem('auth', JSON.stringify(s))",
+         arg={"state": {"accessToken": "...", "refreshToken": "...", "user": {}}, "version": 0})
+reload()
+
+# (c) login programático (fetch al endpoint, sin tocar el form):
+evaluate("""async (c) => {
+  const r = await fetch(c.url, {method:'POST', headers:{'Content-Type':'application/json'},
+                               body: JSON.stringify({email:c.email, password:c.password})}).then(x=>x.json())
+  localStorage.setItem('auth', JSON.stringify({state:{accessToken:r.access, refreshToken:r.refresh, user:r.user}, version:0}))
+}""", arg={"url":"http://localhost:7500/api/v1/auth/login","email":"admin@local.test","password":"..."})
 ```
-`arg` se pasa como argumento a la función → el token no se interpola en el string.
+`arg` se pasa como argumento a la función → el secreto no se interpola en el string.
+
+**Persistencia de sesión (no re-loguear en cada paso).** El `localStorage` vive en el
+**BrowserContext**, no en la tab. Si el context se recrea (browser-idle 30 min, crash del
+Chromium, `set_mode(headed)`), antes se perdía la sesión y `<ProtectedRoute>` rebotaba a
+`/login`. Ahora el server **snapshotea cookies+localStorage** (en el reaper + antes de cada
+teardown) y **los restaura** al relanzar el context → la sesión sobrevive sola. Para
+persistir **a disco / entre reinicios del proceso MCP**: `save_storage_state(path?)` tras
+autenticar, y `load_storage_state(path?)` + `goto` para reusarla.
 
 > Validado en vivo contra focusyn (jun 2026): login por form, `click(force=true)` sobre el
 > canvas, y seed-token; los tres llevan al dashboard `/` con `focusyn.refresh` en localStorage.
@@ -253,3 +275,12 @@ set_mode(headed=true)                   # (opcional) ver a ojo con ventana real 
 
 **El MCP no aparece en Claude Code (VSCode)**
 → Verificar que está en `~/.claude.json` (no en `settings.json`) y reiniciar la extensión. Confirmar que `playwright` está instalado en el venv (`scripts/install-webprobe-mcp.sh`).
+
+**`goto` devuelve `ok 200` pero `⚠ redirected_to: ...`**
+→ La URL **final ≠ la pedida**: un guard de auth (SPA) o un redirect HTTP te movió (típico: ruta protegida → `/login`). El `200` es del documento que sí cargó, pero no estás donde pediste. Autenticá (seed-token / form) y reintentá.
+
+**Las tools de webprobe "no existen" en el primer uso**
+→ Es el harness MCP, no webprobe: las tools llegan **diferidas** (hay que cargar su schema con `ToolSearch` antes de invocarlas). Invocarlas a ciegas falla con InputValidationError. Buscá `select:goto,click,fill,...` (o por keyword `webprobe`) y después ya son invocables normalmente.
+
+**`Input validation error: 'text'/'value' is a required property` en fill/type**
+→ Resuelto: ambas aceptan los dos nombres (`fill` canónico `value`, `type` canónico `text`, cada una acepta el otro como alias). Requiere webprobe ≥ v0.5.0 — si persiste, el proceso MCP quedó stale (mirá `status()`): reiniciá la ventana de VSCode.

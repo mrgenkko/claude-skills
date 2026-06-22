@@ -14,6 +14,7 @@ import base64
 import json
 import os
 import re
+import struct
 import time
 
 from mcp.server import Server
@@ -59,7 +60,7 @@ SERVER_LABEL = args.name or "webprobe"
 # Bump en cada cambio de comportamiento. El agente lo ve en status() para saber si el
 # proceso MCP está stale (un MCP es de vida larga; editar server.py NO recarga el proceso
 # vivo — hay que reiniciar Claude Code / recargar la ventana de VSCode).
-WEBPROBE_VERSION = "0.4.3"
+WEBPROBE_VERSION = "0.5.0"
 app = Server(f"webprobe-{SERVER_LABEL}")
 
 
@@ -77,6 +78,11 @@ class _State:
     reduced_motion_current = args.reduced_motion   # None | "reduce" | "no-preference" (override runtime)
     tab_counter = 0
     artifact_counter = 0
+    # snapshot de cookies+localStorage del último context vivo. Sobrevive a una recreación
+    # del context (browser-idle, crash del chromium, set_mode) → restaura la sesión sin
+    # forzar re-login. El localStorage vive en el BrowserContext, no en la tab: si el context
+    # se recrea (no solo la page), se pierde sin esto.
+    storage_state = None
 
 
 _state = _State()
@@ -87,6 +93,29 @@ def _resolve_url(url: str) -> str:
     if url and "://" not in url and args.base_url:
         return args.base_url.rstrip("/") + "/" + url.lstrip("/")
     return url
+
+
+def _norm_url(u: str) -> str:
+    """Normaliza para comparar pedido vs final: sin fragment, sin trailing slash."""
+    u = (u or "").split("#", 1)[0]
+    return u[:-1] if u.endswith("/") and "://" in u and not u.endswith("://") else u
+
+
+async def _settle_redirect(page, requested: str, poll_ms: int = 400):
+    """Ventana corta para captar un redirect client-side (guard de auth en un SPA) que ocurre
+    DESPUÉS del load. Early-exit apenas la URL deja de coincidir con la pedida → solo el caso
+    sin-redirect paga poll_ms completos."""
+    try:
+        await page.wait_for_url(lambda u: _norm_url(u) != _norm_url(requested), timeout=poll_ms)
+    except Exception:
+        pass
+
+
+def _redirect_warn(requested: str, final: str) -> str:
+    """Aviso si la URL final ≠ la pedida (redirect HTTP o guard client-side del SPA)."""
+    if _norm_url(requested) != _norm_url(final):
+        return f"\n⚠ redirected_to: pediste {requested} pero quedaste en {final} (¿guard de auth / redirect del SPA?)"
+    return ""
 
 
 def _artifact_dir() -> str:
@@ -108,8 +137,24 @@ async def _browser_alive() -> bool:
     )
 
 
+async def _capture_storage_locked():
+    """Snapshot del storage_state (cookies+localStorage) del context vivo, para restaurarlo
+    si el context se recrea. Tragar errores: si el context ya murió (crash), conservamos el
+    último snapshot bueno. Llamar bajo _lock."""
+    if _state.context is None:
+        return
+    try:
+        _state.storage_state = await _state.context.storage_state()
+    except Exception:
+        pass
+
+
 async def _teardown_quiet_locked():
     """Cierra todo tragando errores; deja el estado limpio para relanzar."""
+    # last-chance: preservar la sesión antes de cerrar el context (idle/set_mode/close_browser)
+    # para que el próximo arranque no fuerce re-login. En un crash esto falla y conservamos
+    # el snapshot del reaper (≤reaper-interval viejo).
+    await _capture_storage_locked()
     try:
         if _state.context is not None:
             await _state.context.close()
@@ -159,6 +204,10 @@ async def _ensure_browser_locked():
         _state.browser = _state.context.browser
     else:
         _state.browser = await launcher.launch(**launch_kwargs)
+        # restaura la sesión (cookies+localStorage) si había un snapshot → evita re-login
+        # tras un relaunch por idle/crash/set_mode. (persistent_profile ya persiste en disco.)
+        if _state.storage_state is not None:
+            ctx_kwargs = {**ctx_kwargs, "storage_state": _state.storage_state}
         _state.context = await _state.browser.new_context(**ctx_kwargs)
 
     _state.context.set_default_navigation_timeout(args.nav_timeout_ms)
@@ -263,6 +312,9 @@ async def _reaper_loop():
 async def _reap_once():
     now = time.monotonic()
     async with _lock:
+        # snapshot fresco (≤reaper-interval viejo) para sobrevivir a un crash del browser que
+        # no alcanza a disparar el last-chance capture del teardown. No-op si no hay context.
+        await _capture_storage_locked()
         if args.tab_idle_timeout > 0 and _state.tabs:
             for tab_id in list(_state.tabs.keys()):
                 if tab_id == _state.active:
@@ -843,8 +895,10 @@ async def _tool_goto(arguments: dict) -> str:
     url = _resolve_url(arguments["url"])
     resp = await page.goto(url, wait_until=arguments.get("wait_until", "load"))
     status = resp.status if resp else "?"
+    await _settle_redirect(page, url)   # capta el redirect client-side del guard de auth
     title = await page.title()
-    return f"ok {status} {page.url}\ntitle: {title}\nviewport: {args.viewport_w}x{args.viewport_h} dpr={args.dpr} tab={_state.active}"
+    return (f"ok {status} {page.url}{_redirect_warn(url, page.url)}\n"
+            f"title: {title}\nviewport: {args.viewport_w}x{args.viewport_h} dpr={args.dpr} tab={_state.active}")
 
 
 async def _tool_reload(arguments: dict) -> str:
@@ -923,7 +977,8 @@ async def _tool_open_tab(arguments: dict) -> str:
     if arguments.get("url"):
         url = _resolve_url(arguments["url"])
         resp = await page.goto(url, wait_until="load")
-        msg += f" → {resp.status if resp else '?'} {page.url}"
+        await _settle_redirect(page, url)
+        msg += f" → {resp.status if resp else '?'} {page.url}{_redirect_warn(url, page.url)}"
     if evicted:
         msg += f"\n(LRU-evict de {evicted} por max-tabs={args.max_tabs})"
     return msg
@@ -1330,6 +1385,19 @@ async def _tool_web_vitals(arguments: dict) -> str:
     return "\n".join(lines)
 
 
+def _png_dims(path: str):
+    """(w, h) reales del IHDR de un PNG, para reportar el tamaño efectivo de la captura
+    (no asumir el viewport: una captura de elemento o full_page mide distinto). None si falla."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(24)
+        if len(head) >= 24 and head[:8] == b"\x89PNG\r\n\x1a\n":
+            return struct.unpack(">II", head[16:24])
+    except Exception:
+        pass
+    return None
+
+
 async def _tool_screenshot(arguments: dict):
     page = await _ensure_page(arguments.get("tab"))
     ret = arguments.get("return", "path")
@@ -1351,7 +1419,9 @@ async def _tool_screenshot(arguments: dict):
     else:
         await page.screenshot(path=path, full_page=full_page, type="png")
     size = os.path.getsize(path)
-    return f"saved: {path} ({args.viewport_w}x{args.viewport_h}, {size // 1024}KB)\n(para verla: Read sobre la ruta)"
+    dims = _png_dims(path)
+    dim_str = f"{dims[0]}x{dims[1]}" if dims else f"{args.viewport_w}x{args.viewport_h}"
+    return f"saved: {path} ({dim_str}, {size // 1024}KB)\n(para verla: Read sobre la ruta)"
 
 
 async def _tool_record_trace(arguments: dict) -> str:
@@ -1464,7 +1534,13 @@ async def _tool_fill(arguments: dict) -> str:
         return _interact_forbidden("fill")
     page = await _ensure_page(arguments.get("tab"))
     selector = arguments["selector"]
-    value = arguments.get("value", "")
+    # alias: el canónico es 'value', pero aceptamos 'text' (el param de `type`) para no tropezar
+    # al confundir ambas tools.
+    value = arguments.get("value")
+    if value is None:
+        value = arguments.get("text")
+    if value is None:
+        return "(fill: pasá 'value' (o su alias 'text') con el contenido a escribir)"
     nth = int(arguments.get("nth", 0))
     timeout = int(arguments.get("timeout_ms", 5000))
     force = bool(arguments.get("force", False))
@@ -1485,7 +1561,12 @@ async def _tool_type(arguments: dict) -> str:
         return _interact_forbidden("type")
     page = await _ensure_page(arguments.get("tab"))
     selector = arguments["selector"]
-    text = arguments.get("text", "")
+    # alias: el canónico es 'text', pero aceptamos 'value' (el param de `fill`) para no tropezar.
+    text = arguments.get("text")
+    if text is None:
+        text = arguments.get("value")
+    if text is None:
+        return "(type: pasá 'text' (o su alias 'value') con el contenido a teclear)"
     nth = int(arguments.get("nth", 0))
     delay = int(arguments.get("delay_ms", 0))
     timeout = int(arguments.get("timeout_ms", 5000))
@@ -1613,8 +1694,62 @@ async def _tool_select_option(arguments: dict) -> str:
     return f"select_option ok: {selector}[{nth}] → seleccionado: {selected}"
 
 
+def _storage_path(arguments: dict) -> str:
+    return os.path.expanduser(arguments.get("path") or os.path.join(_artifact_dir(), "storage-state.json"))
+
+
+async def _tool_save_storage_state(arguments: dict) -> str:
+    # NO muta la page → no gateado por allow_interact. Guarda la sesión a disco para reusarla
+    # entre llamadas/arranques (incluso reinicios del proceso MCP).
+    async with _lock:
+        if _state.context is not None:
+            await _capture_storage_locked()
+        state = _state.storage_state
+    if state is None:
+        return "(no hay sesión que guardar: arrancá el browser con goto y autenticá primero)"
+    path = _storage_path(arguments)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception as e:
+        return f"(no se pudo escribir {path}: {e})"
+    n_cookies = len(state.get("cookies", []))
+    n_origins = len(state.get("origins", []))
+    return f"storage_state guardado: {path} ({n_cookies} cookies, {n_origins} origin(s) con localStorage)"
+
+
+async def _tool_load_storage_state(arguments: dict) -> str:
+    path = _storage_path(arguments)
+    if not os.path.isfile(path):
+        return f"(no existe el archivo: {path})"
+    try:
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception as e:
+        return f"(no se pudo leer {path}: {e})"
+    relaunch = False
+    async with _lock:
+        if await _browser_alive():
+            # teardown captura el state VIEJO en _state.storage_state; lo pisamos con el cargado
+            # DESPUÉS, y ensure_page relanza el context tomándolo. (storage_state solo se aplica
+            # al crear el context, no en caliente.)
+            await _teardown_quiet_locked()
+            relaunch = True
+        _state.storage_state = state
+    if relaunch:
+        await _ensure_page()
+    n_cookies = len(state.get("cookies", []))
+    n_origins = len(state.get("origins", []))
+    extra = (" — context relanzado; hacé goto a la app para que el localStorage del origin aplique"
+             if relaunch else " — se aplicará al próximo arranque del browser")
+    return f"storage_state cargado: {path} ({n_cookies} cookies, {n_origins} origin(s)){extra}"
+
+
 _DISPATCH = {
     "goto": _tool_goto,
+    "save_storage_state": _tool_save_storage_state,
+    "load_storage_state": _tool_load_storage_state,
     "click": _tool_click,
     "fill": _tool_fill,
     "type": _tool_type,
@@ -1667,6 +1802,20 @@ async def list_tools() -> list[types.Tool]:
             }, "required": ["url"]},
         ),
         types.Tool(
+            name="save_storage_state",
+            description="Guarda la sesión actual (cookies + localStorage) a disco para reusarla luego con load_storage_state — sobrevive reinicios del proceso MCP. Útil tras autenticar una vez: login (UI o evaluate) → save_storage_state → en adelante load_storage_state evita repetir el login. Nota: el server YA persiste la sesión en memoria entre recreaciones de context (idle/crash/set_mode) automáticamente; esto es para persistir a disco/entre sesiones. NO muta (no requiere allow_interact).",
+            inputSchema={"type": "object", "properties": {
+                "path": {"type": "string", "description": "ruta de salida (opcional; default: <artifact-dir>/storage-state.json)"},
+            }},
+        ),
+        types.Tool(
+            name="load_storage_state",
+            description="Carga una sesión (cookies + localStorage) guardada con save_storage_state y relanza el context para aplicarla → salta el login. Tras cargar, hacé goto a la app para que el localStorage del origin aplique. NO muta (no requiere allow_interact).",
+            inputSchema={"type": "object", "properties": {
+                "path": {"type": "string", "description": "ruta a leer (opcional; default: <artifact-dir>/storage-state.json)"},
+            }},
+        ),
+        types.Tool(
             name="click",
             description="Click en un elemento (valida happy-paths: botón Entrar/Generar/Aplicar/Aprobar). Selector soporta CSS, `text=\"Entrar\"`, `role=button[name=...]`, `:has-text(...)`; `nth` desambigua. Reporta si el click navegó (URL nueva + title) o cambió estado sin navegar. Si un overlay/canvas WebGL tapa el target por coordenada, el click normal da timeout → reintentá con force=true (dispara el click a nivel DOM, ignora el overlay), o press('Enter') si es un submit; el error nombra qué elemento lo tapa. Reporta el elemento realmente tocado (tag+box) y, si está tapado, quién — para no confiar a ciegas en el 'ok'. Requiere allow_interact.",
             inputSchema={"type": "object", "properties": {
@@ -1679,28 +1828,30 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="fill",
-            description="Escribe un valor en un input/textarea (usuario, contraseña, intent, body…). Limpia + setea + dispara 'input' (React controlado lo capta). NO hace eco del valor (puede ser secreto) — solo reporta longitud. Selector CSS/text/role/:has-text; `nth` desambigua. Para inputs que ignoran fill (máscaras/handlers por tecla) usá `type`. Reporta el tag+box del input realmente tocado (detecta si el valor cayó en otro input homónimo). Requiere allow_interact.",
+            description="Escribe un valor en un input/textarea (usuario, contraseña, intent, body…). Limpia + setea + dispara 'input' (React controlado lo capta). NO hace eco del valor (puede ser secreto) — solo reporta longitud. Selector CSS/text/role/:has-text; `nth` desambigua. El contenido va en `value` (alias aceptado: `text`, el param de `type`, para no tropezar). Para inputs que ignoran fill (máscaras/handlers por tecla) usá `type`. Reporta el tag+box del input realmente tocado (detecta si el valor cayó en otro input homónimo). Requiere allow_interact.",
             inputSchema={"type": "object", "properties": {
                 "selector": {"type": "string"},
-                "value": {"type": "string"},
+                "value": {"type": "string", "description": "contenido a escribir (alias: 'text')"},
+                "text": {"type": "string", "description": "alias de 'value' (compat con `type`)"},
                 "nth": {"type": "integer", "default": 0},
                 "force": {"type": "boolean", "default": False, "description": "salta el check de editable/visibilidad (input tapado)"},
                 "timeout_ms": {"type": "integer", "default": 5000},
                 **tab,
-            }, "required": ["selector", "value"]},
+            }, "required": ["selector"]},
         ),
         types.Tool(
             name="type",
-            description="Teclea texto tecla-a-tecla (keydown/keyup reales) en un input — para los que ignoran fill (máscaras, handlers por tecla). Más lento que fill; preferí fill salvo que no dispare el framework. `clear=true` limpia antes; `delay_ms` entre teclas. Reporta el tag+box del input tocado. Requiere allow_interact.",
+            description="Teclea texto tecla-a-tecla (keydown/keyup reales) en un input — para los que ignoran fill (máscaras, handlers por tecla). Más lento que fill; preferí fill salvo que no dispare el framework. El contenido va en `text` (alias aceptado: `value`, el param de `fill`, para no tropezar). `clear=true` limpia antes; `delay_ms` entre teclas. Reporta el tag+box del input tocado. Requiere allow_interact.",
             inputSchema={"type": "object", "properties": {
                 "selector": {"type": "string"},
-                "text": {"type": "string"},
+                "text": {"type": "string", "description": "contenido a teclear (alias: 'value')"},
+                "value": {"type": "string", "description": "alias de 'text' (compat con `fill`)"},
                 "nth": {"type": "integer", "default": 0},
                 "clear": {"type": "boolean", "default": False, "description": "limpiar el input antes de teclear"},
                 "delay_ms": {"type": "integer", "default": 0, "description": "ms entre teclas"},
                 "timeout_ms": {"type": "integer", "default": 5000},
                 **tab,
-            }, "required": ["selector", "text"]},
+            }, "required": ["selector"]},
         ),
         types.Tool(
             name="press",
@@ -1716,7 +1867,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="evaluate",
-            description="Ejecuta JS arbitrario en la page y devuelve el resultado (JSON, capado a max_len). Escape hatch para lo que click/fill no cubren: sembrar un token y saltar el login en test (evaluate(\"(t)=>localStorage.setItem('focusyn.refresh',t)\", arg=\"<token>\")), leer estado del DOM/storage, disparar handlers. `expression` = expresión JS o función flecha; `arg` (JSON) opcional se pasa a la función (evita interpolar secretos en el string). Requiere allow_interact.",
+            description="Ejecuta JS arbitrario en la page y devuelve el resultado (JSON, capado a max_len). Escape hatch para lo que click/fill no cubren: leer estado del DOM/storage, disparar handlers, o SEMBRAR auth y saltar el login. Patrones de seed (según cómo guarda el SPA): (a) clave plana → evaluate(\"(t)=>localStorage.setItem('token',t)\", arg=\"<jwt>\"); (b) Zustand/Redux-persist (objeto JSON bajo UNA clave) → evaluate(\"(s)=>localStorage.setItem('auth',JSON.stringify(s))\", arg={state:{accessToken:'...',refreshToken:'...',user:{}},version:0}); (c) login programático → función async que hace fetch a tu endpoint y siembra el resultado. Tras sembrar, hacé goto/reload. `expression` = expresión JS o función flecha; `arg` (JSON) opcional se pasa a la función (evita interpolar secretos en el string). Para REUSAR la sesión entre llamadas/arranques usá save_storage_state/load_storage_state (el server además persiste la sesión en memoria entre recreaciones de context). Requiere allow_interact.",
             inputSchema={"type": "object", "properties": {
                 "expression": {"type": "string", "description": "expresión JS ('location.href') o función flecha ('()=>({k:localStorage.getItem(\"k\")})')"},
                 "arg": {"description": "argumento JSON-serializable pasado a la función (opcional)"},
@@ -1938,7 +2089,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="screenshot",
-            description="Captura PNG. return='path' (default) guarda en --artifact-dir y devuelve la ruta (token-cheap, cliente local); return='inline' devuelve la imagen base64 por el protocolo (cliente remoto sin disco).",
+            description="Captura PNG. return='path' (default) guarda en --artifact-dir y devuelve la ruta + las dimensiones REALES de la imagen (token-cheap, cliente local); return='inline' devuelve la imagen base64 por el protocolo (cliente remoto sin disco). Con `selector` recorta a ese elemento (scroll-into-view + bounding box); OJO: un ancestro con overflow (tabla en un div scrollable) puede clipear el contenido — para capturar todo usá full_page=true o apuntá el selector al contenedor scrollable. Las dims reportadas (≈viewport ⇒ probablemente recortó) ayudan a detectarlo.",
             inputSchema={"type": "object", "properties": {
                 "selector": {"type": "string", "description": "recorta a un elemento (opcional)"},
                 "full_page": {"type": "boolean", "default": False},
