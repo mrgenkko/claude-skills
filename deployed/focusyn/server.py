@@ -18,6 +18,8 @@ Lecturas y escrituras pasan por el gateway HTTP (puerto 7415 en dev):
   proxy estable); con doc_id + imagen se indexa multimodal.
 - `delete_attachment` borra un binario suelto del NAS por file_id (idempotente; el
   cascade al borrar un doc lo hace `delete_note`).
+- `predict_impact` (qué OTROS docs afecta editar uno, traversal del grafo sin LLM) +
+  closed-loop feedback (`record_feedback`, `search_feedback`, `feedback_stats`) — Fase 9.6.
 """
 
 import asyncio
@@ -464,6 +466,142 @@ async def confirm_entity_alias(keep_entity_id: str, alias_entity_id: str) -> dic
         if resp.status_code >= 400:
             return _gateway_error(resp, "alias_confirm",
                                   keep=keep_entity_id, alias=alias_entity_id)
+        return resp.json()
+
+
+# ── FEEDBACK + PREDICT_IMPACT (vía gateway, Fase 9.6) ───────────────────────────
+
+
+@mcp.tool()
+async def predict_impact(
+    doc_id: str, depth: int = 1, limit: int = 25, min_confidence: float = 0.0, vault: str = ""
+) -> dict:
+    """Dado un doc que vas a editar, qué OTROS docs PODRÍAN verse afectados.
+
+    Traversal del grafo SIN LLM: docs que lo enlazan (LINKS_TO) o comparten entidades
+    mencionadas. Úsalo TRAS un edit grande para no dejar referencias huérfanas.
+    "Mapa, no verdad": el `score` es prioridad de revisión, NO un veredicto — abrí cada
+    candidato (read_note) y verificá. Si `seed_in_graph` es false (con affected vacío)
+    el doc aún no se ingestó en el grafo (latencia tras el edit), no es un error.
+
+    doc_id: doc_id CANÓNICO (ej. "MEL-DEC-001"); codifica el vault (no acepta path suelto).
+    depth: hops del traversal (hoy solo 1). limit: máx de candidatos (1-100, default 25).
+    min_confidence: filtra entidades compartidas por confianza (0 = sin filtro) → sube si
+        un doc-hub mete demasiado ruido. vault: acota el blast-radius a ese vault.
+    """
+    params: dict = {"doc_id": doc_id, "depth": depth, "limit": limit}
+    if min_confidence > 0:
+        params["min_confidence"] = min_confidence
+    if vault:
+        params["vault"] = vault
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(
+            f"{GATEWAY_URL}/v1/graphrag/predict-impact", headers=_HEADERS, params=params
+        )
+        if resp.status_code >= 400:
+            return _gateway_error(resp, "predict_impact", doc_id=doc_id)
+        return resp.json()
+
+
+@mcp.tool()
+async def record_feedback(
+    target_kind: str,
+    target_ref: str,
+    signal: str,
+    rating: int = 0,
+    comment: str = "",
+    vault: str = "",
+    query_text: str = "",
+) -> dict:
+    """Registra una señal de utilidad (closed-loop feedback) — NO reescribe el doc.
+
+    Tu corrección queda como SEÑAL para que el sistema aprenda; no edita el documento.
+    Append-only: cambiar de opinión (mismo doc/signal, distinto rating/comment) crea una
+    fila nueva; solo un reintento byte-idéntico colapsa (already_recorded).
+
+    target_kind: sobre qué — query | retrieval | doc | edit.
+    target_ref: a qué apunta — doc_id (ej. "MEL-DEC-001") | change_id | request_id.
+    signal: up | down | correction | stale | irrelevant.
+    rating: numérico {-1,0,1}; 0 = sin rating (se omite).
+    comment: corrección/nota libre. vault: del target. query_text: la pregunta original.
+    """
+    rating_n = rating if rating in (-1, 1) else None
+    payload: dict = {"target_kind": target_kind, "target_ref": target_ref, "signal": signal}
+    if rating_n is not None:
+        payload["rating"] = rating_n
+    if comment:
+        payload["comment"] = comment
+    if vault:
+        payload["vault"] = vault
+    if query_text:
+        payload["query_text"] = query_text
+    # Idempotency key INCLUYE comment+rating: un re-voto genuino no colisiona con el
+    # voto previo (append-only); solo el reintento idéntico colapsa a already_recorded.
+    payload["idempotency_key"] = _idempotency_key(
+        target_kind, target_ref, signal, str(rating_n), comment
+    )
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(f"{GATEWAY_URL}/v1/feedback", headers=_HEADERS, json=payload)
+        if resp.status_code >= 400:
+            return _gateway_error(resp, "feedback", target_ref=target_ref)
+        return resp.json()
+
+
+@mcp.tool()
+async def search_feedback(
+    target_ref: str = "",
+    target_kind: str = "",
+    signal: str = "",
+    vault: str = "",
+    q: str = "",
+    agent_id: str = "",
+    since: str = "",
+    cursor: str = "",
+    limit: int = 50,
+) -> dict:
+    """Recupera correcciones/pulgares pasados sobre un doc o tema (lista paginada).
+
+    Útil ANTES de reescribir un doc: mirá qué feedback dejó alguien. `q` es substring
+    (ILIKE) sobre query_text+comment, NO semántico. Devuelve {items, next_cursor};
+    pasá ese next_cursor como `cursor` para la página siguiente.
+
+    target_ref/target_kind/signal/vault/agent_id: filtros (vacío = sin filtro).
+    q: substring a buscar. since: ISO-8601 (occurred_at >=). cursor: paginación.
+    limit: máx de filas (1-200, default 50).
+    """
+    params: dict = {"limit": limit}
+    for k, v in (("target_ref", target_ref), ("target_kind", target_kind),
+                 ("signal", signal), ("vault", vault), ("q", q), ("agent_id", agent_id),
+                 ("since", since), ("cursor", cursor)):
+        if v:
+            params[k] = v
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(f"{GATEWAY_URL}/v1/feedback", headers=_HEADERS, params=params)
+        if resp.status_code >= 400:
+            return _gateway_error(resp, "search_feedback", target_ref=target_ref)
+        return resp.json()
+
+
+@mcp.tool()
+async def feedback_stats(
+    target_ref: str = "", target_kind: str = "", vault: str = "", agent_id: str = "", since: str = ""
+) -> dict:
+    """Agregados de feedback: total + conteo por kind y por signal.
+
+    Para ver de un vistazo cuánto feedback (y de qué tipo) hay sobre un doc/tema.
+    Filtros opcionales: target_ref/target_kind/vault/agent_id, y since (ISO-8601).
+    """
+    params: dict = {}
+    for k, v in (("target_ref", target_ref), ("target_kind", target_kind),
+                 ("vault", vault), ("agent_id", agent_id), ("since", since)):
+        if v:
+            params[k] = v
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(
+            f"{GATEWAY_URL}/v1/feedback/stats", headers=_HEADERS, params=params
+        )
+        if resp.status_code >= 400:
+            return _gateway_error(resp, "feedback_stats", target_ref=target_ref)
         return resp.json()
 
 
