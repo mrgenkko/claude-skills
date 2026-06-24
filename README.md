@@ -137,11 +137,12 @@ Autenticación por clave privada (`--key-file`) o contraseña (`--password`).
 | `write_file` | Escribe contenido a un archivo remoto (SFTP)     |
 | `list_dir`   | Lista el contenido de un directorio remoto       |
 
-### focusyn (`deployed/focusyn/server.py`)
+### focusyn (MCP remoto Streamable HTTP — `/mcp` in-process del gateway)
 
-Cliente HTTP del `focusyn`. **Reemplazo completo** del MCP `obsidian` raw:
-reads y writes del vault pasan por el gateway (audit trail + GraphRAG). Configurado por
-variables de entorno (`FOCUSYN_GATEWAY_URL`, `FOCUSYN_GATEWAY_KEY`, `OBSIDIAN_VAULT`).
+MCP remoto **HTTP** del gateway `focusyn` (endpoint `/mcp`). **Reemplazo completo** del
+MCP `obsidian` raw: reads y writes del vault pasan por el gateway (audit trail + GraphRAG).
+Registrado como MCP **global** (user-scope, `mcpServers` top-level de `~/.claude.json`) con
+header `X-Agent-Key`. Reemplaza al wrapper stdio legacy (retirado jun-2026).
 Ver `guides/mcp-focusyn.md`.
 
 | Tool             | Descripción                                                      |

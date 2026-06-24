@@ -124,12 +124,19 @@ def build_mcp_servers(servers_config: list) -> dict:
             ]
 
         elif kind == "focusyn":
-            args = [f"{MCP_SERVERS_DIR}/focusyn/server.py"]
-            env = {
-                "FOCUSYN_GATEWAY_URL": entry["gateway_url"],
-                "FOCUSYN_GATEWAY_KEY": entry["gateway_key"],
-                "OBSIDIAN_VAULT": entry["vault_path"],
+            # MCP remoto Streamable HTTP del gateway (/mcp, in-process). Reemplaza al
+            # wrapper stdio legacy. Auth por header X-Agent-Key (key del agente de máquina).
+            # El registro canónico de focusyn es user-scope GLOBAL (mcpServers top-level
+            # de ~/.claude.json, disponible en todos los proyectos); este branch sirve
+            # para overrides per-proyecto (local scope, que prevalece sobre el global).
+            result[name] = {
+                "type": "http",
+                "url": entry["url"],
+                "headers": {"X-Agent-Key": entry["agent_key"]},
             }
+            if entry.get("timeout_ms"):
+                result[name]["timeout"] = entry["timeout_ms"]
+            continue
 
         elif kind == "webprobe":
             args = [

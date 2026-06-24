@@ -1,7 +1,9 @@
 # MCP `focusyn`
 
-Cliente HTTP del `focusyn`. **Reemplazo completo** del MCP `obsidian` raw:
-lecturas y escrituras del vault pasan por el gateway (audit trail + GraphRAG).
+MCP remoto **Streamable HTTP** del gateway `focusyn` (endpoint `/mcp`, in-process).
+**Reemplazo completo** del MCP `obsidian` raw: lecturas y escrituras del vault pasan
+por el gateway (audit trail + GraphRAG). Reemplaza también al wrapper **stdio legacy**
+(`~/.claude/mcp-servers/focusyn/server.py`, retirado jun-2026).
 
 ## Por qué existe
 
@@ -113,84 +115,79 @@ Los vaults conocidos están en `_KNOWN_VAULTS = {"wiki", "lait", "melquiades"}`.
 
 ## Instalación
 
+El MCP vive **dentro del gateway** (`src/focusyn/mcp_app.py`, endpoint Streamable HTTP
+`/mcp`, montado en `main.py`). No hay binario que copiar ni proceso stdio que lanzar:
+basta con que el gateway esté corriendo y registrar el endpoint con una key de agente.
+
 ### 1. Crear la key del agente en el gateway
 
 ```bash
 cd /home/melquiades/focusyn
 uv run focusyn agent create \
-  --name focusyn \
+  --name focusyn-mcp-local \
   --scopes "read,propose,apply,sync" \
   --rate-limit 120
 ```
 
-> `sync` es necesario para `push_vault` (añadido 2026-06-12; al agente existente
-> se le agregó vía UPDATE en `a2a_ops.agents` — la CLI no edita scopes).
-
-La key se muestra **una sola vez**. Para rotarla:
-
-```bash
-uv run focusyn agent rotate-key focusyn
-```
+> `sync` es necesario para `push_vault`. La key se muestra **una sola vez**; rótala con
+> `uv run focusyn agent rotate-key focusyn-mcp-local` (y re-registra con la nueva).
 
 ### 2. Arrancar el gateway
 
 ```bash
 cd /home/melquiades/focusyn
-make dev          # uvicorn a2a_gateway.main:app --reload --port 7415
+docker compose up -d        # contenedor focusyn-gateway-1, :7415
+# o en dev: make dev        # uvicorn --reload --port 7415
 ```
 
-Verificar:
+Verificar el endpoint MCP (sin auth = 401; con la key, el handshake responde):
 
 ```bash
-curl -s http://localhost:7415/health        # status ok + dependencias
-curl -s http://localhost:7415/v1/capabilities
+curl -s -o /dev/null -w "health: %{http_code}\n" http://localhost:7415/health   # 200
+curl -s -o /dev/null -w "/mcp/: %{http_code}\n"   http://localhost:7415/mcp/     # 401 (sin auth)
 ```
 
-### 3. Copiar el servidor MCP
-
-```bash
-mkdir -p ~/.claude/mcp-servers/focusyn
-cp "~/Mrgenkko Skills/deployed/focusyn/server.py" \
-   ~/.claude/mcp-servers/focusyn/server.py
-```
-
-### 4. Registrar en `scripts/secrets.json`
+### 3. Registrar en `scripts/secrets.json`
 
 ```json
 {
   "name": "focusyn",
   "type": "focusyn",
-  "gateway_url": "http://localhost:7415",
-  "gateway_key": "a2a_<KEY>",
-  "vault_path": "/home/melquiades/ObsidianVault"
+  "url": "http://localhost:7415/mcp/",
+  "agent_key": "a2a_<KEY>"
 }
 ```
 
-`add-mcp-to-project.py` construye la entrada con estos campos como variables de entorno
-(`FOCUSYN_GATEWAY_URL`, `FOCUSYN_GATEWAY_KEY`, `OBSIDIAN_VAULT`).
+`add-mcp-to-project.py` construye con estos campos una entrada **http**:
+`{"type":"http","url":...,"headers":{"X-Agent-Key": <agent_key>}}` (ya no es stdio).
 
-### 5. Registrar en un proyecto (reemplaza al raw)
+### 4. Registrar como MCP GLOBAL (user-scope)
 
-```bash
-/mcp-project add <proyecto> focusyn      # agrega focusyn
-/mcp-project remove <proyecto> obsidian       # quita el raw
-```
-
-O vía script directamente:
+focusyn se registra **una sola vez** en el `mcpServers` top-level de `~/.claude.json`
+(user-scope) y queda disponible en **todos** los proyectos sin repetirlo:
 
 ```bash
-python3 "scripts/add-mcp-to-project.py" /ruta/proyecto --only focusyn
+claude mcp add --scope user --transport http focusyn \
+  http://localhost:7415/mcp/ --header "X-Agent-Key: a2a_<KEY>"
 ```
+
+> Precedencia de scopes: **Local > Project > User**. No dejes un `focusyn` per-project
+> (en `projects[path].mcpServers`) o ganará sobre el global. Para un override puntual en
+> un proyecto sí puedes registrarlo local con
+> `python3 "scripts/add-mcp-to-project.py" /ruta/proyecto --only focusyn`.
 
 Después: **reiniciar Claude Code en VSCode** para que cargue el MCP.
 
-## Variables de entorno
+## Configuración del registro
 
-| Variable | Valor dev | Descripción |
+| Campo | Valor | Descripción |
 |---|---|---|
-| `FOCUSYN_GATEWAY_URL` | `http://localhost:7415` | URL base del gateway |
-| `FOCUSYN_GATEWAY_KEY` | `a2a_<...>` | API key del agente MCP (header `X-Agent-Key`) |
-| `OBSIDIAN_VAULT` | `/home/melquiades/ObsidianVault` | Raíz del vault en el host (para leer el `id` del frontmatter en `write_note`/`delete_note`) |
+| `url` | `http://localhost:7415/mcp/` | Endpoint Streamable HTTP del gateway (in-process `/mcp`) |
+| header `X-Agent-Key` | `a2a_<...>` | Key del agente de máquina (`focusyn-mcp-local`); el gateway resuelve scopes y aplica governance |
+
+El MCP ya **no lee el disco del cliente**: el `id` del frontmatter (para
+`write_note`/`delete_note`/`link`/`supersede`) lo resuelve el gateway vía
+`GET /v1/ids/resolve` (in-process). Por eso no hay `OBSIDIAN_VAULT` ni nada que montar.
 
 ## Latencia esperada
 
@@ -207,24 +204,19 @@ Después: **reiniciar Claude Code en VSCode** para que cargue el MCP.
 
 ## Smoke test
 
-Con el gateway corriendo y la key en el entorno:
+Con el gateway corriendo, un handshake MCP `initialize` debe devolver
+`serverInfo.name = "focusyn"`:
 
 ```bash
-FOCUSYN_GATEWAY_KEY="a2a_<KEY>" python3 - <<'PY'
-import asyncio, importlib.util
-spec = importlib.util.spec_from_file_location("srv", "/home/melquiades/.claude/mcp-servers/focusyn/server.py")
-m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-fn = lambda t: (t.fn if hasattr(t, "fn") else t)
-async def main():
-    gc = await fn(m.get_context)(vault="melquiades")
-    print("get_context ->", list(gc.keys()))
-    ln = await fn(m.list_notes)(vault="melquiades", limit=2)
-    print("list_notes total ->", ln.get("total"))
-    sn = await fn(m.search_notes)(query="arquitectura de autenticacion", vault="melquiades", top_n=2)
-    print("search_notes evidence_docs ->", len(sn.get("evidence_docs", [])))
-asyncio.run(main())
-PY
+curl -s -X POST http://localhost:7415/mcp/ \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "X-Agent-Key: a2a_<KEY>" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}'
 ```
+
+`tools/list` (mismo endpoint, `"method":"tools/list"`) enumera las 26 tools. Sin el
+header `X-Agent-Key` el endpoint responde **401**.
 
 ## Monitoreo del audit trail
 
@@ -252,8 +244,9 @@ asyncio.run(main())
 
 ## Archivos
 
-- Binario instalado: `~/.claude/mcp-servers/focusyn/server.py`
-- Fuente desplegada: `deployed/focusyn/server.py`
-- Ejemplo base público: `examples/mcp-focusyn/server.py`
-- Gateway: `/home/melquiades/focusyn/`
+- MCP (in-process): `/home/melquiades/focusyn/src/focusyn/mcp_app.py` (montado en `main.py`)
+- Gateway: `/home/melquiades/focusyn/` (contenedor `focusyn-gateway-1`, `:7415`)
+- Registro global: `mcpServers.focusyn` (top-level) en `~/.claude.json` (user-scope)
+- Tooling de registro: `scripts/secrets.json` (entry `focusyn`) + `scripts/add-mcp-to-project.py`
+- Wrapper stdio legacy: **retirado** jun-2026 (antes en `~/.claude/mcp-servers/focusyn/` + `deployed/focusyn/`)
 - MCP raw (legacy, fallback): `guides/mcp-obsidian.md`
