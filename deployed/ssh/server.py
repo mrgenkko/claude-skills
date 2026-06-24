@@ -1,12 +1,28 @@
 #!/usr/bin/env python3
-"""MCP server para control de servidores Ubuntu vía SSH."""
+"""MCP server para control de servidores Ubuntu vía SSH.
+
+Modos de `shell`:
+- one-shot (sin `session`): conexión nueva por llamada, `exec_command`, sin estado entre
+  llamadas. Idéntico al comportamiento histórico.
+- sesión persistente (`session="nombre"`): el comando corre dentro de una sesión tmux
+  server-side creada on-demand. El estado (cwd, env, venv) PERSISTE entre llamadas y los
+  procesos largos sobreviven al timeout. tmux queda oculto tras el vocabulario propio
+  (shell+session / sessions / end_session / interrupt_session).
+
+Un watcher en background (reaper) apaga sesiones tras N segundos de INACTIVIDAD real
+(pane en prompt de shell, sin comando corriendo) — un build largo nunca se mata porque su
+output mantiene fresca la actividad de la sesión.
+"""
 
 import argparse
 import asyncio
 import hashlib
 import os
+import re
 import shlex
 import stat
+import time
+import uuid
 import paramiko
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -21,14 +37,51 @@ parser.add_argument("--password", default=None)
 parser.add_argument("--sudo-password", default=None)
 parser.add_argument("--download-dir", default="/tmp")
 parser.add_argument("--name", default=None)
+# Sesiones persistentes: ON por defecto; opt-out por instancia (estilo --allow-flush de redis).
+parser.add_argument("--forbid-sessions", dest="forbid_sessions", action="store_true",
+                    help="Deshabilita las sesiones persistentes (shell one-shot sigue activo).")
+# Watcher: apaga sesiones tras N segundos de inactividad real. 0 = watcher desactivado.
+parser.add_argument("--session-idle-timeout", dest="session_idle_timeout", type=int, default=1800,
+                    help="Segundos de inactividad tras los que el watcher apaga una sesión idle (0=off).")
 args, _ = parser.parse_known_args()
 
 SERVER_LABEL = args.name or args.host
 
-# Umbral por encima del cual read_file deja de devolver texto y redirige a download_file.
+# Umbral por encima del cual la salida deja de devolverse como texto y redirige a download_file.
 READ_TEXT_LIMIT = 256 * 1024  # 256 KB
 
+# Raíz de los temporales por-sesión en el server remoto (centinelas + salida capturada).
+SESSION_BASE = "/tmp/.mcp-ssh"
+# Nombres de sesión válidos: anti-inyección en tmux/shell.
+_SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+# Cadencia del polling del archivo-centinela (segundos).
+POLL_INTERVAL = 0.3
+# Comandos de pane que cuentan como "idle" (prompt de shell, sin proceso corriendo).
+_IDLE_SHELLS = {"bash", "sh", "zsh", "fish", "dash", "ksh", "-bash", "-sh", "-zsh", "-fish"}
+
+SESSIONS_DISABLED_MSG = (
+    f"Las sesiones persistentes están deshabilitadas en {SERVER_LABEL}. "
+    "Re-registrá la instancia con allow_sessions:true (sin --forbid-sessions) en secrets.json "
+    "para habilitarlas. El modo one-shot de shell sigue disponible."
+)
+
 app = Server(f"ssh-{SERVER_LABEL}")
+
+# Metadata en memoria de las sesiones que conoce ESTE proceso (sobrevive entre tool calls;
+# NO entre reinicios del MCP — tmux es la verdad de liveness). Solo enriquece el listado.
+_sessions: dict[str, dict] = {}
+# Lock por sesión: serializa comandos dentro de una misma sesión (dos shell(session="x")
+# concurrentes no deben intercalar send-keys en el mismo pane). Entre sesiones, sin lock.
+_locks: dict[str, asyncio.Lock] = {}
+_locks_guard = asyncio.Lock()
+
+
+class SessionError(Exception):
+    """Error de sesión con mensaje listo para el usuario (sin prefijo 'Error SSH:')."""
+
+
+def _text(s: str) -> list[types.TextContent]:
+    return [types.TextContent(type="text", text=s)]
 
 
 def _sha256(path: str) -> str:
@@ -61,20 +114,324 @@ def _connect() -> paramiko.SSHClient:
     return client
 
 
+# ─────────────────────────── Sesiones persistentes ───────────────────────────
+
+def _valid_session(name) -> bool:
+    return isinstance(name, str) and bool(_SESSION_NAME_RE.match(name))
+
+
+async def _get_lock(session: str) -> asyncio.Lock:
+    async with _locks_guard:
+        if session not in _locks:
+            _locks[session] = asyncio.Lock()
+        return _locks[session]
+
+
+def _touch_session(session: str, command: str) -> None:
+    meta = _sessions.setdefault(session, {})
+    meta.setdefault("created", time.time())
+    meta["last_used"] = time.time()
+    first = command.strip().splitlines()[0] if command.strip() else ""
+    meta["last_command"] = (first[:60] + "…") if len(first) > 60 else first
+
+
+def _forget_session(session: str) -> None:
+    _sessions.pop(session, None)
+    _locks.pop(session, None)
+
+
+def _read_remote_text(sftp, path: str) -> str:
+    """Lee un archivo de texto remoto con el guard de tamaño de read_file."""
+    try:
+        size = sftp.stat(path).st_size
+    except IOError:
+        return ""
+    if size > READ_TEXT_LIMIT:
+        return (f"(salida de {size} bytes — excede el límite de {READ_TEXT_LIMIT}. "
+                f"Redirigí la salida a un archivo dentro del comando y traelo con download_file.)")
+    with sftp.open(path, "r") as f:
+        return f.read().decode("utf-8", errors="replace")
+
+
+def _session_run_blocking(session: str, command: str, timeout: int):
+    """Ejecuta `command` en la sesión tmux preservando estado, captura stdout/stderr+exit code.
+
+    Patrón source + archivo-centinela: el comando se escribe VERBATIM a un .sh (sin escaping)
+    y se `source`-ea en la shell viva (el brace-group corre en la shell actual → cwd/env
+    persisten). La salida va a .out y el exit code a .rc; se hace polling de .rc.
+    Bloqueante: invocar vía asyncio.to_thread. Devuelve (output, exit_code|None, timed_out).
+    """
+    sdir = f"{SESSION_BASE}/{session}"
+    cid = uuid.uuid4().hex
+    cmd_path = f"{sdir}/{cid}.sh"
+    out_path = f"{sdir}/{cid}.out"
+    rc_path = f"{sdir}/{cid}.rc"
+
+    client = _connect()
+    try:
+        # ¿tmux disponible? (no auto-instalar; surface con hint)
+        _, so, _ = client.exec_command("command -v tmux >/dev/null 2>&1 && echo ok")
+        if so.read().decode("utf-8", errors="replace").strip() != "ok":
+            raise SessionError(
+                "tmux no está instalado en el servidor remoto; es necesario para las sesiones "
+                "persistentes. Instalalo con: sudo apt install tmux (el shell one-shot no lo requiere)."
+            )
+
+        # Asegurar la sesión (creación on-demand) + el dir de temporales.
+        setup = (
+            f"tmux has-session -t {shlex.quote(session)} 2>/dev/null || "
+            f"tmux new-session -d -s {shlex.quote(session)}; "
+            f"mkdir -p {shlex.quote(sdir)}"
+        )
+        _, so, _ = client.exec_command(setup)
+        so.channel.recv_exit_status()
+
+        # Comando del usuario VERBATIM (sin escaping): solo nuestras rutas se quotean.
+        wrapper = (
+            "{\n"
+            + command
+            + "\n} > " + shlex.quote(out_path) + " 2>&1\n"
+            + "echo $? > " + shlex.quote(rc_path) + "\n"
+        )
+        sftp = client.open_sftp()
+        with sftp.open(cmd_path, "w") as f:
+            f.write(wrapper.encode("utf-8"))
+
+        # Teclear el `source` en la shell viva (-l = literal; la línea solo tiene rutas nuestras).
+        source_line = f"source {shlex.quote(cmd_path)}"
+        send = (
+            f"tmux send-keys -t {shlex.quote(session)} -l {shlex.quote(source_line)} && "
+            f"tmux send-keys -t {shlex.quote(session)} Enter"
+        )
+        _, so, _ = client.exec_command(send)
+        so.channel.recv_exit_status()
+
+        # Polling del centinela .rc hasta completar o agotar timeout.
+        deadline = time.monotonic() + max(1, timeout)
+        completed = False
+        while time.monotonic() < deadline:
+            try:
+                sftp.stat(rc_path)
+                completed = True
+                break
+            except IOError:
+                time.sleep(POLL_INTERVAL)
+
+        output = _read_remote_text(sftp, out_path)
+        exit_code = None
+        if completed:
+            rc_txt = _read_remote_text(sftp, rc_path).strip()
+            try:
+                exit_code = int(rc_txt)
+            except ValueError:
+                exit_code = None
+            for p in (cmd_path, out_path, rc_path):  # limpiar temporales del comando
+                try:
+                    sftp.remove(p)
+                except IOError:
+                    pass
+        sftp.close()
+        return output, exit_code, (not completed)
+    finally:
+        client.close()
+
+
+def _session_list_blocking() -> str:
+    client = _connect()
+    try:
+        fmt = "#{session_name}\t#{session_created}\t#{session_activity}\t#{pane_current_command}"
+        _, so, _ = client.exec_command(f"tmux ls -F {shlex.quote(fmt)} 2>/dev/null")
+        out = so.read().decode("utf-8", errors="replace").strip()
+        return out if so.channel.recv_exit_status() == 0 else ""
+    finally:
+        client.close()
+
+
+def _session_kill_blocking(session: str) -> None:
+    sdir = f"{SESSION_BASE}/{session}"
+    client = _connect()
+    try:
+        cmd = (f"tmux kill-session -t {shlex.quote(session)} 2>/dev/null; "
+               f"rm -rf {shlex.quote(sdir)}")
+        _, so, _ = client.exec_command(cmd)
+        so.channel.recv_exit_status()
+    finally:
+        client.close()
+
+
+def _session_interrupt_blocking(session: str) -> None:
+    client = _connect()
+    try:
+        _, so, _ = client.exec_command(
+            f"tmux has-session -t {shlex.quote(session)} 2>/dev/null && echo ok")
+        if so.read().decode("utf-8", errors="replace").strip() != "ok":
+            raise SessionError(f"No existe la sesión '{session}'.")
+        _, so, _ = client.exec_command(f"tmux send-keys -t {shlex.quote(session)} C-c")
+        so.channel.recv_exit_status()
+    finally:
+        client.close()
+
+
+def _format_sessions(raw: str) -> str:
+    if not raw:
+        return "(no hay sesiones persistentes activas)"
+    now = time.time()
+    lines = [f"sesiones persistentes en {SERVER_LABEL}:"]
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        sname = parts[0]
+        created = parts[1] if len(parts) > 1 else ""
+        activity = parts[2] if len(parts) > 2 else ""
+        pane_cmd = parts[3] if len(parts) > 3 else ""
+        busy = "idle" if pane_cmd in _IDLE_SHELLS else f"corriendo:{pane_cmd}"
+        try:
+            idle_s = int(now - int(activity))
+            idle_str = f" · inactiva {idle_s}s"
+        except ValueError:
+            idle_str = ""
+        try:
+            created_str = " · creada " + time.strftime("%Y-%m-%d %H:%M", time.localtime(int(created)))
+        except ValueError:
+            created_str = ""
+        last_cmd = _sessions.get(sname, {}).get("last_command")
+        last_str = f" · último: {last_cmd}" if last_cmd else ""
+        lines.append(f"  {sname}  [{busy}]{idle_str}{created_str}{last_str}")
+    return "\n".join(lines)
+
+
+async def _handle_session_tool(name: str, arguments: dict, session):
+    if name == "shell":
+        command = arguments["command"]
+        timeout = arguments.get("timeout", 60)
+        if not _valid_session(session):
+            raise SessionError(
+                f"Nombre de sesión inválido: {session!r}. Permitido: letras, dígitos, '.', '_', '-' (1-64).")
+        lock = await _get_lock(session)
+        async with lock:
+            output, exit_code, timed_out = await asyncio.to_thread(
+                _session_run_blocking, session, command, timeout)
+        _touch_session(session, command)
+        if timed_out:
+            body = output.strip() or "(sin salida todavía)"
+            note = (f"\n\n[el comando sigue corriendo en la sesión '{session}'. "
+                    f"Volvé con shell(session='{session}', …) para seguir, "
+                    f"interrupt_session('{session}') para cortarlo, o end_session('{session}') para terminarla.]")
+            return _text(f"[corriendo · sesión '{session}']\n{body}{note}")
+        if exit_code not in (0, None):
+            return _text(f"[exit {exit_code} · sesión '{session}']\n{output.strip() or '(sin output)'}")
+        return _text(output.strip() or "(sin output)")
+
+    if name == "sessions":
+        raw = await asyncio.to_thread(_session_list_blocking)
+        return _text(_format_sessions(raw))
+
+    if name == "end_session":
+        session = arguments["session"]
+        if not _valid_session(session):
+            raise SessionError(f"Nombre de sesión inválido: {session!r}.")
+        await asyncio.to_thread(_session_kill_blocking, session)
+        _forget_session(session)
+        return _text(f"Sesión '{session}' terminada y sus temporales limpiados.")
+
+    if name == "interrupt_session":
+        session = arguments["session"]
+        if not _valid_session(session):
+            raise SessionError(f"Nombre de sesión inválido: {session!r}.")
+        await asyncio.to_thread(_session_interrupt_blocking, session)
+        _touch_session(session, "<interrupt>")
+        return _text(f"Ctrl-C enviado a la sesión '{session}' (la sesión sigue viva).")
+
+    raise SessionError(f"Tool de sesión desconocido: {name}")
+
+
+# ─────────────────────── Watcher: apaga sesiones idle ────────────────────────
+
+def _reap_idle_sessions() -> None:
+    """Apaga sesiones gestionadas por nosotros que llevan > timeout INACTIVAS.
+
+    Inactiva = pane en prompt de shell (sin proceso corriendo) Y sin actividad en el pane
+    durante > timeout segundos. Un build largo produce output → actividad fresca → NO se mata.
+    Solo toca sesiones nuestras (las que tienen dir bajo SESSION_BASE), nunca sesiones tmux
+    creadas a mano por el usuario. También limpia dirs huérfanos (sesión muerta, dir colgado).
+    Bloqueante: invocar vía asyncio.to_thread.
+    """
+    timeout = args.session_idle_timeout
+    if timeout <= 0:
+        return
+    client = _connect()
+    try:
+        _, so, _ = client.exec_command(f"ls -1 {shlex.quote(SESSION_BASE)} 2>/dev/null")
+        managed = [d for d in so.read().decode("utf-8", errors="replace").split() if d]
+        now = time.time()
+        for sname in managed:
+            if not _valid_session(sname):
+                continue
+            sdir = f"{SESSION_BASE}/{sname}"
+            fmt = "#{session_activity}\t#{pane_current_command}"
+            _, so, _ = client.exec_command(
+                f"tmux display-message -p -t {shlex.quote(sname)} {shlex.quote(fmt)} 2>/dev/null")
+            info = so.read().decode("utf-8", errors="replace").strip()
+            if so.channel.recv_exit_status() != 0 or not info:
+                # Sesión ya no existe en tmux pero quedó el dir → limpiar huérfano.
+                client.exec_command(f"rm -rf {shlex.quote(sdir)}")[1].channel.recv_exit_status()
+                _forget_session(sname)
+                continue
+            parts = info.split("\t")
+            try:
+                idle = now - int(parts[0])
+            except (ValueError, IndexError):
+                continue
+            pane_cmd = parts[1] if len(parts) > 1 else ""
+            if pane_cmd in _IDLE_SHELLS and idle > timeout:
+                client.exec_command(
+                    f"tmux kill-session -t {shlex.quote(sname)} 2>/dev/null; "
+                    f"rm -rf {shlex.quote(sdir)}")[1].channel.recv_exit_status()
+                _forget_session(sname)
+    finally:
+        client.close()
+
+
+async def _reaper_loop() -> None:
+    interval = max(15, min(60, args.session_idle_timeout))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(_reap_idle_sessions)
+        except Exception:
+            pass  # el watcher nunca tumba el server
+
+
+# ──────────────────────────────── Tools ─────────────────────────────────────
+
 @app.list_tools()
 async def list_tools() -> list[types.Tool]:
-    return [
+    sessions_on = not args.forbid_sessions
+    shell_desc = (
+        f"Ejecuta un comando de shell en {SERVER_LABEL} vía SSH. Los comandos con sudo se manejan "
+        "automáticamente: el servidor inyecta la contraseña vía stdin (sudo -S)."
+    )
+    shell_props = {
+        "command": {"type": "string", "description": "Comando bash a ejecutar"},
+        "timeout": {"type": "integer", "default": 60, "description": "Timeout en segundos"},
+    }
+    if sessions_on:
+        shell_desc += (
+            " Pasá `session` (un nombre, ej. \"deploy\") para correrlo en una SESIÓN PERSISTENTE "
+            "server-side: el estado (cwd, export, venv) PERSISTE entre llamadas y los procesos largos "
+            "sobreviven al timeout (al expirar devuelve la salida parcial sin matar la sesión). "
+            "La sesión se crea sola la primera vez. Sin `session`, es one-shot sin estado. Las "
+            f"sesiones idle se apagan solas tras {args.session_idle_timeout}s de inactividad."
+        )
+        shell_props["session"] = {
+            "type": "string",
+            "description": "Nombre de la sesión persistente ([A-Za-z0-9_.-], 1-64). Si se omite, one-shot.",
+        }
+
+    tools = [
         types.Tool(
             name="shell",
-            description=f"Ejecuta un comando de shell en {SERVER_LABEL} vía SSH. Los comandos con sudo se manejan automáticamente: el servidor inyecta la contraseña vía stdin (sudo -S) sin necesidad de incluirla en el comando.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "Comando bash a ejecutar"},
-                    "timeout": {"type": "integer", "default": 60, "description": "Timeout en segundos"},
-                },
-                "required": ["command"],
-            },
+            description=shell_desc,
+            inputSchema={"type": "object", "properties": shell_props, "required": ["command"]},
         ),
         types.Tool(
             name="read_file",
@@ -137,9 +494,56 @@ async def list_tools() -> list[types.Tool]:
         ),
     ]
 
+    if sessions_on:
+        tools += [
+            types.Tool(
+                name="sessions",
+                description=f"Lista las sesiones persistentes activas en {SERVER_LABEL} (nombre, idle/corriendo, inactividad, creación, último comando). Las sesiones idle se apagan solas tras {args.session_idle_timeout}s de inactividad.",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            types.Tool(
+                name="end_session",
+                description=f"Termina una sesión persistente en {SERVER_LABEL} (mata el proceso y limpia sus temporales). Usar para cerrar explícitamente una sesión y todo lo que esté corriendo en ella.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session": {"type": "string", "description": "Nombre de la sesión a terminar"},
+                    },
+                    "required": ["session"],
+                },
+            ),
+            types.Tool(
+                name="interrupt_session",
+                description=f"Envía Ctrl-C al comando que corre en una sesión persistente de {SERVER_LABEL} SIN terminar la sesión (para cortar un comando colgado/runaway y reusar la sesión).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session": {"type": "string", "description": "Nombre de la sesión a interrumpir"},
+                    },
+                    "required": ["session"],
+                },
+            ),
+        ]
+
+    return tools
+
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    # ── Sesiones persistentes: conexión propia en thread (no bloquea el event loop) ──
+    session = arguments.get("session") if name == "shell" else None
+    is_session_tool = name in ("sessions", "end_session", "interrupt_session") or session is not None
+    if is_session_tool:
+        if args.forbid_sessions:
+            return _text(SESSIONS_DISABLED_MSG)
+        try:
+            return await _handle_session_tool(name, arguments, session)
+        except SessionError as e:
+            return _text(str(e))
+        except Exception as e:
+            return _text(f"Error SSH (sesión): {e}")
+
+    # ── One-shot / archivos: comportamiento histórico (conexión por llamada) ──
     try:
         client = _connect()
 
@@ -264,6 +668,9 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
 
 async def main():
+    # Watcher en background: apaga sesiones idle (salvo que las sesiones estén deshabilitadas).
+    if not args.forbid_sessions and args.session_idle_timeout > 0:
+        asyncio.create_task(_reaper_loop())
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
 

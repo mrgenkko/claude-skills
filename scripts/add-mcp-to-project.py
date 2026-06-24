@@ -84,6 +84,12 @@ def build_mcp_servers(servers_config: list) -> dict:
                 args.append(f"--password={entry['password']}")
             if entry.get("sudo_password"):
                 args.append(f"--sudo-password={entry['sudo_password']}")
+            # Sesiones persistentes (tmux server-side): ON por defecto; opt-out por instancia.
+            if entry.get("allow_sessions", True) is False:
+                args.append("--forbid-sessions")
+            # Watcher: apaga sesiones idle tras N segundos de inactividad (default server: 1800; 0=off).
+            if entry.get("session_idle_timeout") is not None:
+                args.append(f"--session-idle-timeout={entry['session_idle_timeout']}")
 
         elif kind == "redis":
             server_label = name.removeprefix("redis-") or entry["host"]
