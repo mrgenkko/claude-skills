@@ -15,6 +15,7 @@ El mismo binario (`server.py`) sirve para múltiples servidores — se diferenci
 | `download_file`     | Descarga un archivo remoto a disco local (SFTP, disco-a-disco)    |
 | `upload_file`       | Sube un archivo local al servidor remoto (SFTP, disco-a-disco)    |
 | `list_dir`          | Lista el contenido de un directorio remoto                        |
+| `server_info`       | Discovery del entorno en una llamada: usuario, hostname, home, sudo (NOPASSWD/inyectado/sin acceso), docker (con/sin sudo), tmux |
 | `sessions`          | Lista las sesiones persistentes activas (idle/corriendo, inactividad, último comando) |
 | `end_session`       | Termina una sesión persistente y limpia sus temporales            |
 | `interrupt_session` | Envía Ctrl-C al comando de una sesión **sin** terminarla (cortar un runaway) |
@@ -45,8 +46,15 @@ end_session(session="deploy")                                         # cerrar t
 - **Salida + exit code confiables**: la salida se captura a archivo y el exit code vía centinela
   (no se parsea la pantalla). El guard de 256 KB aplica igual que en `read_file`.
 - **Nombre de sesión**: `[A-Za-z0-9_.-]`, 1-64 chars.
-- **sudo en sesión**: el auto `sudo -S` por stdin aplica solo al modo one-shot. Dentro de una
-  sesión usá `echo "$PASS" | sudo -S …` o configurá NOPASSWD en el servidor.
+- **sudo en sesión**: funciona automáticamente, igual que en one-shot. Si el MCP tiene
+  `--sudo-password`, cada `sudo` del comando se reescribe a `sudo -A` y la contraseña se entrega
+  vía `SUDO_ASKPASS` (un helper que lee un archivo `0600` bajo `/tmp/.mcp-ssh/<sesión>/`, borrado al
+  cerrar la sesión). No pasa por la línea de comando ni por el pane. No hace falta `echo "$PASS" |
+  sudo -S …`; si igual ponés un `sudo -S`/`-n` explícito, se respeta sin tocar.
+- **Prompt interactivo = señal explícita**: si un comando de sesión queda colgado leyendo un prompt
+  (sudo sin contraseña, passphrase de clave, host-key `yes/no`, `apt … [Y/n]`), al expirar el timeout
+  `shell` lo reporta como `[bloqueado · esperando <X>]` (no como genérico "corriendo"), con la pista
+  de cómo destrabarlo. Cortás con `interrupt_session` y reintentás sin el prompt.
 - **Requiere tmux** en el servidor remoto. Si falta, `shell(session=…)` devuelve un hint
   (`sudo apt install tmux`); el modo one-shot no lo necesita.
 
@@ -120,13 +128,26 @@ redirige a `download_file` en vez de texto corrupto.
 
 ### Sudo
 
-Si se pasa `--sudo-password`, el tool `shell` detecta automáticamente comandos que comienzan con `sudo`, inserta `-S` y alimenta la contraseña por stdin. Ejemplo:
+Si se pasa `--sudo-password`, el tool `shell` detecta automáticamente los comandos con `sudo` e
+inyecta la contraseña, **en los dos modos**:
+
+- **One-shot**: inserta `-S` y alimenta la contraseña por stdin.
+- **Sesión persistente**: reescribe cada `sudo` a `sudo -A` y entrega la contraseña vía
+  `SUDO_ASKPASS` (no por stdin, que la shell sourced no controla). El helper lee un archivo `0600`
+  bajo `/tmp/.mcp-ssh/<sesión>/`, que se borra al cerrar/reapear la sesión.
 
 ```bash
-# Claude puede invocar esto sin configuración extra:
+# Claude puede invocar esto sin configuración extra, en one-shot o en session="deploy":
 sudo -u postgres psql -c "CREATE DATABASE mi_bd;"
 sudo systemctl restart nginx
 ```
+
+Detalles de la inyección:
+- Se reescriben **todos** los `sudo` del comando (no solo el primero), así `sudo a && sudo b` funciona.
+- Si ya ponés un flag explícito (`sudo -S`, `sudo -n`, `sudo -k`, `sudo -v`), no se toca.
+- **`cd` a un home ajeno**: `cd /home/otro/app && sudo docker …` falla en el `cd` (corre como el
+  usuario de login, **antes** de que `sudo` aplique). Envolvé todo en sudo:
+  `sudo bash -c 'cd /home/otro/app && docker compose up'` (o `sudo -u <dueño> -H bash -c '…'`).
 
 Alternativa más segura: configurar `NOPASSWD` en sudoers del servidor para comandos específicos y omitir `--sudo-password`:
 

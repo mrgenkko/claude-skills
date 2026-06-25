@@ -59,6 +59,36 @@ POLL_INTERVAL = 0.3
 # Comandos de pane que cuentan como "idle" (prompt de shell, sin proceso corriendo).
 _IDLE_SHELLS = {"bash", "sh", "zsh", "fish", "dash", "ksh", "-bash", "-sh", "-zsh", "-fish"}
 
+# Inyección de sudo en sesiones: reescribe cada `sudo` → `sudo -A` (usa SUDO_ASKPASS) salvo que
+# el usuario ya haya puesto un flag explícito (-A/-S/-n/-k/-v) tras él. Word-boundary para no
+# tocar `sudo` dentro de rutas/strings (`/usr/bin/sudo`, `pseudo`).
+_SUDO_INJECT_RE = re.compile(r"\bsudo\b(?!\s+-[ASnkv]\b)")
+
+# Prompts interactivos conocidos: si un comando de sesión queda colgado leyendo uno de estos,
+# se reporta como "bloqueado esperando <X>" en vez del genérico "corriendo".
+_PROMPT_PATTERNS = [
+    (re.compile(r"\[sudo\] password for", re.I), "contraseña de sudo"),
+    (re.compile(r"Enter passphrase for", re.I), "passphrase de clave SSH"),
+    (re.compile(r"Are you sure you want to continue connecting", re.I), "confirmación de host-key SSH (yes/no)"),
+    (re.compile(r"\(yes/no(?:/\[fingerprint\])?\)\??", re.I), "confirmación yes/no"),
+    (re.compile(r"\[Y/n\]|\[y/N\]"), "confirmación [Y/n]"),
+    (re.compile(r"(?:^|\n)\s*[Pp]assword:\s*$"), "contraseña"),
+]
+
+
+def _inject_askpass_sudo(command: str) -> str:
+    """Reescribe los `sudo` del comando a `sudo -A` para que tomen la contraseña vía SUDO_ASKPASS."""
+    return _SUDO_INJECT_RE.sub("sudo -A", command)
+
+
+def _detect_prompt(pane: str) -> str | None:
+    """Si las últimas líneas del pane muestran un prompt interactivo conocido, devuelve su etiqueta."""
+    tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-5:])
+    for rx, label in _PROMPT_PATTERNS:
+        if rx.search(tail):
+            return label
+    return None
+
 SESSIONS_DISABLED_MSG = (
     f"Las sesiones persistentes están deshabilitadas en {SERVER_LABEL}. "
     "Re-registrá la instancia con allow_sessions:true (sin --forbid-sessions) en secrets.json "
@@ -159,13 +189,19 @@ def _session_run_blocking(session: str, command: str, timeout: int):
     Patrón source + archivo-centinela: el comando se escribe VERBATIM a un .sh (sin escaping)
     y se `source`-ea en la shell viva (el brace-group corre en la shell actual → cwd/env
     persisten). La salida va a .out y el exit code a .rc; se hace polling de .rc.
-    Bloqueante: invocar vía asyncio.to_thread. Devuelve (output, exit_code|None, timed_out).
+    Bloqueante: invocar vía asyncio.to_thread.
+    Devuelve (output, exit_code|None, timed_out, blocked_on|None) — blocked_on es la etiqueta del
+    prompt interactivo si el comando quedó colgado leyéndolo (sudo, passphrase, yes/no…), o None.
     """
     sdir = f"{SESSION_BASE}/{session}"
     cid = uuid.uuid4().hex
     cmd_path = f"{sdir}/{cid}.sh"
     out_path = f"{sdir}/{cid}.out"
     rc_path = f"{sdir}/{cid}.rc"
+    # Askpass por-sesión: helper estático que `cat`-ea un archivo de contraseña 0600 (la contraseña
+    # nunca pasa por la línea de comando ni por el pane; los archivos se borran al matar la sesión).
+    askpass_path = f"{sdir}/.askpass"
+    pass_path = f"{sdir}/.sudopass"
 
     client = _connect()
     try:
@@ -177,23 +213,41 @@ def _session_run_blocking(session: str, command: str, timeout: int):
                 "persistentes. Instalalo con: sudo apt install tmux (el shell one-shot no lo requiere)."
             )
 
-        # Asegurar la sesión (creación on-demand) + el dir de temporales.
+        # Asegurar la sesión (creación on-demand) + el dir de temporales (0700: protege la contraseña).
         setup = (
             f"tmux has-session -t {shlex.quote(session)} 2>/dev/null || "
             f"tmux new-session -d -s {shlex.quote(session)}; "
-            f"mkdir -p {shlex.quote(sdir)}"
+            f"mkdir -p {shlex.quote(sdir)} && chmod 700 {shlex.quote(sdir)}"
         )
         _, so, _ = client.exec_command(setup)
         so.channel.recv_exit_status()
 
+        sftp = client.open_sftp()
+
+        # sudo en sesión: igual que en one-shot, el MCP inyecta la contraseña. Se hace vía
+        # SUDO_ASKPASS (no por stdin, que no controlamos en la shell sourced): un helper lee un
+        # archivo de contraseña 0600 y cada `sudo` se reescribe a `sudo -A`.
+        prologue = ""
+        run_command = command
+        if args.sudo_password:
+            with sftp.open(pass_path, "w") as f:
+                f.write((args.sudo_password + "\n").encode("utf-8"))
+            sftp.chmod(pass_path, 0o600)
+            askpass_body = f"#!/bin/sh\nexec cat {shlex.quote(pass_path)}\n"
+            with sftp.open(askpass_path, "w") as f:
+                f.write(askpass_body.encode("utf-8"))
+            sftp.chmod(askpass_path, 0o700)
+            prologue = f"export SUDO_ASKPASS={shlex.quote(askpass_path)}\n"
+            run_command = _inject_askpass_sudo(command)
+
         # Comando del usuario VERBATIM (sin escaping): solo nuestras rutas se quotean.
         wrapper = (
-            "{\n"
-            + command
+            prologue
+            + "{\n"
+            + run_command
             + "\n} > " + shlex.quote(out_path) + " 2>&1\n"
             + "echo $? > " + shlex.quote(rc_path) + "\n"
         )
-        sftp = client.open_sftp()
         with sftp.open(cmd_path, "w") as f:
             f.write(wrapper.encode("utf-8"))
 
@@ -219,6 +273,7 @@ def _session_run_blocking(session: str, command: str, timeout: int):
 
         output = _read_remote_text(sftp, out_path)
         exit_code = None
+        blocked_on = None
         if completed:
             rc_txt = _read_remote_text(sftp, rc_path).strip()
             try:
@@ -230,8 +285,17 @@ def _session_run_blocking(session: str, command: str, timeout: int):
                     sftp.remove(p)
                 except IOError:
                     pass
+        else:
+            # No completó: ¿está colgado leyendo un prompt interactivo? (sudo, passphrase, yes/no…)
+            # El prompt va a la tty del pane —no al .out redirigido—, así que se lee con capture-pane.
+            _, so, _ = client.exec_command(
+                f"tmux capture-pane -p -t {shlex.quote(session)} 2>/dev/null")
+            pane = so.read().decode("utf-8", errors="replace")
+            blocked_on = _detect_prompt(pane)
+            if blocked_on and not output.strip():
+                output = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-3:])
         sftp.close()
-        return output, exit_code, (not completed)
+        return output, exit_code, (not completed), blocked_on
     finally:
         client.close()
 
@@ -308,9 +372,16 @@ async def _handle_session_tool(name: str, arguments: dict, session):
                 f"Nombre de sesión inválido: {session!r}. Permitido: letras, dígitos, '.', '_', '-' (1-64).")
         lock = await _get_lock(session)
         async with lock:
-            output, exit_code, timed_out = await asyncio.to_thread(
+            output, exit_code, timed_out, blocked_on = await asyncio.to_thread(
                 _session_run_blocking, session, command, timeout)
         _touch_session(session, command)
+        if blocked_on:
+            ctx = f"\n{output.strip()}" if output.strip() else ""
+            note = (f"\n\n[la sesión '{session}' está BLOQUEADA esperando input interactivo: {blocked_on}. "
+                    f"No va a avanzar sola. Cortá con interrupt_session('{session}') y reintentá sin el prompt: "
+                    f"si es sudo, registrá --sudo-password en el MCP o configurá NOPASSWD; si es apt, agregá -y; "
+                    f"si es host-key SSH, pre-aceptá la key (ssh-keyscan).]")
+            return _text(f"[bloqueado · esperando {blocked_on} · sesión '{session}']{ctx}{note}")
         if timed_out:
             body = output.strip() or "(sin salida todavía)"
             note = (f"\n\n[el comando sigue corriendo en la sesión '{session}'. "
@@ -418,7 +489,8 @@ async def list_tools() -> list[types.Tool]:
         shell_desc += (
             " Pasá `session` (un nombre, ej. \"deploy\") para correrlo en una SESIÓN PERSISTENTE "
             "server-side: el estado (cwd, export, venv) PERSISTE entre llamadas y los procesos largos "
-            "sobreviven al timeout (al expirar devuelve la salida parcial sin matar la sesión). "
+            "sobreviven al timeout (al expirar devuelve la salida parcial sin matar la sesión). sudo "
+            "funciona igual que en one-shot (el MCP inyecta la contraseña, también dentro de la sesión). "
             "La sesión se crea sola la primera vez. Sin `session`, es one-shot sin estado. Las "
             f"sesiones idle se apagan solas tras {args.session_idle_timeout}s de inactividad."
         )
@@ -491,6 +563,16 @@ async def list_tools() -> list[types.Tool]:
                     "path": {"type": "string", "description": "Ruta del directorio", "default": "/"},
                 },
             },
+        ),
+        types.Tool(
+            name="server_info",
+            description=(
+                f"Resumen del entorno de {SERVER_LABEL} en una llamada (discovery): usuario, hostname, "
+                "home, si sudo está disponible (NOPASSWD / contraseña inyectada / sin acceso), si docker "
+                "es accesible (con o sin sudo) y si tmux está instalado (sesiones persistentes). Llamalo "
+                "al empezar a trabajar en el server para no descubrir el entorno a fuerza de prueba y error."
+            ),
+            inputSchema={"type": "object", "properties": {}},
         ),
     ]
 
@@ -655,6 +737,30 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 prefix = "d" if stat.S_ISDIR(e.st_mode) else "-"
                 lines.append(f"{prefix}  {e.filename}")
             output = "\n".join(lines) or "(directorio vacío)"
+
+        elif name == "server_info":
+            info_script = (
+                'printf "usuario:  %s\\n" "$(whoami)"; '
+                'printf "hostname: %s\\n" "$(hostname)"; '
+                'printf "home:     %s\\n" "$HOME"; '
+                'command -v tmux >/dev/null 2>&1 '
+                '&& echo "tmux:     instalado (sesiones persistentes OK)" '
+                '|| echo "tmux:     AUSENTE (sin sesiones persistentes: sudo apt install tmux)"; '
+                'if command -v docker >/dev/null 2>&1; then '
+                '  if docker ps >/dev/null 2>&1; then echo "docker:   accesible SIN sudo"; '
+                '  else echo "docker:   instalado, requiere sudo (probá: sudo docker …)"; fi; '
+                'else echo "docker:   no instalado"; fi'
+            )
+            _, stdout, _ = client.exec_command(info_script, timeout=30)
+            info = stdout.read().decode("utf-8", errors="replace").strip()
+            if args.sudo_password:
+                sudo_line = "sudo:     contraseña configurada — el MCP la inyecta solo (one-shot y sesiones)"
+            else:
+                _, so, _ = client.exec_command("sudo -n true 2>/dev/null && echo yes || echo no")
+                ok = so.read().decode("utf-8", errors="replace").strip() == "yes"
+                sudo_line = ("sudo:     NOPASSWD (no pide contraseña)" if ok else
+                             "sudo:     pide contraseña y NO hay --sudo-password en este MCP (los sudo se colgarán)")
+            output = f"Entorno de {SERVER_LABEL}:\n{info}\n{sudo_line}"
 
         else:
             output = f"Tool desconocido: {name}"
