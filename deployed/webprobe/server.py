@@ -60,7 +60,7 @@ SERVER_LABEL = args.name or "webprobe"
 # Bump en cada cambio de comportamiento. El agente lo ve en status() para saber si el
 # proceso MCP está stale (un MCP es de vida larga; editar server.py NO recarga el proceso
 # vivo — hay que reiniciar Claude Code / recargar la ventana de VSCode).
-WEBPROBE_VERSION = "0.5.0"
+WEBPROBE_VERSION = "0.5.1"
 app = Server(f"webprobe-{SERVER_LABEL}")
 
 
@@ -886,25 +886,71 @@ def _status_line() -> str:
             pass
     parts.append(f"viewport={args.viewport_w}x{args.viewport_h}")
     parts.append(f"headless={str(_state.headless_current).lower()}")
+    # headless → scrollbars overlay/thin (no representativos, no honra ::-webkit-scrollbar);
+    # headed → scrollbars clásicos (~16px, agarrables) = lo que ve el usuario real.
+    parts.append(f"scrollbars={'overlay(no-repr)' if _state.headless_current else 'classic'}")
     parts.append(f"interact={str(bool(args.allow_interact)).lower()}")
     return " ".join(parts)
+
+
+async def _open_cache_bypass(page):
+    """Desactiva la caché HTTP (disco+memoria) vía CDP para forzar fetch de red en la próxima
+    navegación. Chromium-only. Devuelve la sesión CDP (para cerrarla luego) o None si no aplica/falla."""
+    if args.browser != "chromium":
+        return None
+    try:
+        client = await _state.context.new_cdp_session(page)
+        await client.send("Network.setCacheDisabled", {"cacheDisabled": True})
+        return client
+    except Exception:
+        return None
+
+
+async def _close_cache_bypass(client):
+    """Reactiva la caché y suelta la sesión CDP. Tragar errores (best-effort cleanup)."""
+    if client is None:
+        return
+    try:
+        await client.send("Network.setCacheDisabled", {"cacheDisabled": False})
+    except Exception:
+        pass
+    try:
+        await client.detach()
+    except Exception:
+        pass
+
+
+def _cache_note(requested_bypass: bool, client) -> str:
+    if not requested_bypass:
+        return ""
+    return " [cache bypass]" if client else " [bypass_cache ignorado: requiere chromium]"
 
 
 async def _tool_goto(arguments: dict) -> str:
     page = await _ensure_page(arguments.get("tab"))
     url = _resolve_url(arguments["url"])
-    resp = await page.goto(url, wait_until=arguments.get("wait_until", "load"))
+    bypass = bool(arguments.get("bypass_cache", False))
+    cdp = await _open_cache_bypass(page) if bypass else None
+    try:
+        resp = await page.goto(url, wait_until=arguments.get("wait_until", "load"))
+    finally:
+        await _close_cache_bypass(cdp)
     status = resp.status if resp else "?"
     await _settle_redirect(page, url)   # capta el redirect client-side del guard de auth
     title = await page.title()
-    return (f"ok {status} {page.url}{_redirect_warn(url, page.url)}\n"
+    return (f"ok {status} {page.url}{_cache_note(bypass, cdp)}{_redirect_warn(url, page.url)}\n"
             f"title: {title}\nviewport: {args.viewport_w}x{args.viewport_h} dpr={args.dpr} tab={_state.active}")
 
 
 async def _tool_reload(arguments: dict) -> str:
     page = await _ensure_page(arguments.get("tab"))
-    resp = await page.reload(wait_until=arguments.get("wait_until", "load"))
-    return f"reloaded {resp.status if resp else '?'} {page.url}"
+    bypass = bool(arguments.get("bypass_cache", False))
+    cdp = await _open_cache_bypass(page) if bypass else None
+    try:
+        resp = await page.reload(wait_until=arguments.get("wait_until", "load"))
+    finally:
+        await _close_cache_bypass(cdp)
+    return f"reloaded {resp.status if resp else '?'} {page.url}{_cache_note(bypass, cdp)}"
 
 
 async def _tool_set_viewport(arguments: dict) -> str:
@@ -936,7 +982,7 @@ async def _tool_set_mode(arguments: dict) -> str:
                 pass
         msgs.append(f"reduced_motion: {rm} (aplicado a {len(pages)} tab(s) abiertas + las nuevas)")
 
-    # headed/headless: sí requiere teardown + relaunch.
+    # headed/headless: flag de LAUNCH → teardown + relaunch.
     if headed_arg is not None:
         headed = bool(headed_arg)
         if headed and not args.allow_headed:
@@ -953,8 +999,10 @@ async def _tool_set_mode(arguments: dict) -> str:
                 await _teardown_quiet_locked()
                 relaunch = True
         if relaunch:
-            await _ensure_page()  # relanza ya, en el nuevo modo (conserva reduced_motion)
-            msgs.append(f"modo: {'headed' if headed else 'headless'} (browser relanzado)")
+            await _ensure_page()  # relanza ya, en el nuevo modo (conserva reduced_motion + sesión)
+            sb = ("scrollbars ahora clásicos (~16px, agarrables)" if headed
+                  else "scrollbars vuelven a overlay/thin (no representativos)")
+            msgs.append(f"modo: {'headed' if headed else 'headless'} (browser relanzado; {sb})")
 
     return " | ".join(msgs)
 
@@ -1495,6 +1543,10 @@ async def _tool_click(arguments: dict) -> str:
     nth = int(arguments.get("nth", 0))
     timeout = int(arguments.get("timeout_ms", 5000))
     force = bool(arguments.get("force", False))
+    # position: offset {x,y} EN PÍXELES dentro del bounding box del elemento (esquina top-left
+    # = 0,0). Para clickear una coordenada precisa dentro del target: scrollbar, canvas, mapa,
+    # slider, etc. — donde el centro no sirve. Solo aplica al click por coordenada (no con force).
+    position = arguments.get("position")
     url0 = page.url
     loc = page.locator(selector).nth(nth)
     try:
@@ -1506,7 +1558,10 @@ async def _tool_click(arguments: dict) -> str:
             # entregaría el evento al canvas que está encima (falso "ok" sin disparar el handler).
             await loc.dispatch_event("click", timeout=timeout)
         else:
-            await loc.click(timeout=timeout)
+            click_kwargs = {"timeout": timeout}
+            if position and position.get("x") is not None and position.get("y") is not None:
+                click_kwargs["position"] = {"x": float(position["x"]), "y": float(position["y"])}
+            await loc.click(**click_kwargs)
     except Exception as e:
         first = str(e).strip().splitlines()[0]
         hint = ""
@@ -1694,6 +1749,157 @@ async def _tool_select_option(arguments: dict) -> str:
     return f"select_option ok: {selector}[{nth}] → seleccionado: {selected}"
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Primitivas de mouse de bajo nivel (trusted, vía page.mouse.*) — para lo que
+# click/fill no cubren: drag de scrollbars/sliders, drag-to-pan, drag&drop,
+# wheel real (path del compositor), hover desacoplado. Todas gateadas por
+# allow_interact (sintetizan input trusted que puede mutar estado).
+# ──────────────────────────────────────────────────────────────────────────
+async def _resolve_point(page, spec):
+    """spec → (x, y) en coords del viewport. spec puede ser:
+      - {"x": .., "y": ..}                  coordenada absoluta del viewport
+      - {"selector": .., "nth"?, "offset_x"?, "offset_y"?}
+        centro del bounding box del elemento (o esquina top-left + offset si se pasa).
+    Devuelve None si no se pudo resolver (selector sin match / sin box)."""
+    if not isinstance(spec, dict):
+        return None
+    if spec.get("x") is not None and spec.get("y") is not None:
+        return float(spec["x"]), float(spec["y"])
+    sel = spec.get("selector")
+    if not sel:
+        return None
+    nth = int(spec.get("nth", 0))
+    loc = page.locator(sel).nth(nth)
+    try:
+        await loc.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+    box = await loc.bounding_box()
+    if not box:
+        return None
+    ox, oy = spec.get("offset_x"), spec.get("offset_y")
+    x = box["x"] + (float(ox) if ox is not None else box["width"] / 2)
+    y = box["y"] + (float(oy) if oy is not None else box["height"] / 2)
+    return x, y
+
+
+async def _tool_mouse(arguments: dict) -> str:
+    if not args.allow_interact:
+        return _interact_forbidden("mouse")
+    page = await _ensure_page(arguments.get("tab"))
+    action = arguments.get("action")
+    if action not in ("down", "up", "move"):
+        return "mouse: 'action' debe ser 'down' | 'up' | 'move'"
+    button = arguments.get("button", "left")
+    x, y = arguments.get("x"), arguments.get("y")
+    has_xy = x is not None and y is not None
+    try:
+        if has_xy:
+            await page.mouse.move(float(x), float(y))
+        elif action == "move":
+            return "mouse move: pasá 'x' e 'y' (coords del viewport)"
+        if action == "down":
+            await page.mouse.down(button=button)
+        elif action == "up":
+            await page.mouse.up(button=button)
+    except Exception as e:
+        return f"(mouse {action} error: {e})"
+    pos = f" @ ({float(x):.0f},{float(y):.0f})" if has_xy else " (posición actual)"
+    return f"mouse {action}{pos} button={button} ok"
+
+
+async def _tool_drag(arguments: dict) -> str:
+    if not args.allow_interact:
+        return _interact_forbidden("drag")
+    page = await _ensure_page(arguments.get("tab"))
+    frm, to = arguments.get("from"), arguments.get("to")
+    if not frm or not to:
+        return ("drag: pasá 'from' y 'to' (cada uno {x,y} o {selector[,nth,offset_x,offset_y]}). "
+                "Para arrastrar el thumb de un scrollbar/slider usá selector+offset, o coords directas.")
+    p_from = await _resolve_point(page, frm)
+    if p_from is None:
+        return f"(drag: no pude resolver 'from' = {json.dumps(frm, ensure_ascii=False)})"
+    p_to = await _resolve_point(page, to)
+    if p_to is None:
+        return f"(drag: no pude resolver 'to' = {json.dumps(to, ensure_ascii=False)})"
+    steps = max(1, int(arguments.get("steps", 12)))
+    button = arguments.get("button", "left")
+    url0 = page.url
+    try:
+        await page.mouse.move(p_from[0], p_from[1])
+        await page.mouse.down(button=button)
+        await page.mouse.move(p_to[0], p_to[1], steps=steps)
+        await page.mouse.up(button=button)
+    except Exception as e:
+        try:
+            await page.mouse.up(button=button)  # no dejar el botón "pegado"
+        except Exception:
+            pass
+        return f"(drag error: {e})"
+    await _settle_nav(page, url0)
+    nav = f" → navegó: {page.url}" if page.url != url0 else ""
+    return (f"drag ok: ({p_from[0]:.0f},{p_from[1]:.0f}) → ({p_to[0]:.0f},{p_to[1]:.0f}) "
+            f"steps={steps} button={button}{nav}")
+
+
+async def _tool_scroll(arguments: dict) -> str:
+    if not args.allow_interact:
+        return _interact_forbidden("scroll")
+    page = await _ensure_page(arguments.get("tab"))
+    dx = float(arguments.get("delta_x", 0) or 0)
+    dy = float(arguments.get("delta_y", 0) or 0)
+    if dx == 0 and dy == 0:
+        return "scroll: pasá delta_x y/o delta_y en px (+y baja / -y sube, +x derecha / -x izquierda)"
+    # el wheel afecta al elemento BAJO el cursor → posicionarlo primero si se indicó dónde
+    # (selector o x,y). Sin eso, scrollea lo que esté bajo la última posición del mouse.
+    spec = None
+    if arguments.get("selector"):
+        spec = {"selector": arguments["selector"], "nth": arguments.get("nth", 0)}
+    elif arguments.get("x") is not None and arguments.get("y") is not None:
+        spec = {"x": arguments["x"], "y": arguments["y"]}
+    moved = ""
+    if spec is not None:
+        pt = await _resolve_point(page, spec)
+        if pt is None:
+            return f"(scroll: no pude resolver el punto {json.dumps(spec, ensure_ascii=False)})"
+        try:
+            await page.mouse.move(pt[0], pt[1])
+        except Exception as e:
+            return f"(scroll: no pude posicionar el mouse: {e})"
+        moved = f" sobre ({pt[0]:.0f},{pt[1]:.0f})"
+    try:
+        await page.mouse.wheel(dx, dy)
+        # el wheel real va por el compositor (async): el scroll se commitea en frames siguientes,
+        # no al volver de wheel(). Esperar 2 rAF para que la posición ya refleje el scroll cuando
+        # el agente mida justo después (sin esto, un read inmediato de scrollTop da el valor viejo).
+        await page.evaluate("()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))")
+    except Exception as e:
+        return f"(scroll error: {e})"
+    return f"scroll ok: wheel(dx={dx:.0f}, dy={dy:.0f}){moved}"
+
+
+async def _tool_hover(arguments: dict) -> str:
+    if not args.allow_interact:
+        return _interact_forbidden("hover")
+    page = await _ensure_page(arguments.get("tab"))
+    selector = arguments.get("selector")
+    x, y = arguments.get("x"), arguments.get("y")
+    try:
+        if selector:
+            nth = int(arguments.get("nth", 0))
+            timeout = int(arguments.get("timeout_ms", 5000))
+            force = bool(arguments.get("force", False))
+            loc = page.locator(selector).nth(nth)
+            await loc.hover(timeout=timeout, force=force)
+            return f"hover ok: {selector}[{nth}]" + _fmt_touch(await _touch_report(loc))
+        if x is not None and y is not None:
+            await page.mouse.move(float(x), float(y))
+            return f"hover ok @ ({float(x):.0f},{float(y):.0f})"
+        return "hover: pasá 'selector' (o 'x' e 'y')"
+    except Exception as e:
+        return f"(hover error: {e})"
+
+
 def _storage_path(arguments: dict) -> str:
     return os.path.expanduser(arguments.get("path") or os.path.join(_artifact_dir(), "storage-state.json"))
 
@@ -1754,6 +1960,10 @@ _DISPATCH = {
     "fill": _tool_fill,
     "type": _tool_type,
     "press": _tool_press,
+    "mouse": _tool_mouse,
+    "drag": _tool_drag,
+    "scroll": _tool_scroll,
+    "hover": _tool_hover,
     "evaluate": _tool_evaluate,
     "wait_for": _tool_wait_for,
     "set_input_files": _tool_set_input_files,
@@ -1794,10 +2004,11 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="goto",
-            description=f"Navega a una URL en {SERVER_LABEL}. URL relativa se resuelve contra --base-url si está; si no, pasá la URL completa. El browser arranca solo si no estaba activo.",
+            description=f"Navega a una URL en {SERVER_LABEL}. URL relativa se resuelve contra --base-url si está; si no, pasá la URL completa. El browser arranca solo si no estaba activo. `bypass_cache=true` fuerza fetch de red (ignora caché de disco+memoria) — úsalo tras reconstruir el frontend en apps SIN hashing de assets, para no validar el bundle viejo (chromium; en otros browsers se ignora con aviso).",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string", "description": "URL completa o ruta relativa a --base-url"},
                 "wait_until": {"type": "string", "enum": ["load", "domcontentloaded", "networkidle", "commit"], "default": "load"},
+                "bypass_cache": {"type": "boolean", "default": False, "description": "ignora la caché HTTP en esta navegación (hard-load, chromium)"},
                 **tab,
             }, "required": ["url"]},
         ),
@@ -1822,6 +2033,7 @@ async def list_tools() -> list[types.Tool]:
                 "selector": {"type": "string"},
                 "nth": {"type": "integer", "default": 0, "description": "índice si el selector matchea varios"},
                 "force": {"type": "boolean", "default": False, "description": "dispara el click a nivel DOM (dispatchEvent crudo) en vez de por coordenada — IDEAL para overlays decorativos (canvas/WebGL). OJO: NO sintetiza pointer events (handlers basados en pointerdown/mousedown pueden no correr) y NO hace hit-test, así que sobre un modal puede disparar el elemento de ATRÁS — ahí usá un selector más específico, no force"},
+                "position": {"type": "object", "description": "offset {x,y} EN PÍXELES dentro del bounding box del elemento (top-left=0,0) para clickear una coordenada precisa: scrollbar, canvas, mapa, slider — donde el centro no sirve. Ignorado con force=true", "properties": {"x": {"type": "number"}, "y": {"type": "number"}}},
                 "timeout_ms": {"type": "integer", "default": 5000},
                 **tab,
             }, "required": ["selector"]},
@@ -1866,8 +2078,56 @@ async def list_tools() -> list[types.Tool]:
             }, "required": ["key"]},
         ),
         types.Tool(
+            name="mouse",
+            description="Primitiva de mouse de BAJO NIVEL (trusted, vía page.mouse): 'down' | 'up' | 'move'. Para construir gestos a mano cuando drag no alcanza (down → varios move → up). Con x,y mueve a esa coord del viewport antes de la acción; sin x,y usa la posición actual (útil para down/up). 'button': left|middle|right. Para un arrastre simple preferí `drag`. Requiere allow_interact.",
+            inputSchema={"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["down", "up", "move"]},
+                "x": {"type": "number", "description": "coord X del viewport (opcional para down/up; requerido para move)"},
+                "y": {"type": "number", "description": "coord Y del viewport"},
+                "button": {"type": "string", "enum": ["left", "middle", "right"], "default": "left"},
+                **tab,
+            }, "required": ["action"]},
+        ),
+        types.Tool(
+            name="drag",
+            description="Arrastre TRUSTED por coordenadas (down→move→up real, lo que dispatchEvent sintético NO logra): arrastrar el thumb de un scrollbar/slider, drag-to-pan, drag&drop, handles de resize, selección por arrastre. `from` y `to` son cada uno {x,y} (coord viewport) o {selector,nth,offset_x,offset_y} (centro del elemento, o esquina+offset). `steps` = pasos intermedios del move (más = más suave/realista). Reporta si navegó. Requiere allow_interact.",
+            inputSchema={"type": "object", "properties": {
+                "from": {"type": "object", "description": "origen: {x,y} o {selector[,nth,offset_x,offset_y]}", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "selector": {"type": "string"}, "nth": {"type": "integer"}, "offset_x": {"type": "number"}, "offset_y": {"type": "number"}}},
+                "to": {"type": "object", "description": "destino: {x,y} o {selector[,nth,offset_x,offset_y]}", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "selector": {"type": "string"}, "nth": {"type": "integer"}, "offset_x": {"type": "number"}, "offset_y": {"type": "number"}}},
+                "steps": {"type": "integer", "default": 12, "description": "pasos intermedios del movimiento (suavidad/realismo)"},
+                "button": {"type": "string", "enum": ["left", "middle", "right"], "default": "left"},
+                **tab,
+            }, "required": ["from", "to"]},
+        ),
+        types.Tool(
+            name="scroll",
+            description="Scroll por RUEDA trusted (page.mouse.wheel — ejercita el path del compositor: passive listeners, inertia, scroll horizontal por rueda) en vez del WheelEvent sintético. delta_y +baja/-sube, delta_x +derecha/-izquierda (px). Con `selector` o `x,y` posiciona el cursor sobre ese elemento ANTES (el wheel afecta lo que esté bajo el cursor) — clave para scrollear un contenedor interno y no el body. Requiere allow_interact.",
+            inputSchema={"type": "object", "properties": {
+                "delta_y": {"type": "number", "default": 0, "description": "px verticales (+ baja, - sube)"},
+                "delta_x": {"type": "number", "default": 0, "description": "px horizontales (+ derecha, - izquierda)"},
+                "selector": {"type": "string", "description": "posiciona el cursor sobre este elemento antes del wheel (scrollea ESE contenedor)"},
+                "nth": {"type": "integer", "default": 0},
+                "x": {"type": "number", "description": "alternativa a selector: coord X del viewport donde posar el cursor"},
+                "y": {"type": "number", "description": "coord Y del viewport"},
+                **tab,
+            }},
+        ),
+        types.Tool(
+            name="hover",
+            description="Posa el mouse sobre un elemento o coordenada (mousemove trusted) para validar comportamientos hover-only (auto-scroll de un nombre, tooltip, menú, número de un dot) — desacoplado de la medición de animación (para eso está interaction_animation). Con `selector` (CSS/text/role/:has-text) hace hover sobre el elemento; con `x,y` mueve a esa coord del viewport. Requiere allow_interact.",
+            inputSchema={"type": "object", "properties": {
+                "selector": {"type": "string"},
+                "nth": {"type": "integer", "default": 0},
+                "x": {"type": "number", "description": "alternativa a selector: coord X del viewport"},
+                "y": {"type": "number", "description": "coord Y del viewport"},
+                "force": {"type": "boolean", "default": False, "description": "con selector: salta el actionability check"},
+                "timeout_ms": {"type": "integer", "default": 5000},
+                **tab,
+            }},
+        ),
+        types.Tool(
             name="evaluate",
-            description="Ejecuta JS arbitrario en la page y devuelve el resultado (JSON, capado a max_len). Escape hatch para lo que click/fill no cubren: leer estado del DOM/storage, disparar handlers, o SEMBRAR auth y saltar el login. Patrones de seed (según cómo guarda el SPA): (a) clave plana → evaluate(\"(t)=>localStorage.setItem('token',t)\", arg=\"<jwt>\"); (b) Zustand/Redux-persist (objeto JSON bajo UNA clave) → evaluate(\"(s)=>localStorage.setItem('auth',JSON.stringify(s))\", arg={state:{accessToken:'...',refreshToken:'...',user:{}},version:0}); (c) login programático → función async que hace fetch a tu endpoint y siembra el resultado. Tras sembrar, hacé goto/reload. `expression` = expresión JS o función flecha; `arg` (JSON) opcional se pasa a la función (evita interpolar secretos en el string). Para REUSAR la sesión entre llamadas/arranques usá save_storage_state/load_storage_state (el server además persiste la sesión en memoria entre recreaciones de context). Requiere allow_interact.",
+            description="Ejecuta JS arbitrario en la page y devuelve el resultado (JSON, capado a max_len). Escape hatch para lo que click/fill no cubren: leer estado del DOM/storage, disparar handlers, o SEMBRAR auth y saltar el login. Patrones de seed (según cómo guarda el SPA): (a) clave plana → evaluate(\"(t)=>localStorage.setItem('token',t)\", arg=\"<jwt>\"); (b) Zustand/Redux-persist (objeto JSON bajo UNA clave) → evaluate(\"(s)=>localStorage.setItem('auth',JSON.stringify(s))\", arg={state:{accessToken:'...',refreshToken:'...',user:{}},version:0}); (c) login programático → función async que hace fetch a tu endpoint y siembra el resultado. Tras sembrar, hacé goto/reload. `expression` = expresión JS o función flecha; `arg` (JSON) opcional se pasa a la función (evita interpolar secretos en el string). CONTRATO de `arg`: llega a tu función TAL CUAL lo mandás deserializado — si mandás un objeto, recibís un objeto (NO lo re-stringifiques con JSON.stringify dentro; si mandás un string, recibís un string). Para sembrar storage que espera un string defendé con `const v = (typeof s === 'string') ? s : JSON.stringify(s)` y evitás el doble-encode. Para REUSAR la sesión entre llamadas/arranques usá save_storage_state/load_storage_state (el server además persiste la sesión en memoria entre recreaciones de context). Requiere allow_interact.",
             inputSchema={"type": "object", "properties": {
                 "expression": {"type": "string", "description": "expresión JS ('location.href') o función flecha ('()=>({k:localStorage.getItem(\"k\")})')"},
                 "arg": {"description": "argumento JSON-serializable pasado a la función (opcional)"},
@@ -1912,9 +2172,10 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="reload",
-            description="Recarga la page activa (o la tab indicada).",
+            description="Recarga la page activa (o la tab indicada). `bypass_cache=true` = hard-reload (ignora caché de disco+memoria; chromium) — para revalidar tras rebuild del frontend sin comerte el bundle cacheado.",
             inputSchema={"type": "object", "properties": {
                 "wait_until": {"type": "string", "enum": ["load", "domcontentloaded", "networkidle", "commit"], "default": "load"},
+                "bypass_cache": {"type": "boolean", "default": False, "description": "hard-reload ignorando caché HTTP (chromium)"},
                 **tab,
             }},
         ),
@@ -1927,9 +2188,9 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="set_mode",
-            description="Ajusta modo de runtime: 'headed' (headless↔headed, teardown+relaunch; gobernado por allow_headed) y/o 'reduced_motion' (emula prefers-reduced-motion sin relanzar — valida la rama useReducedMotion/reduced-motion del DS: en 'reduce' las animaciones gateadas quedan estáticas; matchMedia y entrance_animation_check lo reflejan). Pasá al menos uno; ambos opcionales. reduced_motion persiste a las tabs nuevas y a un relaunch por cambio de headed.",
+            description="Ajusta modo de runtime: 'headed' (headless↔headed, teardown+relaunch; gobernado por allow_headed) y/o 'reduced_motion' (emula prefers-reduced-motion sin relanzar — valida la rama useReducedMotion/reduced-motion del DS: en 'reduce' las animaciones gateadas quedan estáticas; matchMedia y entrance_animation_check lo reflejan). SCROLLBARS: el chromium headless NO renderiza scrollbars clásicos (da ~2px thin y NO honra ::-webkit-scrollbar) → offsetWidth-clientWidth no representa lo que ve el usuario. Para auditar usabilidad de scroll/scrollbars (ancho real, thumb agarrable) activá headed=true: ahí el scrollbar es clásico (~16px, reserva espacio). Requiere display (WSLg en WSL). Pasá al menos uno; ambos opcionales. reduced_motion y la sesión persisten al relaunch por headed.",
             inputSchema={"type": "object", "properties": {
-                "headed": {"type": "boolean", "description": "true=ventana visible (WSLg), false=headless"},
+                "headed": {"type": "boolean", "description": "true=ventana visible (WSLg) — también habilita scrollbars clásicos (~16px) para auditarlos; false=headless (scrollbars thin/overlay no representativos)"},
                 "reduced_motion": {"type": "string", "enum": ["reduce", "no-preference"], "description": "emula la media query prefers-reduced-motion ('reduce' = usuario pidió menos movimiento)"},
             }},
         ),
@@ -2089,7 +2350,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="screenshot",
-            description="Captura PNG. return='path' (default) guarda en --artifact-dir y devuelve la ruta + las dimensiones REALES de la imagen (token-cheap, cliente local); return='inline' devuelve la imagen base64 por el protocolo (cliente remoto sin disco). Con `selector` recorta a ese elemento (scroll-into-view + bounding box); OJO: un ancestro con overflow (tabla en un div scrollable) puede clipear el contenido — para capturar todo usá full_page=true o apuntá el selector al contenedor scrollable. Las dims reportadas (≈viewport ⇒ probablemente recortó) ayudan a detectarlo.",
+            description="Captura PNG. return='path' (default) guarda en --artifact-dir y devuelve la ruta + las dimensiones REALES de la imagen (token-cheap, cliente local); return='inline' devuelve la imagen base64 por el protocolo (cliente remoto sin disco). Con `selector` recorta a ese elemento (scroll-into-view + bounding box); OJO: un ancestro con overflow (tabla en un div scrollable) puede clipear el contenido — para capturar todo usá full_page=true o apuntá el selector al contenedor scrollable. Las dims reportadas (≈viewport ⇒ probablemente recortó) ayudan a detectarlo. NOTA scrollbars: en headless el scrollbar sale thin/overlay (casi no se ve, no representa al usuario real); para captar/auditar el scrollbar clásico usá set_mode(headed=true).",
             inputSchema={"type": "object", "properties": {
                 "selector": {"type": "string", "description": "recorta a un elemento (opcional)"},
                 "full_page": {"type": "boolean", "default": False},

@@ -25,14 +25,18 @@ encaja con gcloud/postgres/ssh/redis.
 | Grupo | Tool | Uso |
 |---|---|---|
 | Sesión | `status` | Estado (running, tabs, url, modo). Barato: **no** arranca el browser. |
-| Sesión | `goto` | Navega a una URL (relativa a `--base-url` o completa). Arranca el browser solo. |
-| Sesión | `reload`, `set_viewport` | Recargar / cambiar viewport. |
+| Sesión | `goto` | Navega a una URL (relativa a `--base-url` o completa). Arranca el browser solo. **`bypass_cache=true`** fuerza fetch de red (hard-load) — tras rebuild del frontend en apps sin hashing de assets. |
+| Sesión | `reload`, `set_viewport` | Recargar (`bypass_cache=true` = hard-reload, ignora caché) / cambiar viewport. |
 | Sesión | `save_storage_state`, `load_storage_state` | Persisten/cargan la sesión (cookies+localStorage) a disco para reusarla entre llamadas/arranques → saltar el login. No mutan (sin gate). El server además persiste la sesión en memoria entre recreaciones de context. |
-| Sesión | `set_mode` | `headed` (headless↔headed en runtime, gate `allow_headed`) y/o `reduced_motion` (`reduce`\|`no-preference`, emula prefers-reduced-motion sin relanzar — valida la rama `useReducedMotion` del DS). |
-| **Interacción** | `click` | Click en un elemento (botón Entrar/Generar/Aplicar/Aprobar). Selector CSS/`text=`/`role=`; `nth` desambigua. Reporta si navegó (URL+title) o cambió estado. **`force=true`** dispara el click a nivel DOM (dispatchEvent) para targets tapados por un overlay/canvas WebGL (ver gotcha abajo). |
+| Sesión | `set_mode` | `headed` (headless↔headed en runtime, gate `allow_headed`) y/o `reduced_motion` (`reduce`\|`no-preference`, emula prefers-reduced-motion sin relanzar — valida la rama `useReducedMotion` del DS). **headed también habilita scrollbars clásicos** (headless da thin/overlay no representativo — ver sección scrollbars). |
+| **Interacción** | `click` | Click en un elemento (botón Entrar/Generar/Aplicar/Aprobar). Selector CSS/`text=`/`role=`; `nth` desambigua. Reporta si navegó (URL+title) o cambió estado. **`force=true`** dispara el click a nivel DOM (dispatchEvent) para targets tapados por un overlay/canvas WebGL (ver gotcha abajo). **`position={x,y}`** clickea un offset (px) dentro del elemento (scrollbar/canvas/mapa/slider). |
 | **Interacción** | `fill` | Escribe en un input/textarea (usuario/contraseña/intent/body). Limpia+setea+dispara `input` (React lo capta). **No hace eco del valor** (secreto): solo longitud. |
 | **Interacción** | `type` | Teclea tecla-a-tecla (keydown/keyup reales) — para inputs que ignoran `fill` (máscaras, handlers por tecla). `clear`+`delay_ms`. Preferí `fill` salvo que no dispare el framework. |
 | **Interacción** | `press` | Pulsa tecla/combo (`Enter` para submit, `Escape`, `Control+a`, `Tab`). Con `selector` la enfoca; sin él va al foco actual. |
+| **Interacción** | `mouse` | Primitiva de bajo nivel **trusted**: `down`/`move`/`up` por coordenada del viewport (`button` L/M/R). Para construir gestos a mano cuando `drag` no alcanza. |
+| **Interacción** | `drag` | Arrastre **trusted** `from`→`to` (cada uno `{x,y}` o `{selector,nth,offset_x,offset_y}`): thumb de scrollbar/slider, drag-to-pan, drag&drop, resize-handles. `steps` = suavidad. Lo que `dispatchEvent` sintético **no** logra. |
+| **Interacción** | `scroll` | Scroll por **rueda trusted** (`page.mouse.wheel`, path del compositor: passive listeners/inertia/scroll-horizontal). `delta_x`/`delta_y`; `selector`/`x,y` posa el cursor sobre el contenedor a scrollear. Settle de 2 rAF → al volver, `scrollTop` ya refleja. |
+| **Interacción** | `hover` | `mousemove` **trusted** sobre selector o `x,y` para validar comportamientos hover-only (auto-scroll de nombre, tooltip, menú). Desacoplado de la medición de animación. |
 | **Interacción** | `select_option` | Elige opción de un `<select>` nativo por value/label/index. Dropdown custom (divs) → `click` para abrir + `click` la opción. |
 | **Interacción** | `set_input_files` | Sube archivo(s) a un `<input type=file>` (Adjuntar/subir), sin abrir el picker del SO. Valida que las rutas existan. |
 | **Interacción** | `evaluate` | Ejecuta JS arbitrario y devuelve el resultado (JSON, capado). Escape hatch: **sembrar un token y saltar el login** en test, leer storage/DOM, disparar handlers. `arg` JSON opcional → función (no interpola secretos). |
@@ -65,13 +69,17 @@ punta a punta — pasar el login y recorrer crear → previsualizar → aplicar 
 
 | Tool | Firma | Notas |
 |---|---|---|
-| `click` | `click(selector, nth?, force?, timeout_ms?)` | auto-wait; reporta navegación (espera la async con poll + early-exit). `force=true` → click DOM (overlays). |
+| `click` | `click(selector, nth?, force?, position?, timeout_ms?)` | auto-wait; reporta navegación (espera la async con poll + early-exit). `force=true` → click DOM (overlays). `position={x,y}` → offset px dentro del elemento (ignorado con `force`). |
 | `fill` | `fill(selector, value, nth?, force?)` | clear+set+`input` event. Solo loguea longitud (secretos). Alias de `value`: `text`. |
 | `type` | `type(selector, text, clear?, delay_ms?)` | tecla-a-tecla; fallback de `fill`. Alias de `text`: `value`. |
 | `press` | `press(key, selector?, nth?, force?)` | `Enter`/`Escape`/combos; selector opcional. |
+| `mouse` | `mouse(action, x?, y?, button?)` | `down`/`move`/`up` trusted por coord viewport. Gestos a mano (down→move…→up). |
+| `drag` | `drag(from, to, steps?, button?)` | `from`/`to` = `{x,y}` o `{selector,nth,offset_x,offset_y}`. Arrastre trusted real (scrollbar/slider/pan/dnd). Reporta navegación. |
+| `scroll` | `scroll(delta_x?, delta_y?, selector?\|x,y?, nth?)` | wheel trusted; posa el cursor sobre `selector`/`x,y` antes (scrollea ESE contenedor). Settle 2 rAF. |
+| `hover` | `hover(selector?\|x,y?, nth?, force?)` | `mousemove` trusted; valida hover-only sin medir animación. |
 | `select_option` | `select_option(selector, value?, label?, index?)` | solo `<select>` nativo. |
 | `set_input_files` | `set_input_files(selector, files)` | sube a `<input type=file>`; valida rutas. |
-| `evaluate` | `evaluate(expression, arg?, max_len?)` | JS arbitrario; `arg` JSON → función. |
+| `evaluate` | `evaluate(expression, arg?, max_len?)` | JS arbitrario; `arg` JSON → función. **Contrato `arg`**: llega tal cual deserializado (objeto→objeto; string→string). NO re-`JSON.stringify` un string; para sembrar storage defendé con `typeof s==='string'?s:JSON.stringify(s)`. |
 | `wait_for` | `wait_for(selector, state?, nth?)` | sincroniza pasos; **no muta** (sin gate). |
 
 **Gate `allow_interact`** (default `true`, patrón del `allow_headed`): registrá con
@@ -152,6 +160,21 @@ runtime con `set_mode(headed=true/false)` (hace teardown + relaunch). El gate es
 capacidad `allow_headed` (default `true`): si la ponés en `false` (ej. server sin
 display), `set_mode(headed=true)` se rechaza. **Patrón idéntico al `allow_flush` de
 redis.** En esta máquina hay WSLg, así que headed abre ventana real.
+
+## Scrollbars: headless NO es representativo
+
+El Chromium **headless no renderiza scrollbars clásicos**: da una barra *thin/overlay* de
+~2px que **no reserva espacio** y **no honra `::-webkit-scrollbar`** (verificado en Chromium
+131: `offsetWidth - clientWidth` da ~2px aunque el CSS pida `width:14px`; ningún flag headless
+lo cambia — probados `--disable-features=OverlayScrollbar[s]`, `FluentOverlayScrollbar`,
+`--headless=old`, etc.). Esto produce **falsos negativos** al auditar usabilidad de scroll:
+un scrollbar "imposible de agarrar" se ve como inexistente, y medir su ancho/thumb engaña.
+
+**Para auditar scroll/scrollbars usá `set_mode(headed=true)`**: ahí el scrollbar es clásico
+(~16px, reserva espacio, agarrable) = lo que ve el usuario real. Requiere display (WSLg en
+WSL). `status()` lo refleja: `scrollbars=classic` (headed) vs `scrollbars=overlay(no-repr)`
+(headless). El scroll *funcional* sí anda en headless (`scroll`/`measure_fps` scrollean bien);
+lo que no es fiable es la **geometría/apariencia** del scrollbar.
 
 ## prefers-reduced-motion (a11y)
 
@@ -284,3 +307,14 @@ set_mode(headed=true)                   # (opcional) ver a ojo con ventana real 
 
 **`Input validation error: 'text'/'value' is a required property` en fill/type**
 → Resuelto: ambas aceptan los dos nombres (`fill` canónico `value`, `type` canónico `text`, cada una acepta el otro como alias). Requiere webprobe ≥ v0.5.0 — si persiste, el proceso MCP quedó stale (mirá `status()`): reiniciá la ventana de VSCode.
+
+**No puedo arrastrar (scrollbar/slider/pan/drag&drop) ni clickear una coordenada precisa**
+→ Resuelto en **v0.5.1**: `drag(from,to)` + `mouse(down/move/up)` (eventos trusted, lo que `dispatchEvent` sintético no logra) y `click(position={x,y})` (offset px dentro del elemento). Para scroll por rueda real: `scroll(delta_y=…, selector=…)`. Para hover-only: `hover(…)`.
+
+**Validé el bundle viejo tras reconstruir el frontend**
+→ Resuelto en **v0.5.1**: `goto(url, bypass_cache=true)` / `reload(bypass_cache=true)` fuerzan fetch de red ignorando caché (chromium).
+
+**El scrollbar "no existe" / `offsetWidth-clientWidth` da ~0 en headless**
+→ No es la app: el headless no renderiza scrollbars clásicos (ver sección *Scrollbars*). Usá `set_mode(headed=true)` para auditarlos. (Documentado en v0.5.1.)
+
+> **Recordá:** un MCP es de vida larga — editar `server.py` **no** recarga el proceso vivo. Tras actualizar a v0.5.1, reiniciá la ventana de VSCode (o el cliente) y confirmá con `status()` que dice `v0.5.1`.
