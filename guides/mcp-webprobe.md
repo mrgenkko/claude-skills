@@ -17,15 +17,15 @@ El oficial hace navegar/click/snapshot muy bien, pero (a) no mide animaciones/pe
 (b) en sesiones largas acumula accessibility-snapshots verbosos que queman contexto.
 `webprobe` devuelve **veredictos numéricos compactos** (`smooth|degraded|janky`,
 `slow`, `no_entrance_animation`) en vez de volcar el DOM, y reimplementar
-navegar/click es trivial para el scope (tus landings en chromium). Es "lo nuestro" y
-encaja con gcloud/postgres/ssh/redis.
+navegar/click es trivial para el scope (tus landings, en chromium/firefox/webkit). Es
+"lo nuestro" y encaja con gcloud/postgres/ssh/redis.
 
 ## Tools que expone
 
 | Grupo | Tool | Uso |
 |---|---|---|
-| Sesión | `status` | Estado (running, tabs, url, modo). Barato: **no** arranca el browser. |
-| Sesión | `goto` | Navega a una URL (relativa a `--base-url` o completa). Arranca el browser solo. **`bypass_cache=true`** fuerza fetch de red (hard-load) — tras rebuild del frontend en apps sin hashing de assets. |
+| Sesión | `status` | Estado (running, **qué motores están vivos**, tabs con su motor, url, modo). Barato: **no** arranca el browser. |
+| Sesión | `goto` | Navega a una URL (relativa a `--base-url` o completa). Arranca el browser solo. **`browser`** elige el motor (`chromium`\|`firefox`\|`webkit`) — los 3 conviven a la vez sin pisarse (ver sección Multi-navegador). **`bypass_cache=true`** fuerza fetch de red (hard-load) — tras rebuild del frontend en apps sin hashing de assets. |
 | Sesión | `reload`, `set_viewport` | Recargar (`bypass_cache=true` = hard-reload, ignora caché) / cambiar viewport. |
 | Sesión | `save_storage_state`, `load_storage_state` | Persisten/cargan la sesión (cookies+localStorage) a disco para reusarla entre llamadas/arranques → saltar el login. No mutan (sin gate). El server además persiste la sesión en memoria entre recreaciones de context. |
 | Sesión | `set_mode` | `headed` (headless↔headed en runtime, gate `allow_headed`) y/o `reduced_motion` (`reduce`\|`no-preference`, emula prefers-reduced-motion sin relanzar — valida la rama `useReducedMotion` del DS). **headed también habilita scrollbars clásicos** (headless da thin/overlay no representativo — ver sección scrollbars). |
@@ -41,8 +41,8 @@ encaja con gcloud/postgres/ssh/redis.
 | **Interacción** | `set_input_files` | Sube archivo(s) a un `<input type=file>` (Adjuntar/subir), sin abrir el picker del SO. Valida que las rutas existan. |
 | **Interacción** | `evaluate` | Ejecuta JS arbitrario y devuelve el resultado (JSON, capado). Escape hatch: **sembrar un token y saltar el login** en test, leer storage/DOM, disparar handlers. `arg` JSON opcional → función (no interpola secretos). |
 | **Sync** | `wait_for` | Espera que un selector llegue a `visible`/`hidden`/`attached`/`detached` — sincroniza pasos del flujo (tras Aplicar, esperar el toast / que el spinner desaparezca). No muta (no requiere `allow_interact`). |
-| Pestañas | `open_tab`, `list_tabs`, `switch_tab`, `close_tab` | Multi-pestaña (comparar variantes lado a lado). |
-| Pestañas | `close_browser` | Cierra todo y libera RAM. |
+| Pestañas | `open_tab`, `list_tabs`, `switch_tab`, `close_tab` | Multi-pestaña (comparar variantes lado a lado). `open_tab` acepta **`browser`** (abre la tab en ese motor); `list_tabs` muestra el motor de cada tab. |
+| Pestañas | `close_browser` | Cierra navegadores y libera RAM. Sin args cierra **todos** los motores vivos; con **`browser`** cierra solo ese (conserva su sesión para relanzar sin re-login). |
 | Inspección | `inspect_buttons` | **Resumen** de un DS: `{total, warns, signatures[], offenders[]}` — agrupa botones idénticos por firma (NO devuelve 153 clones), detalla solo los ofensores (motion+transform o `transition:all` con duración >0). `include_all` para el array completo. |
 | Inspección | `query`, `get_computed_style`, `outer_html` | Props clave de un selector / estilos computados acotados / outerHTML sin truncar (depurar qué clase ganó). |
 | **Audit** | `audit_motion_transform` | Design system: marca nodos Motion cuyo CSS transiciona `transform`/`all` con duración >0 (el CSS pelea con la animación de Motion). |
@@ -153,6 +153,40 @@ autenticar, y `load_storage_state(path?)` + `goto` para reusarla.
    cerrar, el reaper limpia. Al cerrar Claude Code, el proceso muere y se lleva el
    Chromium — nunca queda huérfano. Cualquier timeout en `0` desactiva esa capa.
 
+## Multi-navegador (chromium + firefox + webkit a la vez)
+
+**Una sola instancia del MCP maneja los 3 motores vivos en paralelo** (desde v0.5.2). No
+hace falta registrar `webprobe-firefox` aparte: el agente elige el motor con el parámetro
+`browser` (`chromium`\|`firefox`\|`webkit`) en `goto`/`open_tab`. **Cada tab recuerda su
+motor** y conviven sin pisarse — sirve para comparar el mismo flujo entre navegadores
+(Blink vs Gecko vs WebKit/Safari):
+
+```
+goto(url, browser="chromium")    → t1 (chromium)
+goto(url, browser="firefox")     → t2 (firefox)   # NO pisa t1
+measure_fps(tab="t1")            # mide chromium
+measure_fps(tab="t2")            # mide firefox
+status()                         # browsers_live=chromium+firefox
+close_browser(browser="firefox") # cierra solo firefox; chromium sigue
+```
+
+Detalles del modelo:
+- **`default_engine`** = el `--browser` de lanzamiento (default `chromium`). Un `goto` **sin**
+  `browser` usa la tab activa (cualquier motor) o abre una en el default.
+- **Sesión por motor**: el `storage_state` (cookies+localStorage) es independiente por
+  navegador — un login en chromium no autentica firefox. `save_storage_state`/`load_storage_state`
+  y `close_browser` aceptan `browser` para apuntar a un motor concreto.
+- **headed aplica a todos**: `set_mode(headed=true)` relanza headed cada motor vivo.
+- **Reaper**: un motor que se queda sin tabs se cierra solo (libera RAM, conserva su sesión);
+  el browser-idle global cierra todo.
+- **Compatibilidad**: las instancias ya registradas (`--browser=chromium`) siguen igual; el
+  multi-browser es aditivo (el `--browser` pasa a ser solo el motor por defecto).
+
+> **WebKit necesita libs del SO** (la primera vez): `sudo <venv>/playwright install-deps webkit`
+> (libwoff1, libgstreamer*, libavif, libenchant, libsecret, libmanette). Sin ellas, `goto(...,
+> browser="webkit")` devuelve un mensaje claro pidiendo ese comando. Chromium y Firefox ya
+> funcionan sin paso extra.
+
 ## headless vs headed
 
 `headless` en `secrets.json` es solo el **modo de arranque**. El agente lo cambia en
@@ -218,14 +252,30 @@ el protocolo y sirve si exponés el MCP por HTTP a otra máquina sin disco.
 `artifact_dir`/`artifact_ttl`/`max_artifacts`. La URL la pasa el agente en `goto`, así
 que una sola instancia genérica `webprobe` sirve para todos los proyectos.
 
+## Requisitos
+
+- **venv del repo** (`~/Mrgenkko Skills/.venv`) con `playwright==1.49.0`.
+- **Motores de Playwright** en `~/.cache/ms-playwright/`: `chromium`, `firefox`, `webkit` (los baja el instalador).
+- **Librerías del SO** (vía `sudo`): chromium/firefox suelen traerlas; **WebKit casi siempre las
+  necesita** (`libwoff1`, `libgstreamer*`, `libavif`, `libenchant`, `libsecret`, `libmanette`).
+  Instalalas una vez con `sudo "<venv>/bin/playwright" install-deps webkit` (o `install-deps` para
+  los 3). Sin ellas, `goto(..., browser="webkit")` devuelve el comando exacto como aviso.
+- **Display para headed**: `set_mode(headed=true)` y los motores no-headless requieren un display
+  (en WSL lo provee **WSLg** — esta máquina ya lo tiene: `DISPLAY=:0`).
+
 ## Instalación
 
 ```bash
 bash "/home/melquiades/Mrgenkko Skills/scripts/install-webprobe-mcp.sh"
 # → pip install playwright==1.49.0 en el venv del repo
-# → playwright install chromium (casi no-op: ya cacheado en ~/.cache/ms-playwright)
+# → playwright install chromium firefox webkit (los 3 motores, en ~/.cache/ms-playwright)
+# → playwright install-deps (libs del SO; requiere sudo — si no hay, avisa el comando para webkit)
 # → copia server.py a ~/.claude/mcp-servers/webprobe/
 ```
+
+> El MCP es de vida larga: editar `server.py` **no** recarga el proceso vivo. Tras actualizar
+> (p. ej. al multi-browser v0.5.2), **recargá la ventana de VSCode** para que las instancias ya
+> registradas tomen el server nuevo. `status()` muestra la versión para detectar si quedó stale.
 
 ## Registrar en un proyecto
 

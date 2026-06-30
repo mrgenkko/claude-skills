@@ -60,33 +60,58 @@ SERVER_LABEL = args.name or "webprobe"
 # Bump en cada cambio de comportamiento. El agente lo ve en status() para saber si el
 # proceso MCP está stale (un MCP es de vida larga; editar server.py NO recarga el proceso
 # vivo — hay que reiniciar Claude Code / recargar la ventana de VSCode).
-WEBPROBE_VERSION = "0.5.1"
+WEBPROBE_VERSION = "0.5.2"
 app = Server(f"webprobe-{SERVER_LABEL}")
 
 
 # ──────────────────────────────────────────────────────────────────────────
 # Estado singleton + helpers de ciclo de vida
 # ──────────────────────────────────────────────────────────────────────────
+_VALID_ENGINES = ("chromium", "firefox", "webkit")
+
+
 class _State:
-    pw = None
-    browser = None
-    context = None
-    tabs: dict = {}          # tab_id -> {"page": Page, "label": str, "last_used": float}
-    active = None            # tab_id activo
+    pw = None                # un solo Playwright driver, compartido por los 3 engines
+    # engines vivos EN PARALELO: engine -> {"browser": Browser, "context": BrowserContext,
+    # "storage_state": dict|None}. El agente elige el engine por tab (param `browser` en
+    # goto/open_tab); cada tab recuerda el suyo. storage_state es POR engine (las cookies de
+    # chromium no son las de firefox) y sobrevive a una recreación del context (browser-idle,
+    # crash, set_mode) → restaura la sesión sin re-login. Las entradas persisten aunque se
+    # apague el browser (guardan el storage_state); solo browser/context se nulean.
+    engines: dict = {}
+    tabs: dict = {}          # tab_id -> {"page": Page, "label": str, "last_used": float, "engine": str}
+    active = None            # tab_id activo (global, cualquier engine)
     last_activity = 0.0      # time.monotonic() del último tool call
     headless_current = args.headless
     reduced_motion_current = args.reduced_motion   # None | "reduce" | "no-preference" (override runtime)
     tab_counter = 0
     artifact_counter = 0
-    # snapshot de cookies+localStorage del último context vivo. Sobrevive a una recreación
-    # del context (browser-idle, crash del chromium, set_mode) → restaura la sesión sin
-    # forzar re-login. El localStorage vive en el BrowserContext, no en la tab: si el context
-    # se recrea (no solo la page), se pierde sin esto.
-    storage_state = None
+    default_engine = args.browser if args.browser in _VALID_ENGINES else "chromium"  # engine de una tab sin `browser` explícito
 
 
 _state = _State()
 _lock = asyncio.Lock()
+
+
+def _norm_engine(name) -> str:
+    e = name or _state.default_engine
+    return e if e in _VALID_ENGINES else _state.default_engine
+
+
+def _engine_entry(engine: str) -> dict:
+    """Devuelve (creando si falta) la entrada del engine. La entrada persiste el storage_state
+    aunque browser/context estén apagados."""
+    e = _state.engines.get(engine)
+    if e is None:
+        e = {"browser": None, "context": None, "storage_state": None}
+        _state.engines[engine] = e
+    return e
+
+
+def _active_engine() -> str:
+    """Engine de la tab activa, o el default si no hay tab activa."""
+    info = _state.tabs.get(_state.active) if _state.active else None
+    return info["engine"] if info else _state.default_engine
 
 
 def _resolve_url(url: str) -> str:
@@ -129,61 +154,90 @@ def _new_tab_id() -> str:
     return f"t{_state.tab_counter}"
 
 
-async def _browser_alive() -> bool:
-    return (
-        _state.browser is not None
-        and _state.browser.is_connected()
-        and _state.context is not None
+def _engine_alive(engine: str) -> bool:
+    e = _state.engines.get(engine)
+    return bool(
+        e is not None
+        and e["browser"] is not None
+        and e["browser"].is_connected()
+        and e["context"] is not None
     )
 
 
-async def _capture_storage_locked():
-    """Snapshot del storage_state (cookies+localStorage) del context vivo, para restaurarlo
-    si el context se recrea. Tragar errores: si el context ya murió (crash), conservamos el
-    último snapshot bueno. Llamar bajo _lock."""
-    if _state.context is None:
+def _any_alive() -> bool:
+    return any(_engine_alive(e) for e in _state.engines)
+
+
+async def _capture_storage_engine_locked(engine: str):
+    """Snapshot del storage_state (cookies+localStorage) del context vivo de un engine, para
+    restaurarlo si el context se recrea. Tragar errores: si el context ya murió (crash),
+    conservamos el último snapshot bueno. Llamar bajo _lock."""
+    e = _state.engines.get(engine)
+    if e is None or e["context"] is None:
         return
     try:
-        _state.storage_state = await _state.context.storage_state()
+        e["storage_state"] = await e["context"].storage_state()
     except Exception:
         pass
+
+
+async def _teardown_engine_locked(engine: str):
+    """Cierra el browser+context de UN engine tragando errores; conserva su storage_state y
+    descarta sus tabs. La entrada del engine persiste (solo browser/context se nulean)."""
+    e = _state.engines.get(engine)
+    if e is None:
+        return
+    # last-chance: preservar la sesión de este engine antes de cerrar (idle/set_mode/close).
+    await _capture_storage_engine_locked(engine)
+    try:
+        if e["context"] is not None:
+            await e["context"].close()
+    except Exception:
+        pass
+    try:
+        if e["browser"] is not None and not args.persistent_profile:
+            await e["browser"].close()
+    except Exception:
+        pass
+    e["browser"] = None
+    e["context"] = None
+    for tid in [t for t, info in _state.tabs.items() if info["engine"] == engine]:
+        _state.tabs.pop(tid, None)
+    if _state.active not in _state.tabs:
+        _state.active = next(iter(_state.tabs), None)
 
 
 async def _teardown_quiet_locked():
-    """Cierra todo tragando errores; deja el estado limpio para relanzar."""
-    # last-chance: preservar la sesión antes de cerrar el context (idle/set_mode/close_browser)
-    # para que el próximo arranque no fuerce re-login. En un crash esto falla y conservamos
-    # el snapshot del reaper (≤reaper-interval viejo).
-    await _capture_storage_locked()
-    try:
-        if _state.context is not None:
-            await _state.context.close()
-    except Exception:
-        pass
-    try:
-        if _state.browser is not None and not args.persistent_profile:
-            await _state.browser.close()
-    except Exception:
-        pass
+    """Cierra TODOS los engines + el driver, tragando errores. Conserva el storage_state de cada
+    engine (en su entrada) para restaurar la sesión al relanzar. Llamar bajo _lock."""
+    for engine in list(_state.engines.keys()):
+        await _teardown_engine_locked(engine)
     try:
         if _state.pw is not None:
             await _state.pw.stop()
     except Exception:
         pass
-    _state.pw = _state.browser = _state.context = None
+    _state.pw = None
     _state.tabs = {}
     _state.active = None
 
 
-async def _ensure_browser_locked():
-    """Arranca el browser+context si no hay uno vivo. Llamar bajo _lock."""
-    if await _browser_alive():
-        return
-    await _teardown_quiet_locked()
-    _state.pw = await async_playwright().start()
-    launcher = getattr(_state.pw, args.browser)
+async def _ensure_engine_locked(engine: str) -> str:
+    """Arranca el browser+context de un engine si no hay uno vivo. Los engines conviven (un
+    solo driver pw los lanza a todos). Devuelve el engine normalizado. Llamar bajo _lock."""
+    engine = _norm_engine(engine)
+    if _engine_alive(engine):
+        return engine
+    # entry previo no-vivo (crash/teardown): limpia sus tabs muertas y captura su sesión antes
+    # de relanzar el mismo motor (storage_state preservado en la entrada). No-op en primer arranque.
+    if engine in _state.engines:
+        await _teardown_engine_locked(engine)
+    if _state.pw is None:
+        _state.pw = await async_playwright().start()
+    entry = _engine_entry(engine)
+    launcher = getattr(_state.pw, engine)
     launch_kwargs = {"headless": _state.headless_current}
-    if args.browser == "chromium":
+    if engine == "chromium":
         # flags anti-throttling: el render no se ralentiza en background → medición fiel.
         launch_kwargs["args"] = [
             "--disable-backgrounding-occluded-windows",
@@ -197,32 +251,47 @@ async def _ensure_browser_locked():
     if _state.reduced_motion_current:
         ctx_kwargs["reduced_motion"] = _state.reduced_motion_current
 
-    if args.persistent_profile:
-        _state.context = await launcher.launch_persistent_context(
-            args.persistent_profile, **launch_kwargs, **ctx_kwargs
-        )
-        _state.browser = _state.context.browser
-    else:
-        _state.browser = await launcher.launch(**launch_kwargs)
-        # restaura la sesión (cookies+localStorage) si había un snapshot → evita re-login
-        # tras un relaunch por idle/crash/set_mode. (persistent_profile ya persiste en disco.)
-        if _state.storage_state is not None:
-            ctx_kwargs = {**ctx_kwargs, "storage_state": _state.storage_state}
-        _state.context = await _state.browser.new_context(**ctx_kwargs)
+    # persistent_profile (raro; default None) solo tiene sentido para UN engine en disco →
+    # se aplica al default_engine; los demás engines arrancan efímeros.
+    use_profile = args.persistent_profile and engine == _state.default_engine
+    # restaura la sesión (cookies+localStorage) de ESTE engine si había snapshot → evita
+    # re-login tras un relaunch por idle/crash/set_mode. (persistent_profile ya persiste en disco.)
+    if not use_profile and entry["storage_state"] is not None:
+        ctx_kwargs = {**ctx_kwargs, "storage_state": entry["storage_state"]}
+    try:
+        if use_profile:
+            entry["context"] = await launcher.launch_persistent_context(
+                args.persistent_profile, **launch_kwargs, **ctx_kwargs
+            )
+            entry["browser"] = entry["context"].browser
+        else:
+            entry["browser"] = await launcher.launch(**launch_kwargs)
+            entry["context"] = await entry["browser"].new_context(**ctx_kwargs)
+    except Exception as e:
+        # caso típico de webkit/firefox recién instalados: faltan libs del SO. Mensaje corto y
+        # accionable en vez de la caja ASCII gigante de Playwright.
+        msg = str(e)
+        if "missing dependencies" in msg or "install-deps" in msg:
+            raise RuntimeError(
+                f"el navegador '{engine}' está descargado pero le faltan librerías del SO. "
+                f"Instalalas una vez (sudo) con: playwright install-deps {engine}"
+            ) from None
+        raise
 
-    _state.context.set_default_navigation_timeout(args.nav_timeout_ms)
-    _state.tabs = {}
-    _state.active = None
-    # Un persistent_profile suele traer una page inicial: adoptarla como tab.
-    for pg in (_state.context.pages or []):
-        tid = _new_tab_id()
-        _state.tabs[tid] = {"page": pg, "label": "", "last_used": time.monotonic()}
-        if _state.active is None:
-            _state.active = tid
+    entry["context"].set_default_navigation_timeout(args.nav_timeout_ms)
+    # Un persistent_profile suele traer una page inicial: adoptarla como tab de este engine.
+    if use_profile:
+        for pg in (entry["context"].pages or []):
+            tid = _new_tab_id()
+            _state.tabs[tid] = {"page": pg, "label": "", "last_used": time.monotonic(), "engine": engine}
+            if _state.active is None:
+                _state.active = tid
+    return engine
 
 
-async def _new_tab_locked(label: str = None) -> str:
-    page = await _state.context.new_page()
+async def _new_tab_locked(engine: str = None, label: str = None) -> str:
+    engine = _norm_engine(engine)
+    page = await _state.engines[engine]["context"].new_page()
     # el context ya nace con reduced_motion del estado runtime; pero si se cambió en
     # caliente (sin relanzar browser), el context conserva el valor viejo → reaplicar por page.
     if _state.reduced_motion_current:
@@ -231,7 +300,7 @@ async def _new_tab_locked(label: str = None) -> str:
         except Exception:
             pass
     tid = _new_tab_id()
-    _state.tabs[tid] = {"page": page, "label": label or "", "last_used": time.monotonic()}
+    _state.tabs[tid] = {"page": page, "label": label or "", "last_used": time.monotonic(), "engine": engine}
     _state.active = tid
     return tid
 
@@ -247,13 +316,33 @@ async def _safe_close_page(tab_id: str):
         _state.active = next(iter(_state.tabs), None)
 
 
-async def _ensure_page(tab: str = None):
-    """Capa 1: garantiza una page viva (arranca/reutiliza/reconstruye). Invisible al agente."""
+async def _ensure_page(tab: str = None, browser: str = None):
+    """Capa 1: garantiza una page viva (arranca/reutiliza/reconstruye). Invisible al agente.
+    `tab` apunta a una pestaña concreta (su engine ya está fijo). `browser` elige el engine
+    cuando se crea/reutiliza una tab sin `tab` explícito: reusa la activa si coincide el engine,
+    si no la tab más reciente de ese engine, si no abre una nueva — así chromium y firefox
+    conviven sin pisarse."""
     async with _lock:
-        await _ensure_browser_locked()
-        tab_id = tab or _state.active
-        if not tab_id or tab_id not in _state.tabs:
-            tab_id = await _new_tab_locked()
+        if tab and tab in _state.tabs:
+            tab_id = tab
+            await _ensure_engine_locked(_state.tabs[tab_id]["engine"])
+        elif browser:
+            engine = _norm_engine(browser)
+            await _ensure_engine_locked(engine)
+            tab_id = None
+            if _state.active in _state.tabs and _state.tabs[_state.active]["engine"] == engine:
+                tab_id = _state.active
+            else:
+                same = [(t, i["last_used"]) for t, i in _state.tabs.items() if i["engine"] == engine]
+                if same:
+                    tab_id = max(same, key=lambda x: x[1])[0]
+            if tab_id is None:
+                tab_id = await _new_tab_locked(engine)
+        else:
+            tab_id = _state.active
+            if not tab_id or tab_id not in _state.tabs:
+                engine = await _ensure_engine_locked(_state.default_engine)
+                tab_id = await _new_tab_locked(engine)
         page = _state.tabs[tab_id]["page"]
         _state.active = tab_id
         _state.tabs[tab_id]["last_used"] = time.monotonic()
@@ -263,8 +352,10 @@ async def _ensure_page(tab: str = None):
         await page.evaluate("1")
     except Exception:
         async with _lock:
+            engine = _state.tabs.get(tab_id, {}).get("engine", _state.default_engine)
             await _safe_close_page(tab_id)
-            tab_id = await _new_tab_locked()
+            engine = await _ensure_engine_locked(engine)
+            tab_id = await _new_tab_locked(engine)
             page = _state.tabs[tab_id]["page"]
             _state.active = tab_id
             _state.last_activity = time.monotonic()
@@ -312,18 +403,24 @@ async def _reaper_loop():
 async def _reap_once():
     now = time.monotonic()
     async with _lock:
-        # snapshot fresco (≤reaper-interval viejo) para sobrevivir a un crash del browser que
-        # no alcanza a disparar el last-chance capture del teardown. No-op si no hay context.
-        await _capture_storage_locked()
+        # snapshot fresco (≤reaper-interval viejo) por engine para sobrevivir a un crash que no
+        # alcanza a disparar el last-chance capture del teardown. No-op si el engine no vive.
+        for engine in list(_state.engines.keys()):
+            await _capture_storage_engine_locked(engine)
         if args.tab_idle_timeout > 0 and _state.tabs:
             for tab_id in list(_state.tabs.keys()):
                 if tab_id == _state.active:
                     continue  # la activa vive hasta el browser-idle
                 if now - _state.tabs[tab_id]["last_used"] > args.tab_idle_timeout:
                     await _safe_close_page(tab_id)
+        # un engine sin tabs ya no se usa: cerrarlo libera su RAM (conserva storage_state para
+        # relanzarlo sin re-login cuando el agente vuelva a pedir ese navegador).
+        for engine in list(_state.engines.keys()):
+            if _engine_alive(engine) and not any(i["engine"] == engine for i in _state.tabs.values()):
+                await _teardown_engine_locked(engine)
         if (
             args.browser_idle_timeout > 0
-            and _state.browser is not None
+            and _any_alive()
             and (now - _state.last_activity) > args.browser_idle_timeout
         ):
             await _teardown_quiet_locked()
@@ -876,10 +973,14 @@ _JS_WEB_VITALS = r"""
 # Tools
 # ──────────────────────────────────────────────────────────────────────────
 def _status_line() -> str:
-    if _state.browser is None or not _state.browser.is_connected():
-        return f"webprobe v{WEBPROBE_VERSION} | running=false"
-    parts = [f"webprobe v{WEBPROBE_VERSION}", "running=true", f"tabs={len(_state.tabs)}", f"active={_state.active}"]
+    if not _any_alive():
+        return (f"webprobe v{WEBPROBE_VERSION} | running=false | "
+                f"default_browser={_state.default_engine} | browsers={'+'.join(_VALID_ENGINES)}")
+    alive = [e for e in _VALID_ENGINES if _engine_alive(e)]
+    parts = [f"webprobe v{WEBPROBE_VERSION}", "running=true",
+             f"browsers_live={'+'.join(alive)}", f"tabs={len(_state.tabs)}", f"active={_state.active}"]
     if _state.active and _state.active in _state.tabs:
+        parts.append(f"active_browser={_state.tabs[_state.active]['engine']}")
         try:
             parts.append(f"url={_state.tabs[_state.active]['page'].url}")
         except Exception:
@@ -895,11 +996,10 @@ def _status_line() -> str:
 
 async def _open_cache_bypass(page):
     """Desactiva la caché HTTP (disco+memoria) vía CDP para forzar fetch de red en la próxima
-    navegación. Chromium-only. Devuelve la sesión CDP (para cerrarla luego) o None si no aplica/falla."""
-    if args.browser != "chromium":
-        return None
+    navegación. Chromium-only (firefox/webkit no exponen CDP → new_cdp_session lanza y devolvemos
+    None). Devuelve la sesión CDP (para cerrarla luego) o None si no aplica/falla."""
     try:
-        client = await _state.context.new_cdp_session(page)
+        client = await page.context.new_cdp_session(page)
         await client.send("Network.setCacheDisabled", {"cacheDisabled": True})
         return client
     except Exception:
@@ -927,7 +1027,7 @@ def _cache_note(requested_bypass: bool, client) -> str:
 
 
 async def _tool_goto(arguments: dict) -> str:
-    page = await _ensure_page(arguments.get("tab"))
+    page = await _ensure_page(arguments.get("tab"), arguments.get("browser"))
     url = _resolve_url(arguments["url"])
     bypass = bool(arguments.get("bypass_cache", False))
     cdp = await _open_cache_bypass(page) if bypass else None
@@ -939,7 +1039,8 @@ async def _tool_goto(arguments: dict) -> str:
     await _settle_redirect(page, url)   # capta el redirect client-side del guard de auth
     title = await page.title()
     return (f"ok {status} {page.url}{_cache_note(bypass, cdp)}{_redirect_warn(url, page.url)}\n"
-            f"title: {title}\nviewport: {args.viewport_w}x{args.viewport_h} dpr={args.dpr} tab={_state.active}")
+            f"title: {title}\nviewport: {args.viewport_w}x{args.viewport_h} dpr={args.dpr} "
+            f"tab={_state.active} browser={_active_engine()}")
 
 
 async def _tool_reload(arguments: dict) -> str:
@@ -989,37 +1090,40 @@ async def _tool_set_mode(arguments: dict) -> str:
             return ("set_mode(headed) deshabilitado en esta instancia (allow_headed=false). "
                     "Re-registrá sin --forbid-headed (allow_headed:true en secrets.json) para permitirlo.")
         new_headless = not headed
-        relaunch = False
+        to_relaunch = []
         async with _lock:
-            if (_state.headless_current == new_headless
-                    and _state.browser is not None and _state.browser.is_connected()):
+            if _state.headless_current == new_headless and _any_alive():
                 msgs.append(f"modo: ya está {'headed' if headed else 'headless'} (sin cambios)")
             else:
                 _state.headless_current = new_headless
+                # relanzar los engines que estaban vivos (o el default si no había ninguno),
+                # cada uno en el nuevo modo, conservando su sesión.
+                to_relaunch = [e for e in _VALID_ENGINES if _engine_alive(e)] or [_state.default_engine]
                 await _teardown_quiet_locked()
-                relaunch = True
-        if relaunch:
-            await _ensure_page()  # relanza ya, en el nuevo modo (conserva reduced_motion + sesión)
+        if to_relaunch:
+            for eng in to_relaunch:
+                await _ensure_page(browser=eng)  # relanza ya, en el nuevo modo (conserva reduced_motion + sesión)
             sb = ("scrollbars ahora clásicos (~16px, agarrables)" if headed
                   else "scrollbars vuelven a overlay/thin (no representativos)")
-            msgs.append(f"modo: {'headed' if headed else 'headless'} (browser relanzado; {sb})")
+            msgs.append(f"modo: {'headed' if headed else 'headless'} ({'+'.join(to_relaunch)} relanzado(s); {sb})")
 
     return " | ".join(msgs)
 
 
 async def _tool_open_tab(arguments: dict) -> str:
     evicted = None
+    engine = _norm_engine(arguments.get("browser"))
     async with _lock:
-        await _ensure_browser_locked()
+        await _ensure_engine_locked(engine)
         if len(_state.tabs) >= args.max_tabs:
             candidates = [(tid, info["last_used"]) for tid, info in _state.tabs.items() if tid != _state.active]
             if candidates:
                 evicted = min(candidates, key=lambda x: x[1])[0]
                 await _safe_close_page(evicted)
-        tab_id = await _new_tab_locked(label=arguments.get("label"))
+        tab_id = await _new_tab_locked(engine, label=arguments.get("label"))
         _state.last_activity = time.monotonic()
     page = _state.tabs[tab_id]["page"]
-    msg = f"tab abierta: {tab_id}"
+    msg = f"tab abierta: {tab_id} [{engine}]"
     if arguments.get("label"):
         msg += f" ({arguments['label']})"
     if arguments.get("url"):
@@ -1043,7 +1147,7 @@ async def _tool_list_tabs(arguments: dict) -> str:
         except Exception:
             url = "?"
         rows.append({
-            "id": tid, "label": info["label"], "url": url,
+            "id": tid, "label": info["label"], "browser": info["engine"], "url": url,
             "active": tid == _state.active, "idle_s": round(now - info["last_used"], 1),
         })
     return json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
@@ -1074,10 +1178,16 @@ async def _tool_close_tab(arguments: dict) -> str:
 
 
 async def _tool_close_browser(arguments: dict) -> str:
+    target = arguments.get("browser")
     async with _lock:
-        had = _state.browser is not None
+        if target:
+            engine = _norm_engine(target)
+            had = _engine_alive(engine)
+            await _teardown_engine_locked(engine)
+            return f"browser {engine} cerrado" if had else f"no había browser {engine} activo"
+        had = _any_alive()
         await _teardown_quiet_locked()
-    return "browser cerrado" if had else "no había browser activo"
+    return "browsers cerrados" if had else "no había browser activo"
 
 
 async def _tool_inspect_buttons(arguments: dict) -> str:
@@ -1476,15 +1586,16 @@ async def _tool_record_trace(arguments: dict) -> str:
     page = await _ensure_page(arguments.get("tab"))
     _state.artifact_counter += 1
     path = os.path.join(_artifact_dir(), f"trace-{int(time.time())}-{_state.artifact_counter}.zip")
+    ctx = page.context
     try:
-        await _state.context.tracing.start(screenshots=True, snapshots=True)
+        await ctx.tracing.start(screenshots=True, snapshots=True)
     except Exception:
-        await _state.context.tracing.stop()
-        await _state.context.tracing.start(screenshots=True, snapshots=True)
+        await ctx.tracing.stop()
+        await ctx.tracing.start(screenshots=True, snapshots=True)
     if arguments.get("action") == "scroll":
         await page.evaluate("(px)=>window.scrollBy(0,px)", int(arguments.get("scroll_px", 2000)))
     await page.wait_for_timeout(int(arguments.get("duration_ms", 4000)))
-    await _state.context.tracing.stop(path=path)
+    await ctx.tracing.stop(path=path)
     size = os.path.getsize(path)
     return f"trace saved: {path} ({size // 1024}KB)\nabrir con: npx playwright show-trace {path}"
 
@@ -1907,12 +2018,13 @@ def _storage_path(arguments: dict) -> str:
 async def _tool_save_storage_state(arguments: dict) -> str:
     # NO muta la page → no gateado por allow_interact. Guarda la sesión a disco para reusarla
     # entre llamadas/arranques (incluso reinicios del proceso MCP).
+    engine = _norm_engine(arguments.get("browser") or _active_engine())
     async with _lock:
-        if _state.context is not None:
-            await _capture_storage_locked()
-        state = _state.storage_state
+        if _engine_alive(engine):
+            await _capture_storage_engine_locked(engine)
+        state = (_state.engines.get(engine) or {}).get("storage_state")
     if state is None:
-        return "(no hay sesión que guardar: arrancá el browser con goto y autenticá primero)"
+        return f"(no hay sesión {engine} que guardar: arrancá ese browser con goto y autenticá primero)"
     path = _storage_path(arguments)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1922,7 +2034,7 @@ async def _tool_save_storage_state(arguments: dict) -> str:
         return f"(no se pudo escribir {path}: {e})"
     n_cookies = len(state.get("cookies", []))
     n_origins = len(state.get("origins", []))
-    return f"storage_state guardado: {path} ({n_cookies} cookies, {n_origins} origin(s) con localStorage)"
+    return f"storage_state guardado [{engine}]: {path} ({n_cookies} cookies, {n_origins} origin(s) con localStorage)"
 
 
 async def _tool_load_storage_state(arguments: dict) -> str:
@@ -1934,22 +2046,24 @@ async def _tool_load_storage_state(arguments: dict) -> str:
             state = json.load(f)
     except Exception as e:
         return f"(no se pudo leer {path}: {e})"
+    engine = _norm_engine(arguments.get("browser") or _active_engine())
     relaunch = False
     async with _lock:
-        if await _browser_alive():
-            # teardown captura el state VIEJO en _state.storage_state; lo pisamos con el cargado
+        entry = _engine_entry(engine)
+        if _engine_alive(engine):
+            # teardown captura el state VIEJO en entry["storage_state"]; lo pisamos con el cargado
             # DESPUÉS, y ensure_page relanza el context tomándolo. (storage_state solo se aplica
             # al crear el context, no en caliente.)
-            await _teardown_quiet_locked()
+            await _teardown_engine_locked(engine)
             relaunch = True
-        _state.storage_state = state
+        entry["storage_state"] = state
     if relaunch:
-        await _ensure_page()
+        await _ensure_page(browser=engine)
     n_cookies = len(state.get("cookies", []))
     n_origins = len(state.get("origins", []))
     extra = (" — context relanzado; hacé goto a la app para que el localStorage del origin aplique"
-             if relaunch else " — se aplicará al próximo arranque del browser")
-    return f"storage_state cargado: {path} ({n_cookies} cookies, {n_origins} origin(s)){extra}"
+             if relaunch else f" — se aplicará al próximo arranque del browser {engine}")
+    return f"storage_state cargado [{engine}]: {path} ({n_cookies} cookies, {n_origins} origin(s)){extra}"
 
 
 _DISPATCH = {
@@ -1996,19 +2110,25 @@ _DISPATCH = {
 @app.list_tools()
 async def list_tools() -> list[types.Tool]:
     tab = {"tab": {"type": "string", "description": "tab_id objetivo (default: la activa)"}}
+    # `browser` elige el MOTOR. Los 3 conviven vivos en paralelo: el agente puede tener
+    # chromium y firefox abiertos a la vez (cada tab recuerda su motor). Default: el de la tab
+    # activa, o chromium si no hay ninguna.
+    browser_param = {"browser": {"type": "string", "enum": list(_VALID_ENGINES),
+                                 "description": "motor del navegador (chromium|firefox|webkit). Conviven en paralelo; default: el de la tab activa o chromium"}}
     return [
         types.Tool(
             name="status",
-            description=f"Estado de {SERVER_LABEL}: versión del server (para detectar si el proceso MCP quedó stale tras actualizar), running, tabs, url, modo. Barato: NO arranca el browser.",
+            description=f"Estado de {SERVER_LABEL}: versión del server (para detectar si el proceso MCP quedó stale tras actualizar), running, qué navegadores están vivos (chromium/firefox/webkit conviven), tabs (cada una con su motor), url, modo. Barato: NO arranca el browser.",
             inputSchema={"type": "object", "properties": {}},
         ),
         types.Tool(
             name="goto",
-            description=f"Navega a una URL en {SERVER_LABEL}. URL relativa se resuelve contra --base-url si está; si no, pasá la URL completa. El browser arranca solo si no estaba activo. `bypass_cache=true` fuerza fetch de red (ignora caché de disco+memoria) — úsalo tras reconstruir el frontend en apps SIN hashing de assets, para no validar el bundle viejo (chromium; en otros browsers se ignora con aviso).",
+            description=f"Navega a una URL en {SERVER_LABEL}. URL relativa se resuelve contra --base-url si está; si no, pasá la URL completa. El browser arranca solo si no estaba activo. `browser` elige el MOTOR (chromium|firefox|webkit) — los 3 conviven vivos a la vez para comparar el mismo flujo entre navegadores: goto(url, browser='firefox') abre/usa una tab de firefox SIN pisar la de chromium. `bypass_cache=true` fuerza fetch de red (ignora caché de disco+memoria) — úsalo tras reconstruir el frontend en apps SIN hashing de assets, para no validar el bundle viejo (chromium; en otros browsers se ignora con aviso).",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string", "description": "URL completa o ruta relativa a --base-url"},
                 "wait_until": {"type": "string", "enum": ["load", "domcontentloaded", "networkidle", "commit"], "default": "load"},
                 "bypass_cache": {"type": "boolean", "default": False, "description": "ignora la caché HTTP en esta navegación (hard-load, chromium)"},
+                **browser_param,
                 **tab,
             }, "required": ["url"]},
         ),
@@ -2017,6 +2137,7 @@ async def list_tools() -> list[types.Tool]:
             description="Guarda la sesión actual (cookies + localStorage) a disco para reusarla luego con load_storage_state — sobrevive reinicios del proceso MCP. Útil tras autenticar una vez: login (UI o evaluate) → save_storage_state → en adelante load_storage_state evita repetir el login. Nota: el server YA persiste la sesión en memoria entre recreaciones de context (idle/crash/set_mode) automáticamente; esto es para persistir a disco/entre sesiones. NO muta (no requiere allow_interact).",
             inputSchema={"type": "object", "properties": {
                 "path": {"type": "string", "description": "ruta de salida (opcional; default: <artifact-dir>/storage-state.json)"},
+                **browser_param,
             }},
         ),
         types.Tool(
@@ -2024,6 +2145,7 @@ async def list_tools() -> list[types.Tool]:
             description="Carga una sesión (cookies + localStorage) guardada con save_storage_state y relanza el context para aplicarla → salta el login. Tras cargar, hacé goto a la app para que el localStorage del origin aplique. NO muta (no requiere allow_interact).",
             inputSchema={"type": "object", "properties": {
                 "path": {"type": "string", "description": "ruta a leer (opcional; default: <artifact-dir>/storage-state.json)"},
+                **browser_param,
             }},
         ),
         types.Tool(
@@ -2188,7 +2310,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="set_mode",
-            description="Ajusta modo de runtime: 'headed' (headless↔headed, teardown+relaunch; gobernado por allow_headed) y/o 'reduced_motion' (emula prefers-reduced-motion sin relanzar — valida la rama useReducedMotion/reduced-motion del DS: en 'reduce' las animaciones gateadas quedan estáticas; matchMedia y entrance_animation_check lo reflejan). SCROLLBARS: el chromium headless NO renderiza scrollbars clásicos (da ~2px thin y NO honra ::-webkit-scrollbar) → offsetWidth-clientWidth no representa lo que ve el usuario. Para auditar usabilidad de scroll/scrollbars (ancho real, thumb agarrable) activá headed=true: ahí el scrollbar es clásico (~16px, reserva espacio). Requiere display (WSLg en WSL). Pasá al menos uno; ambos opcionales. reduced_motion y la sesión persisten al relaunch por headed.",
+            description="Ajusta modo de runtime: 'headed' (headless↔headed, teardown+relaunch; gobernado por allow_headed) y/o 'reduced_motion' (emula prefers-reduced-motion sin relanzar — valida la rama useReducedMotion/reduced-motion del DS: en 'reduce' las animaciones gateadas quedan estáticas; matchMedia y entrance_animation_check lo reflejan). SCROLLBARS: el chromium headless NO renderiza scrollbars clásicos (da ~2px thin y NO honra ::-webkit-scrollbar) → offsetWidth-clientWidth no representa lo que ve el usuario. Para auditar usabilidad de scroll/scrollbars (ancho real, thumb agarrable) activá headed=true: ahí el scrollbar es clásico (~16px, reserva espacio). Requiere display (WSLg en WSL). Pasá al menos uno; ambos opcionales. reduced_motion y la sesión persisten al relaunch por headed. headed aplica a TODOS los motores: si tenés chromium y firefox vivos, ambos se relanzan headed.",
             inputSchema={"type": "object", "properties": {
                 "headed": {"type": "boolean", "description": "true=ventana visible (WSLg) — también habilita scrollbars clásicos (~16px) para auditarlos; false=headless (scrollbars thin/overlay no representativos)"},
                 "reduced_motion": {"type": "string", "enum": ["reduce", "no-preference"], "description": "emula la media query prefers-reduced-motion ('reduce' = usuario pidió menos movimiento)"},
@@ -2196,15 +2318,16 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="open_tab",
-            description=f"Abre una pestaña nueva (opcionalmente navega). Respeta --max-tabs={args.max_tabs} con LRU-evict. Retorna su tab_id.",
+            description=f"Abre una pestaña nueva (opcionalmente navega) en el motor `browser` (chromium|firefox|webkit; default chromium). Respeta --max-tabs={args.max_tabs} con LRU-evict. Retorna su tab_id. Para tener chromium y firefox abiertos a la vez: open_tab(browser='chromium') + open_tab(browser='firefox').",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string", "description": "URL/ruta a abrir (opcional)"},
                 "label": {"type": "string", "description": "etiqueta legible (opcional)"},
+                **browser_param,
             }},
         ),
         types.Tool(
             name="list_tabs",
-            description="Lista las pestañas abiertas: id, label, url, cuál es la activa e idle_s.",
+            description="Lista las pestañas abiertas: id, label, browser (motor: chromium|firefox|webkit), url, cuál es la activa e idle_s.",
             inputSchema={"type": "object", "properties": {}},
         ),
         types.Tool(
@@ -2219,8 +2342,8 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="close_browser",
-            description="Cierra todo el browser (libera RAM). La próxima llamada lo relanza solo.",
-            inputSchema={"type": "object", "properties": {}},
+            description="Cierra navegadores (libera RAM). Sin `browser` cierra TODOS los motores vivos; con `browser` cierra solo ese (chromium|firefox|webkit). La próxima llamada que lo necesite lo relanza solo, conservando su sesión.",
+            inputSchema={"type": "object", "properties": {**browser_param}},
         ),
         types.Tool(
             name="inspect_buttons",
