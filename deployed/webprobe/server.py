@@ -11,6 +11,7 @@ seguridad automática (Capa 3: _reaper_loop cierra tabs/browser idle y purga art
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import re
@@ -43,6 +44,9 @@ parser.add_argument("--persistent-profile", default=None)
 parser.add_argument("--viewport-w", type=int, default=1440)
 parser.add_argument("--viewport-h", type=int, default=900)
 parser.add_argument("--dpr", type=float, default=1.0)
+# device por defecto de las tabs nuevas (nombre de preset Playwright, ej. "iPhone 15 Pro").
+# Default None = desktop (viewport-w/h + dpr). El agente lo pisa por tab con `device` en goto/open_tab.
+parser.add_argument("--device", default=None)
 parser.add_argument("--reduced-motion", default=None, choices=["reduce", "no-preference"])
 parser.add_argument("--nav-timeout-ms", type=int, default=15000)
 # ciclo de vida / multi-tab
@@ -60,7 +64,7 @@ SERVER_LABEL = args.name or "webprobe"
 # Bump en cada cambio de comportamiento. El agente lo ve en status() para saber si el
 # proceso MCP está stale (un MCP es de vida larga; editar server.py NO recarga el proceso
 # vivo — hay que reiniciar Claude Code / recargar la ventana de VSCode).
-WEBPROBE_VERSION = "0.5.2"
+WEBPROBE_VERSION = "0.5.3"
 app = Server(f"webprobe-{SERVER_LABEL}")
 
 
@@ -68,18 +72,23 @@ app = Server(f"webprobe-{SERVER_LABEL}")
 # Estado singleton + helpers de ciclo de vida
 # ──────────────────────────────────────────────────────────────────────────
 _VALID_ENGINES = ("chromium", "firefox", "webkit")
+_DEVICE_DESKTOP = "desktop"   # device_key del context sin emulación (viewport-w/h + dpr del CLI)
 
 
 class _State:
     pw = None                # un solo Playwright driver, compartido por los 3 engines
-    # engines vivos EN PARALELO: engine -> {"browser": Browser, "context": BrowserContext,
-    # "storage_state": dict|None}. El agente elige el engine por tab (param `browser` en
-    # goto/open_tab); cada tab recuerda el suyo. storage_state es POR engine (las cookies de
-    # chromium no son las de firefox) y sobrevive a una recreación del context (browser-idle,
-    # crash, set_mode) → restaura la sesión sin re-login. Las entradas persisten aunque se
-    # apague el browser (guardan el storage_state); solo browser/context se nulean.
+    # engines vivos EN PARALELO: engine -> {"browser": Browser, "contexts": {device_key: BrowserContext},
+    # "ctx_kwargs": {device_key: dict}, "storage_state": dict|None}.
+    # El BROWSER es caro → uno por engine. El CONTEXT es barato y es donde viven user_agent /
+    # is_mobile / has_touch / device_scale_factor (NO se pueden cambiar en caliente sobre una page)
+    # → uno por device_key, así desktop y mobile del mismo engine conviven vivos en paralelo.
+    # Cada tab recuerda su (engine, device). ctx_kwargs guarda con qué se creó cada context para
+    # poder recrearlo idéntico tras un relaunch (set_mode/crash) sin re-resolver el device.
+    # storage_state es POR engine (las cookies de chromium no son las de firefox) y lo comparten
+    # todos sus devices → logueás en desktop y el context mobile nace autenticado.
+    # Las entradas persisten aunque se apague el browser (guardan storage_state + ctx_kwargs).
     engines: dict = {}
-    tabs: dict = {}          # tab_id -> {"page": Page, "label": str, "last_used": float, "engine": str}
+    tabs: dict = {}          # tab_id -> {"page", "label", "last_used", "engine", "device"}
     active = None            # tab_id activo (global, cualquier engine)
     last_activity = 0.0      # time.monotonic() del último tool call
     headless_current = args.headless
@@ -87,6 +96,7 @@ class _State:
     tab_counter = 0
     artifact_counter = 0
     default_engine = args.browser if args.browser in _VALID_ENGINES else "chromium"  # engine de una tab sin `browser` explícito
+    default_device = args.device   # device de una tab sin `device` explícito (None = desktop)
 
 
 _state = _State()
@@ -100,10 +110,10 @@ def _norm_engine(name) -> str:
 
 def _engine_entry(engine: str) -> dict:
     """Devuelve (creando si falta) la entrada del engine. La entrada persiste el storage_state
-    aunque browser/context estén apagados."""
+    y los ctx_kwargs aunque browser/contexts estén apagados."""
     e = _state.engines.get(engine)
     if e is None:
-        e = {"browser": None, "context": None, "storage_state": None}
+        e = {"browser": None, "contexts": {}, "ctx_kwargs": {}, "storage_state": None}
         _state.engines[engine] = e
     return e
 
@@ -112,6 +122,12 @@ def _active_engine() -> str:
     """Engine de la tab activa, o el default si no hay tab activa."""
     info = _state.tabs.get(_state.active) if _state.active else None
     return info["engine"] if info else _state.default_engine
+
+
+def _active_device() -> str:
+    """device_key de la tab activa, o desktop si no hay tab activa."""
+    info = _state.tabs.get(_state.active) if _state.active else None
+    return info["device"] if info else _DEVICE_DESKTOP
 
 
 def _resolve_url(url: str) -> str:
@@ -154,53 +170,215 @@ def _new_tab_id() -> str:
     return f"t{_state.tab_counter}"
 
 
-def _engine_alive(engine: str) -> bool:
+def _browser_alive(engine: str) -> bool:
     e = _state.engines.get(engine)
-    return bool(
-        e is not None
-        and e["browser"] is not None
-        and e["browser"].is_connected()
-        and e["context"] is not None
-    )
+    return bool(e is not None and e["browser"] is not None and e["browser"].is_connected())
+
+
+def _ctx_alive(engine: str, device: str) -> bool:
+    e = _state.engines.get(engine)
+    return bool(_browser_alive(engine) and e["contexts"].get(device) is not None)
+
+
+def _engine_alive(engine: str) -> bool:
+    """Browser vivo CON al menos un context (un browser sin contexts no sirve para nada)."""
+    e = _state.engines.get(engine)
+    return bool(_browser_alive(engine) and e["contexts"])
 
 
 def _any_alive() -> bool:
     return any(_engine_alive(e) for e in _state.engines)
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Emulación de dispositivo (device_key → ctx_kwargs)
+# ──────────────────────────────────────────────────────────────────────────
+def _base_ctx_kwargs() -> dict:
+    """El context 'desktop': lo que se venía usando siempre (viewport + dpr del CLI)."""
+    return {
+        "viewport": {"width": args.viewport_w, "height": args.viewport_h},
+        "device_scale_factor": args.dpr,
+    }
+
+
+def _match_preset(name: str, catalog: dict):
+    """Preset de Playwright por nombre, tolerante a mayúsculas ('iphone 15 pro' → 'iPhone 15 Pro')."""
+    if name in catalog:
+        return name
+    low = name.strip().lower()
+    for k in catalog:
+        if k.lower() == low:
+            return k
+    return None
+
+
+def _preset_suggestions(name: str, catalog: dict, n: int = 6) -> str:
+    """Nombres parecidos, para que un typo no obligue a un list_devices completo."""
+    toks = [t for t in re.split(r"[\s_-]+", name.strip().lower()) if t]
+    hits = [k for k in catalog if any(t in k.lower() for t in toks)]
+    return ", ".join(f"'{h}'" for h in hits[:n])
+
+
+async def _ensure_driver_locked():
+    """Arranca el driver de Playwright (no un browser). Necesario para leer pw.devices.
+    Llamar bajo _lock."""
+    if _state.pw is None:
+        _state.pw = await async_playwright().start()
+
+
+async def _resolve_device_locked(spec, engine: str):
+    """spec → (device_key, ctx_kwargs, notes). `spec` puede ser:
+      - None                         → el default de la instancia (--device), o desktop
+      - "desktop"                    → sin emulación
+      - "iPhone 15 Pro"              → preset de Playwright (los mismos del device toolbar de DevTools)
+      - {"preset": "Pixel 7", ...}   → preset + overrides puntuales
+      - {"viewport": {"w":360,"h":800}, "is_mobile": true, ...}   → device 100% custom
+    El device_key indexa el context: mismo key ⇒ mismo context reutilizado. Llamar bajo _lock."""
+    await _ensure_driver_locked()
+    catalog = _state.pw.devices
+
+    if spec is None:
+        spec = _state.default_device
+    if spec is None or (isinstance(spec, str) and spec.strip().lower() in ("", _DEVICE_DESKTOP)):
+        return _DEVICE_DESKTOP, _base_ctx_kwargs(), []
+
+    if isinstance(spec, str):
+        preset_name, ov = spec, {}
+    elif isinstance(spec, dict):
+        preset_name, ov = spec.get("preset"), spec
+    else:
+        raise RuntimeError("device: pasá un nombre de preset (string) o un objeto "
+                           "{preset, viewport, dpr, user_agent, is_mobile, has_touch}.")
+
+    notes = []
+    desc = {}
+    label = "custom"
+    if preset_name:
+        hit = _match_preset(preset_name, catalog)
+        if hit is None:
+            sug = _preset_suggestions(preset_name, catalog)
+            extra = f" ¿Quisiste decir {sug}?" if sug else ""
+            raise RuntimeError(f"device desconocido: '{preset_name}'.{extra} "
+                               f"Usá list_devices para ver los {len(catalog)} presets.")
+        # default_browser_type es metadata del catálogo (qué engine emula mejor a ese device),
+        # no un kwarg de new_context → fuera.
+        desc = {k: v for k, v in catalog[hit].items() if k != "default_browser_type"}
+        label = hit
+        want = catalog[hit].get("default_browser_type")
+        if want and want != engine:
+            notes.append(f"'{hit}' emula {want}; lo estás corriendo sobre {engine} "
+                         f"(el UA dice {want} pero el motor es {engine}) — para fidelidad real usá browser='{want}'")
+
+    ctx = {**_base_ctx_kwargs(), **desc}
+
+    # overrides puntuales sobre el preset (o sobre desktop si no hubo preset)
+    if "viewport" in ov and ov["viewport"] is not None:
+        v = ov["viewport"]
+        if not isinstance(v, dict):
+            raise RuntimeError("device.viewport: pasá {\"w\": <px>, \"h\": <px>}")
+        w, h = v.get("w", v.get("width")), v.get("h", v.get("height"))
+        if w is None or h is None:
+            raise RuntimeError("device.viewport: faltan 'w'/'h'")
+        ctx["viewport"] = {"width": int(w), "height": int(h)}
+    if ov.get("dpr") is not None:
+        ctx["device_scale_factor"] = float(ov["dpr"])
+    if ov.get("user_agent") is not None:
+        ctx["user_agent"] = str(ov["user_agent"])
+    if ov.get("is_mobile") is not None:
+        ctx["is_mobile"] = bool(ov["is_mobile"])
+    if ov.get("has_touch") is not None:
+        ctx["has_touch"] = bool(ov["has_touch"])
+
+    if not preset_name and ctx == _base_ctx_kwargs():
+        raise RuntimeError("device: el objeto no cambia nada. Pasá 'preset' y/o algún override "
+                           "(viewport, dpr, user_agent, is_mobile, has_touch).")
+
+    # firefox no implementa is_mobile (meta viewport + touch events): Playwright lanza al crear el
+    # context. Degradar con aviso en vez de romper — el resto (viewport/UA/dpr) sí emula.
+    if engine == "firefox" and ctx.get("is_mobile"):
+        ctx.pop("is_mobile", None)
+        notes.append("firefox no soporta is_mobile (ignorado: sin meta-viewport ni touch events). "
+                     "Para mobile de verdad usá browser='webkit' (iOS) o 'chromium' (Android)")
+
+    key = label
+    if _canon(ctx) != _canon({**_base_ctx_kwargs(), **desc}):
+        key = f"{label}~{_short_hash(ctx)}"   # preset pisado / custom puro → key propio
+    elif not preset_name:
+        key = f"custom~{_short_hash(ctx)}"
+    return key, ctx, notes
+
+
+def _canon(d: dict) -> str:
+    return json.dumps(d, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _short_hash(d: dict) -> str:
+    return hashlib.sha1(_canon(d).encode()).hexdigest()[:6]
+
+
 async def _capture_storage_engine_locked(engine: str):
-    """Snapshot del storage_state (cookies+localStorage) del context vivo de un engine, para
-    restaurarlo si el context se recrea. Tragar errores: si el context ya murió (crash),
-    conservamos el último snapshot bueno. Llamar bajo _lock."""
+    """Snapshot del storage_state (cookies+localStorage) de un engine, para restaurarlo si sus
+    contexts se recrean. Con varios devices vivos hay N contexts: gana el más 'rico'
+    (más cookies+origins) — si logueaste en el context mobile y el desktop está vacío, queremos
+    el de mobile, y nunca que un context recién nacido pise una sesión buena. Tragar errores:
+    si un context ya murió (crash), conservamos el último snapshot bueno. Llamar bajo _lock."""
     e = _state.engines.get(engine)
-    if e is None or e["context"] is None:
+    if e is None or not e["contexts"]:
         return
-    try:
-        e["storage_state"] = await e["context"].storage_state()
-    except Exception:
-        pass
+    best, best_score = None, -1
+    for ctx in list(e["contexts"].values()):
+        try:
+            st = await ctx.storage_state()
+        except Exception:
+            continue
+        score = len(st.get("cookies", [])) + len(st.get("origins", []))
+        if score > best_score:
+            best, best_score = st, score
+    if best is not None and (best_score > 0 or e["storage_state"] is None):
+        e["storage_state"] = best
+
+
+async def _teardown_context_locked(engine: str, device: str):
+    """Cierra UN context (un device) de un engine y descarta sus tabs. El browser sigue vivo para
+    los demás devices. Conserva sus ctx_kwargs → se puede recrear idéntico. Llamar bajo _lock."""
+    e = _state.engines.get(engine)
+    if e is None:
+        return
+    # last-chance: si el login vivía en ESTE context, preservarlo antes de cerrarlo.
+    await _capture_storage_engine_locked(engine)
+    ctx = e["contexts"].pop(device, None)
+    if ctx is not None:
+        try:
+            await ctx.close()
+        except Exception:
+            pass
+    for tid in [t for t, i in _state.tabs.items() if i["engine"] == engine and i["device"] == device]:
+        _state.tabs.pop(tid, None)
+    if _state.active not in _state.tabs:
+        _state.active = next(iter(_state.tabs), None)
 
 
 async def _teardown_engine_locked(engine: str):
-    """Cierra el browser+context de UN engine tragando errores; conserva su storage_state y
-    descarta sus tabs. La entrada del engine persiste (solo browser/context se nulean)."""
+    """Cierra el browser + TODOS los contexts de UN engine tragando errores; conserva su
+    storage_state y sus ctx_kwargs, y descarta sus tabs. La entrada del engine persiste
+    (solo browser/contexts se vacían)."""
     e = _state.engines.get(engine)
     if e is None:
         return
     # last-chance: preservar la sesión de este engine antes de cerrar (idle/set_mode/close).
     await _capture_storage_engine_locked(engine)
-    try:
-        if e["context"] is not None:
-            await e["context"].close()
-    except Exception:
-        pass
+    for ctx in list(e["contexts"].values()):
+        try:
+            await ctx.close()
+        except Exception:
+            pass
+    e["contexts"] = {}
     try:
         if e["browser"] is not None and not args.persistent_profile:
             await e["browser"].close()
     except Exception:
         pass
     e["browser"] = None
-    e["context"] = None
     for tid in [t for t, info in _state.tabs.items() if info["engine"] == engine]:
         _state.tabs.pop(tid, None)
     if _state.active not in _state.tabs:
@@ -222,18 +400,15 @@ async def _teardown_quiet_locked():
     _state.active = None
 
 
-async def _ensure_engine_locked(engine: str) -> str:
-    """Arranca el browser+context de un engine si no hay uno vivo. Los engines conviven (un
-    solo driver pw los lanza a todos). Devuelve el engine normalizado. Llamar bajo _lock."""
-    engine = _norm_engine(engine)
-    if _engine_alive(engine):
-        return engine
-    # entry previo no-vivo (crash/teardown): limpia sus tabs muertas y captura su sesión antes
-    # de relanzar el mismo motor (storage_state preservado en la entrada). No-op en primer arranque.
-    if engine in _state.engines:
-        await _teardown_engine_locked(engine)
-    if _state.pw is None:
-        _state.pw = await async_playwright().start()
+def _uses_profile(engine: str) -> bool:
+    """persistent_profile (raro; default None) solo tiene sentido para UN engine en disco →
+    se aplica al default_engine; los demás engines arrancan efímeros."""
+    return bool(args.persistent_profile) and engine == _state.default_engine
+
+
+async def _launch_browser_locked(engine: str):
+    """Lanza el proceso del browser de un engine (sin contexts). Llamar bajo _lock."""
+    await _ensure_driver_locked()
     entry = _engine_entry(engine)
     launcher = getattr(_state.pw, engine)
     launch_kwargs = {"headless": _state.headless_current}
@@ -244,29 +419,27 @@ async def _ensure_engine_locked(engine: str) -> str:
             "--disable-renderer-backgrounding",
             "--disable-background-timer-throttling",
         ]
-    ctx_kwargs = {
-        "viewport": {"width": args.viewport_w, "height": args.viewport_h},
-        "device_scale_factor": args.dpr,
-    }
-    if _state.reduced_motion_current:
-        ctx_kwargs["reduced_motion"] = _state.reduced_motion_current
-
-    # persistent_profile (raro; default None) solo tiene sentido para UN engine en disco →
-    # se aplica al default_engine; los demás engines arrancan efímeros.
-    use_profile = args.persistent_profile and engine == _state.default_engine
-    # restaura la sesión (cookies+localStorage) de ESTE engine si había snapshot → evita
-    # re-login tras un relaunch por idle/crash/set_mode. (persistent_profile ya persiste en disco.)
-    if not use_profile and entry["storage_state"] is not None:
-        ctx_kwargs = {**ctx_kwargs, "storage_state": entry["storage_state"]}
     try:
-        if use_profile:
-            entry["context"] = await launcher.launch_persistent_context(
+        if _uses_profile(engine):
+            ctx_kwargs = dict(entry["ctx_kwargs"].get(_DEVICE_DESKTOP) or _base_ctx_kwargs())
+            if _state.reduced_motion_current:
+                ctx_kwargs["reduced_motion"] = _state.reduced_motion_current
+            ctx = await launcher.launch_persistent_context(
                 args.persistent_profile, **launch_kwargs, **ctx_kwargs
             )
-            entry["browser"] = entry["context"].browser
+            entry["browser"] = ctx.browser
+            entry["contexts"][_DEVICE_DESKTOP] = ctx
+            entry["ctx_kwargs"][_DEVICE_DESKTOP] = _base_ctx_kwargs()
+            ctx.set_default_navigation_timeout(args.nav_timeout_ms)
+            # un persistent_profile suele traer una page inicial: adoptarla como tab.
+            for pg in (ctx.pages or []):
+                tid = _new_tab_id()
+                _state.tabs[tid] = {"page": pg, "label": "", "last_used": time.monotonic(),
+                                    "engine": engine, "device": _DEVICE_DESKTOP}
+                if _state.active is None:
+                    _state.active = tid
         else:
             entry["browser"] = await launcher.launch(**launch_kwargs)
-            entry["context"] = await entry["browser"].new_context(**ctx_kwargs)
     except Exception as e:
         # caso típico de webkit/firefox recién instalados: faltan libs del SO. Mensaje corto y
         # accionable en vez de la caja ASCII gigante de Playwright.
@@ -278,20 +451,53 @@ async def _ensure_engine_locked(engine: str) -> str:
             ) from None
         raise
 
-    entry["context"].set_default_navigation_timeout(args.nav_timeout_ms)
-    # Un persistent_profile suele traer una page inicial: adoptarla como tab de este engine.
-    if use_profile:
-        for pg in (entry["context"].pages or []):
-            tid = _new_tab_id()
-            _state.tabs[tid] = {"page": pg, "label": "", "last_used": time.monotonic(), "engine": engine}
-            if _state.active is None:
-                _state.active = tid
+
+async def _ensure_context_locked(engine: str, device: str = _DEVICE_DESKTOP, ctx_extra: dict = None) -> str:
+    """Arranca el browser del engine (si falta) y el context de ese device (si falta). Los engines
+    conviven (un solo driver pw los lanza a todos) y dentro de cada uno conviven los devices.
+    `ctx_extra` = kwargs del device ya resueltos; si es None se toman los guardados de un context
+    previo con ese mismo key (caso relaunch). Devuelve el engine normalizado. Llamar bajo _lock."""
+    engine = _norm_engine(engine)
+    if _ctx_alive(engine, device):
+        return engine
+    if not _browser_alive(engine):
+        # entry previo no-vivo (crash/teardown): limpia sus tabs muertas y captura su sesión antes
+        # de relanzar el mismo motor (storage_state preservado en la entrada). No-op en 1er arranque.
+        if engine in _state.engines:
+            await _teardown_engine_locked(engine)
+        await _launch_browser_locked(engine)
+        if _ctx_alive(engine, device):   # el persistent_profile ya dejó su context creado
+            return engine
+
+    entry = _engine_entry(engine)
+    if _uses_profile(engine) and device != _DEVICE_DESKTOP:
+        raise RuntimeError(
+            f"--persistent-profile no soporta emulación de dispositivo en '{engine}': el profile "
+            f"abre un único context fijo y user_agent/is_mobile/has_touch se fijan al crearlo. "
+            f"Probá el device en otro browser (ej. browser='webkit'), o registrá la instancia "
+            f"sin --persistent-profile."
+        )
+    if ctx_extra is None:
+        ctx_extra = entry["ctx_kwargs"].get(device) or _base_ctx_kwargs()
+    ctx_kwargs = dict(ctx_extra)
+    if _state.reduced_motion_current:
+        ctx_kwargs["reduced_motion"] = _state.reduced_motion_current
+    # restaura la sesión (cookies+localStorage) de ESTE engine si había snapshot → evita re-login
+    # tras un relaunch por idle/crash/set_mode, y estrena los devices nuevos ya autenticados.
+    # (persistent_profile ya persiste en disco.)
+    if entry["storage_state"] is not None:
+        ctx_kwargs["storage_state"] = entry["storage_state"]
+
+    ctx = await entry["browser"].new_context(**ctx_kwargs)
+    ctx.set_default_navigation_timeout(args.nav_timeout_ms)
+    entry["contexts"][device] = ctx
+    entry["ctx_kwargs"][device] = dict(ctx_extra)
     return engine
 
 
-async def _new_tab_locked(engine: str = None, label: str = None) -> str:
+async def _new_tab_locked(engine: str = None, device: str = _DEVICE_DESKTOP, label: str = None) -> str:
     engine = _norm_engine(engine)
-    page = await _state.engines[engine]["context"].new_page()
+    page = await _state.engines[engine]["contexts"][device].new_page()
     # el context ya nace con reduced_motion del estado runtime; pero si se cambió en
     # caliente (sin relanzar browser), el context conserva el valor viejo → reaplicar por page.
     if _state.reduced_motion_current:
@@ -300,7 +506,8 @@ async def _new_tab_locked(engine: str = None, label: str = None) -> str:
         except Exception:
             pass
     tid = _new_tab_id()
-    _state.tabs[tid] = {"page": page, "label": label or "", "last_used": time.monotonic(), "engine": engine}
+    _state.tabs[tid] = {"page": page, "label": label or "", "last_used": time.monotonic(),
+                        "engine": engine, "device": device}
     _state.active = tid
     return tid
 
@@ -316,33 +523,43 @@ async def _safe_close_page(tab_id: str):
         _state.active = next(iter(_state.tabs), None)
 
 
-async def _ensure_page(tab: str = None, browser: str = None):
+async def _ensure_page(tab: str = None, browser: str = None, device=None, notes_out: list = None):
     """Capa 1: garantiza una page viva (arranca/reutiliza/reconstruye). Invisible al agente.
-    `tab` apunta a una pestaña concreta (su engine ya está fijo). `browser` elige el engine
-    cuando se crea/reutiliza una tab sin `tab` explícito: reusa la activa si coincide el engine,
-    si no la tab más reciente de ese engine, si no abre una nueva — así chromium y firefox
-    conviven sin pisarse."""
+    `tab` apunta a una pestaña concreta (su engine y device ya están fijos). `browser`/`device`
+    eligen el par (engine, device) cuando se crea/reutiliza una tab sin `tab` explícito: reusa la
+    activa si coincide el par, si no la tab más reciente de ese par, si no abre una nueva — así
+    chromium-desktop y webkit-iPhone conviven sin pisarse. Sin `browser` ni `device` se usa la tab
+    activa tal cual. `notes_out` recibe los avisos de la resolución del device (ej. engine que no
+    matchea el preset)."""
     async with _lock:
         if tab and tab in _state.tabs:
             tab_id = tab
-            await _ensure_engine_locked(_state.tabs[tab_id]["engine"])
-        elif browser:
-            engine = _norm_engine(browser)
-            await _ensure_engine_locked(engine)
+            info = _state.tabs[tab_id]
+            await _ensure_context_locked(info["engine"], info["device"])
+        elif browser or device is not None or (_state.default_device and not _state.tabs):
+            engine = _norm_engine(browser or _active_engine())
+            dev, ctx_extra, notes = await _resolve_device_locked(device, engine)
+            if notes_out is not None:
+                notes_out.extend(notes)
+            await _ensure_context_locked(engine, dev, ctx_extra)
             tab_id = None
-            if _state.active in _state.tabs and _state.tabs[_state.active]["engine"] == engine:
+            if (_state.active in _state.tabs
+                    and _state.tabs[_state.active]["engine"] == engine
+                    and _state.tabs[_state.active]["device"] == dev):
                 tab_id = _state.active
             else:
-                same = [(t, i["last_used"]) for t, i in _state.tabs.items() if i["engine"] == engine]
+                same = [(t, i["last_used"]) for t, i in _state.tabs.items()
+                        if i["engine"] == engine and i["device"] == dev]
                 if same:
                     tab_id = max(same, key=lambda x: x[1])[0]
             if tab_id is None:
-                tab_id = await _new_tab_locked(engine)
+                tab_id = await _new_tab_locked(engine, dev)
         else:
             tab_id = _state.active
             if not tab_id or tab_id not in _state.tabs:
-                engine = await _ensure_engine_locked(_state.default_engine)
-                tab_id = await _new_tab_locked(engine)
+                dev, ctx_extra, _ = await _resolve_device_locked(None, _state.default_engine)
+                engine = await _ensure_context_locked(_state.default_engine, dev, ctx_extra)
+                tab_id = await _new_tab_locked(engine, dev)
         page = _state.tabs[tab_id]["page"]
         _state.active = tab_id
         _state.tabs[tab_id]["last_used"] = time.monotonic()
@@ -352,10 +569,12 @@ async def _ensure_page(tab: str = None, browser: str = None):
         await page.evaluate("1")
     except Exception:
         async with _lock:
-            engine = _state.tabs.get(tab_id, {}).get("engine", _state.default_engine)
+            info = _state.tabs.get(tab_id, {})
+            engine = info.get("engine", _state.default_engine)
+            dev = info.get("device", _DEVICE_DESKTOP)
             await _safe_close_page(tab_id)
-            engine = await _ensure_engine_locked(engine)
-            tab_id = await _new_tab_locked(engine)
+            engine = await _ensure_context_locked(engine, dev)
+            tab_id = await _new_tab_locked(engine, dev)
             page = _state.tabs[tab_id]["page"]
             _state.active = tab_id
             _state.last_activity = time.monotonic()
@@ -413,10 +632,16 @@ async def _reap_once():
                     continue  # la activa vive hasta el browser-idle
                 if now - _state.tabs[tab_id]["last_used"] > args.tab_idle_timeout:
                     await _safe_close_page(tab_id)
-        # un engine sin tabs ya no se usa: cerrarlo libera su RAM (conserva storage_state para
-        # relanzarlo sin re-login cuando el agente vuelva a pedir ese navegador).
+        # un context (device) sin tabs ya no se usa → cerrarlo libera su RAM; y un browser que se
+        # queda sin contexts, también. Conservan storage_state + ctx_kwargs para reconstruirse
+        # idénticos y sin re-login cuando el agente vuelva a pedir ese navegador/device.
         for engine in list(_state.engines.keys()):
-            if _engine_alive(engine) and not any(i["engine"] == engine for i in _state.tabs.values()):
+            if not _browser_alive(engine):
+                continue
+            for dev in list(_state.engines[engine]["contexts"].keys()):
+                if not any(i["engine"] == engine and i["device"] == dev for i in _state.tabs.values()):
+                    await _teardown_context_locked(engine, dev)
+            if not _state.engines[engine]["contexts"]:
                 await _teardown_engine_locked(engine)
         if (
             args.browser_idle_timeout > 0
@@ -972,20 +1197,45 @@ _JS_WEB_VITALS = r"""
 # ──────────────────────────────────────────────────────────────────────────
 # Tools
 # ──────────────────────────────────────────────────────────────────────────
-def _status_line() -> str:
+async def _viewport_str(page) -> str:
+    """Viewport + dpr REALES de la page (no los del CLI: un device los pisa, set_viewport también)."""
+    vs = None
+    try:
+        vs = page.viewport_size
+    except Exception:
+        pass
+    dpr = args.dpr
+    try:
+        dpr = await page.evaluate("window.devicePixelRatio")
+    except Exception:
+        pass
+    wh = f"{vs['width']}x{vs['height']}" if vs else f"{args.viewport_w}x{args.viewport_h}"
+    return f"{wh} dpr={dpr}"
+
+
+async def _status_line() -> str:
     if not _any_alive():
+        dflt = f" | default_device={_state.default_device}" if _state.default_device else ""
         return (f"webprobe v{WEBPROBE_VERSION} | running=false | "
-                f"default_browser={_state.default_engine} | browsers={'+'.join(_VALID_ENGINES)}")
+                f"default_browser={_state.default_engine} | browsers={'+'.join(_VALID_ENGINES)}{dflt}")
     alive = [e for e in _VALID_ENGINES if _engine_alive(e)]
     parts = [f"webprobe v{WEBPROBE_VERSION}", "running=true",
              f"browsers_live={'+'.join(alive)}", f"tabs={len(_state.tabs)}", f"active={_state.active}"]
     if _state.active and _state.active in _state.tabs:
-        parts.append(f"active_browser={_state.tabs[_state.active]['engine']}")
+        info = _state.tabs[_state.active]
+        parts.append(f"active_browser={info['engine']}")
+        parts.append(f"device={info['device']}")
         try:
-            parts.append(f"url={_state.tabs[_state.active]['page'].url}")
+            parts.append(f"url={info['page'].url}")
         except Exception:
             pass
-    parts.append(f"viewport={args.viewport_w}x{args.viewport_h}")
+        parts.append(f"viewport={await _viewport_str(info['page'])}")
+    else:
+        parts.append(f"viewport={args.viewport_w}x{args.viewport_h} dpr={args.dpr}")
+    # contexts vivos por engine: un device = un context (desktop y mobile conviven).
+    devs = sorted({f"{i['engine']}:{i['device']}" for i in _state.tabs.values()})
+    if devs:
+        parts.append(f"live={'+'.join(devs)}")
     parts.append(f"headless={str(_state.headless_current).lower()}")
     # headless → scrollbars overlay/thin (no representativos, no honra ::-webkit-scrollbar);
     # headed → scrollbars clásicos (~16px, agarrables) = lo que ve el usuario real.
@@ -1027,7 +1277,9 @@ def _cache_note(requested_bypass: bool, client) -> str:
 
 
 async def _tool_goto(arguments: dict) -> str:
-    page = await _ensure_page(arguments.get("tab"), arguments.get("browser"))
+    notes = []
+    page = await _ensure_page(arguments.get("tab"), arguments.get("browser"),
+                              arguments.get("device"), notes_out=notes)
     url = _resolve_url(arguments["url"])
     bypass = bool(arguments.get("bypass_cache", False))
     cdp = await _open_cache_bypass(page) if bypass else None
@@ -1038,9 +1290,10 @@ async def _tool_goto(arguments: dict) -> str:
     status = resp.status if resp else "?"
     await _settle_redirect(page, url)   # capta el redirect client-side del guard de auth
     title = await page.title()
+    warn = "".join(f"\n⚠ {n}" for n in notes)
     return (f"ok {status} {page.url}{_cache_note(bypass, cdp)}{_redirect_warn(url, page.url)}\n"
-            f"title: {title}\nviewport: {args.viewport_w}x{args.viewport_h} dpr={args.dpr} "
-            f"tab={_state.active} browser={_active_engine()}")
+            f"title: {title}\nviewport: {await _viewport_str(page)} "
+            f"tab={_state.active} browser={_active_engine()} device={_active_device()}{warn}")
 
 
 async def _tool_reload(arguments: dict) -> str:
@@ -1058,7 +1311,13 @@ async def _tool_set_viewport(arguments: dict) -> str:
     page = await _ensure_page(arguments.get("tab"))
     w, h = int(arguments["w"]), int(arguments["h"])
     await page.set_viewport_size({"width": w, "height": h})
-    return f"viewport: {w}x{h} dpr={args.dpr}"
+    dev = _active_device()
+    # solo-tamaño: no toca UA/touch/dpr. En una tab con device emulado eso es deseable
+    # (rotar/probar alturas sin perder el resto de la emulación); en una tab desktop, no.
+    hint = ("" if dev != _DEVICE_DESKTOP else
+            "\n(solo tamaño: el sitio sigue viendo un desktop — UA de desktop, sin touch, "
+            "pointer:fine. Para que detecte móvil pasá device= en goto/open_tab.)")
+    return f"viewport: {await _viewport_str(page)} device={dev}{hint}"
 
 
 async def _tool_set_mode(arguments: dict) -> str:
@@ -1096,16 +1355,30 @@ async def _tool_set_mode(arguments: dict) -> str:
                 msgs.append(f"modo: ya está {'headed' if headed else 'headless'} (sin cambios)")
             else:
                 _state.headless_current = new_headless
-                # relanzar los engines que estaban vivos (o el default si no había ninguno),
-                # cada uno en el nuevo modo, conservando su sesión.
-                to_relaunch = [e for e in _VALID_ENGINES if _engine_alive(e)] or [_state.default_engine]
+                # relanzar los engines que estaban vivos (o el default si no había ninguno), cada
+                # uno en el nuevo modo, con SUS devices y conservando la sesión: los ctx_kwargs de
+                # cada context sobreviven al teardown → el iPhone vuelve como iPhone.
+                to_relaunch = [(e, list(_state.engines[e]["contexts"].keys()))
+                               for e in _VALID_ENGINES if _engine_alive(e)] or [(_state.default_engine, [])]
                 await _teardown_quiet_locked()
         if to_relaunch:
-            for eng in to_relaunch:
-                await _ensure_page(browser=eng)  # relanza ya, en el nuevo modo (conserva reduced_motion + sesión)
+            # relanza ya, en el nuevo modo (conserva reduced_motion + device + sesión)
+            async with _lock:
+                for eng, devs in to_relaunch:
+                    if not devs:
+                        d, extra, _ = await _resolve_device_locked(None, eng)
+                        devs = [d]
+                        await _ensure_context_locked(eng, d, extra)
+                    else:
+                        for d in devs:
+                            await _ensure_context_locked(eng, d)
+                    for d in devs:
+                        await _new_tab_locked(eng, d)
+                _state.last_activity = time.monotonic()
             sb = ("scrollbars ahora clásicos (~16px, agarrables)" if headed
                   else "scrollbars vuelven a overlay/thin (no representativos)")
-            msgs.append(f"modo: {'headed' if headed else 'headless'} ({'+'.join(to_relaunch)} relanzado(s); {sb})")
+            what = "+".join(f"{e}[{','.join(d) if d else _DEVICE_DESKTOP}]" for e, d in to_relaunch)
+            msgs.append(f"modo: {'headed' if headed else 'headless'} ({what} relanzado(s); {sb})")
 
     return " | ".join(msgs)
 
@@ -1114,16 +1387,17 @@ async def _tool_open_tab(arguments: dict) -> str:
     evicted = None
     engine = _norm_engine(arguments.get("browser"))
     async with _lock:
-        await _ensure_engine_locked(engine)
+        dev, ctx_extra, notes = await _resolve_device_locked(arguments.get("device"), engine)
+        await _ensure_context_locked(engine, dev, ctx_extra)
         if len(_state.tabs) >= args.max_tabs:
             candidates = [(tid, info["last_used"]) for tid, info in _state.tabs.items() if tid != _state.active]
             if candidates:
                 evicted = min(candidates, key=lambda x: x[1])[0]
                 await _safe_close_page(evicted)
-        tab_id = await _new_tab_locked(engine, label=arguments.get("label"))
+        tab_id = await _new_tab_locked(engine, dev, label=arguments.get("label"))
         _state.last_activity = time.monotonic()
     page = _state.tabs[tab_id]["page"]
-    msg = f"tab abierta: {tab_id} [{engine}]"
+    msg = f"tab abierta: {tab_id} [{engine} · {dev}]"
     if arguments.get("label"):
         msg += f" ({arguments['label']})"
     if arguments.get("url"):
@@ -1131,9 +1405,45 @@ async def _tool_open_tab(arguments: dict) -> str:
         resp = await page.goto(url, wait_until="load")
         await _settle_redirect(page, url)
         msg += f" → {resp.status if resp else '?'} {page.url}{_redirect_warn(url, page.url)}"
+    if dev != _DEVICE_DESKTOP:
+        msg += f"\nviewport: {await _viewport_str(page)}"
+    for n in notes:
+        msg += f"\n⚠ {n}"
     if evicted:
         msg += f"\n(LRU-evict de {evicted} por max-tabs={args.max_tabs})"
     return msg
+
+
+async def _tool_list_devices(arguments: dict) -> str:
+    async with _lock:
+        await _ensure_driver_locked()
+        catalog = dict(_state.pw.devices)
+    q = (arguments.get("filter") or "").strip().lower()
+    names = [n for n in catalog if not q or q in n.lower()]
+    if not names:
+        return (f"(ningún device matchea '{q}' — probá 'iphone', 'pixel', 'galaxy', 'ipad'; "
+                f"hay {len(catalog)} presets)")
+    # sin filtro son ~133 presets: devolver solo los nombres (token-cheap). Con filtro, el detalle.
+    if not q:
+        return (f"{len(names)} devices (pasá `filter` para ver viewport/dpr/UA de un subconjunto):\n"
+                + ", ".join(names))
+    limit = int(arguments.get("limit") or 30)
+    rows = []
+    for n in names[:limit]:
+        d = catalog[n]
+        vp = d.get("viewport") or {}
+        rows.append({
+            "name": n,
+            "viewport": f"{vp.get('width')}x{vp.get('height')}",
+            "dpr": d.get("device_scale_factor"),
+            "mobile": bool(d.get("is_mobile")),
+            "touch": bool(d.get("has_touch")),
+            "engine": d.get("default_browser_type"),
+        })
+    out = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+    if len(names) > limit:
+        out += f"\n({len(names) - limit} más matchean '{q}': subí `limit` o afiná el filtro)"
+    return out
 
 
 async def _tool_list_tabs(arguments: dict) -> str:
@@ -1147,7 +1457,8 @@ async def _tool_list_tabs(arguments: dict) -> str:
         except Exception:
             url = "?"
         rows.append({
-            "id": tid, "label": info["label"], "browser": info["engine"], "url": url,
+            "id": tid, "label": info["label"], "browser": info["engine"],
+            "device": info["device"], "url": url,
             "active": tid == _state.active, "idle_s": round(now - info["last_used"], 1),
         })
     return json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
@@ -2047,22 +2358,28 @@ async def _tool_load_storage_state(arguments: dict) -> str:
     except Exception as e:
         return f"(no se pudo leer {path}: {e})"
     engine = _norm_engine(arguments.get("browser") or _active_engine())
-    relaunch = False
+    devs = []
     async with _lock:
         entry = _engine_entry(engine)
         if _engine_alive(engine):
-            # teardown captura el state VIEJO en entry["storage_state"]; lo pisamos con el cargado
-            # DESPUÉS, y ensure_page relanza el context tomándolo. (storage_state solo se aplica
-            # al crear el context, no en caliente.)
-            await _teardown_engine_locked(engine)
-            relaunch = True
+            # storage_state solo se aplica al CREAR el context, no en caliente → hay que recrear
+            # los contexts de este engine (uno por device vivo; el browser sigue arriba).
+            # El teardown captura el state VIEJO en entry["storage_state"]; lo pisamos con el
+            # cargado DESPUÉS, y la recreación lo toma.
+            devs = list(entry["contexts"].keys())
+            for d in devs:
+                await _teardown_context_locked(engine, d)
         entry["storage_state"] = state
-    if relaunch:
-        await _ensure_page(browser=engine)
+        for d in devs:   # mismos devices, ahora autenticados (ctx_kwargs sobrevivió al teardown)
+            await _ensure_context_locked(engine, d)
+            await _new_tab_locked(engine, d)
+        if devs:
+            _state.last_activity = time.monotonic()
     n_cookies = len(state.get("cookies", []))
     n_origins = len(state.get("origins", []))
-    extra = (" — context relanzado; hacé goto a la app para que el localStorage del origin aplique"
-             if relaunch else f" — se aplicará al próximo arranque del browser {engine}")
+    extra = (f" — context(s) recreado(s) [{', '.join(devs)}]; hacé goto a la app para que el "
+             f"localStorage del origin aplique"
+             if devs else f" — se aplicará al próximo arranque del browser {engine}")
     return f"storage_state cargado [{engine}]: {path} ({n_cookies} cookies, {n_origins} origin(s)){extra}"
 
 
@@ -2086,6 +2403,7 @@ _DISPATCH = {
     "set_viewport": _tool_set_viewport,
     "set_mode": _tool_set_mode,
     "open_tab": _tool_open_tab,
+    "list_devices": _tool_list_devices,
     "list_tabs": _tool_list_tabs,
     "switch_tab": _tool_switch_tab,
     "close_tab": _tool_close_tab,
@@ -2113,6 +2431,35 @@ async def list_tools() -> list[types.Tool]:
     # `browser` elige el MOTOR. Los 3 conviven vivos en paralelo: el agente puede tener
     # chromium y firefox abiertos a la vez (cada tab recuerda su motor). Default: el de la tab
     # activa, o chromium si no hay ninguna.
+    # `device` emula un dispositivo COMPLETO (viewport + dpr + user_agent + is_mobile + has_touch),
+    # como el device toolbar de DevTools — a diferencia de set_viewport, que solo redimensiona.
+    # Un device = un context propio ⇒ desktop y mobile conviven vivos, igual que los motores.
+    device_param = {"device": {
+        "description": (
+            "Dispositivo a emular en esta tab. String = preset de Playwright ('iPhone 15 Pro', "
+            "'Pixel 7', 'Galaxy S9+', 'iPad Pro 11'; list_devices los enumera), 'desktop' = sin "
+            "emular. Objeto = preset + overrides, o device custom: "
+            "{preset?, viewport?:{w,h}, dpr?, user_agent?, is_mobile?, has_touch?}. "
+            "A diferencia de set_viewport (solo redimensiona ⇒ el sitio SIGUE viendo un desktop: "
+            "UA desktop, sin touch, pointer:fine), esto emula el dispositivo entero, así que la "
+            "detección de móvil del sitio ramifica de verdad. Cada device vive en su propio "
+            "context ⇒ desktop y mobile conviven: podés comparar sin perder ninguno. "
+            "OJO: el UA no cambia el MOTOR — para un iPhone fiel combiná device='iPhone 15 Pro' "
+            "con browser='webkit' (Safari real); para Android, browser='chromium'."
+        ),
+        "anyOf": [
+            {"type": "string"},
+            {"type": "object", "properties": {
+                "preset": {"type": "string", "description": "nombre de preset a usar como base (ver list_devices)"},
+                "viewport": {"type": "object", "properties": {"w": {"type": "integer"}, "h": {"type": "integer"}},
+                             "description": "pisa el tamaño del preset"},
+                "dpr": {"type": "number", "description": "device_scale_factor (retina = 2 o 3)"},
+                "user_agent": {"type": "string"},
+                "is_mobile": {"type": "boolean", "description": "meta viewport + touch events (no soportado en firefox)"},
+                "has_touch": {"type": "boolean", "description": "pointer:coarse + eventos touch"},
+            }},
+        ],
+    }}
     browser_param = {"browser": {"type": "string", "enum": list(_VALID_ENGINES),
                                  "description": "motor del navegador (chromium|firefox|webkit). Conviven en paralelo; default: el de la tab activa o chromium"}}
     return [
@@ -2129,6 +2476,7 @@ async def list_tools() -> list[types.Tool]:
                 "wait_until": {"type": "string", "enum": ["load", "domcontentloaded", "networkidle", "commit"], "default": "load"},
                 "bypass_cache": {"type": "boolean", "default": False, "description": "ignora la caché HTTP en esta navegación (hard-load, chromium)"},
                 **browser_param,
+                **device_param,
                 **tab,
             }, "required": ["url"]},
         ),
@@ -2303,7 +2651,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="set_viewport",
-            description="Cambia el tamaño del viewport (px) de la page activa.",
+            description="Cambia SOLO el tamaño del viewport (px) de la page activa. Para probar responsive NO suele alcanzar: redimensionar no convierte la tab en un móvil — el sitio sigue mandando UA de desktop, matchMedia('(pointer:coarse)') da false, no hay eventos touch y el dpr no cambia, así que todo lo que ramifique por DETECCIÓN de móvil (y no por media query de ancho) sigue tomando la rama desktop. Para eso usá `device` en goto/open_tab. Esto sirve para barrer breakpoints dentro de un mismo device, o probar alturas/rotación sin perder la emulación.",
             inputSchema={"type": "object", "properties": {
                 "w": {"type": "integer"}, "h": {"type": "integer"}, **tab,
             }, "required": ["w", "h"]},
@@ -2318,16 +2666,25 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="open_tab",
-            description=f"Abre una pestaña nueva (opcionalmente navega) en el motor `browser` (chromium|firefox|webkit; default chromium). Respeta --max-tabs={args.max_tabs} con LRU-evict. Retorna su tab_id. Para tener chromium y firefox abiertos a la vez: open_tab(browser='chromium') + open_tab(browser='firefox').",
+            description=f"Abre una pestaña nueva (opcionalmente navega) en el motor `browser` (chromium|firefox|webkit; default chromium) y el dispositivo `device` (default: desktop). Respeta --max-tabs={args.max_tabs} con LRU-evict. Retorna su tab_id. Para tener chromium y firefox abiertos a la vez: open_tab(browser='chromium') + open_tab(browser='firefox'). Para auditar responsive comparando desktop vs móvil sin perder ninguno: open_tab(label='desk') + open_tab(browser='webkit', device='iPhone 15 Pro', label='mob') → cada tab queda viva en su propio context.",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string", "description": "URL/ruta a abrir (opcional)"},
                 "label": {"type": "string", "description": "etiqueta legible (opcional)"},
                 **browser_param,
+                **device_param,
+            }},
+        ),
+        types.Tool(
+            name="list_devices",
+            description="Enumera los presets de dispositivo disponibles para `device` (los mismos que usa el device toolbar de DevTools). Sin `filter` devuelve solo los nombres (son ~133); con `filter` (substring, ej. 'iphone', 'pixel', 'galaxy', 'ipad') devuelve viewport, dpr, mobile, touch y el motor que cada uno emula. Barato: NO arranca el browser.",
+            inputSchema={"type": "object", "properties": {
+                "filter": {"type": "string", "description": "substring del nombre (case-insensitive), ej. 'iphone'"},
+                "limit": {"type": "integer", "default": 30, "description": "máx. filas con detalle (solo aplica con filter)"},
             }},
         ),
         types.Tool(
             name="list_tabs",
-            description="Lista las pestañas abiertas: id, label, browser (motor: chromium|firefox|webkit), url, cuál es la activa e idle_s.",
+            description="Lista las pestañas abiertas: id, label, browser (motor: chromium|firefox|webkit), device (dispositivo emulado, 'desktop' si ninguno), url, cuál es la activa e idle_s.",
             inputSchema={"type": "object", "properties": {}},
         ),
         types.Tool(
@@ -2498,7 +2855,7 @@ async def list_tools() -> list[types.Tool]:
 async def call_tool(name: str, arguments: dict):
     try:
         if name == "status":
-            result = _status_line()
+            result = await _status_line()
         elif name in _DISPATCH:
             result = await _DISPATCH[name](arguments or {})
         else:

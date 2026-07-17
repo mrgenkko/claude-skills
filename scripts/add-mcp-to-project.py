@@ -152,6 +152,13 @@ def build_mcp_servers(servers_config: list) -> dict:
             ]
             if entry.get("base_url"):
                 args.append(f"--base-url={entry['base_url']}")
+            if entry.get("device"):
+                args.append(f"--device={entry['device']}")
+            for k, flag in (("viewport_w", "--viewport-w"),
+                            ("viewport_h", "--viewport-h"),
+                            ("dpr", "--dpr")):
+                if entry.get(k) is not None:
+                    args.append(f"{flag}={entry[k]}")
             if entry.get("headless", True):
                 args.append("--headless")
             else:

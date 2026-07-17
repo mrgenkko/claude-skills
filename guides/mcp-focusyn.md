@@ -43,7 +43,7 @@ registrado en los proyectos activos. El binario `obsidian` raw se conserva en
 | `lint_vault(vault="", kind="")` | `GET /v1/lint` | Lista docs indexados que violan el schema vigente (deuda de frontmatter). Sin filtros audita los 3 vaults. Sáldalos con `patch_frontmatter` |
 | `peek_id(vault, kind)` | `GET /v1/ids/peek` | Último/próximo doc_id para `(vault, kind)` SIN consumir uno (no cuentes a mano). `in_sync=false` señala drift contador↔índice |
 | `push_vault(vault)` | `POST /v1/sync/push` | Empuja commits locales pendientes a GitHub (push fallido / commits manuales). Al día → `pushed: false`. Requiere scope `sync` |
-| `add_attachment(source_path, vault, doc_id="", alt="", filename="")` | `POST /v1/write/attachment` | Sube un binario (imagen/PDF/audio) al **NAS vía gateway** (fuera de Git). Devuelve `markdown_ref` (`![alt](/v1/attachment/{file_id})`) + `file_id` + `status`. Con `doc_id` + imagen → indexado multimodal (recuperable cross-modal por `search_notes`). Idempotente por `(vault, source_path)`. Scope `apply` |
+| `add_attachment(content_base64, vault, filename, doc_id="", alt="", content_type="")` | `POST /v1/write/attachment` | Sube un binario **chico** (imagen/PDF/audio) al **NAS vía gateway** (fuera de Git). `content_base64` SOLO para archivos <~1 MB (requiere `filename`): el MCP corre EN el gateway, un base64 grande se corrompe/topa el cap de 8 MB. **Grandes o en tu disco → el CLI `focusyn attachment upload --file … --vault …`** (streaming multipart, hasta 50 MB) o multipart directo a `POST /v1/write/attachment`. Devuelve `markdown_ref` (`![alt](/v1/attachment/{file_id})`) + `file_id` + `status`. Con `doc_id` + imagen → indexado multimodal (recuperable cross-modal por `search_notes`). Idempotente content-addressed por `(contenido, vault)`. Scope `apply`. (`source_path` fue removido: en el `/mcp` remoto leería el disco del gateway, no el del agente.) |
 | `delete_attachment(file_id)` | `DELETE /v1/attachment/{file_id}` | Borra una imagen/binario **suelto** del NAS por `file_id` (el UUID de `![alt](/v1/attachment/{file_id})`): binario + fila `attachments` + chunk multimodal. Devuelve `{file_id, status}` (`deleted` \| `already_deleted`). Idempotente. Para borrar TODOS los adjuntos de un doc usa `delete_note` (cascade). Scope `apply` |
 
 > **Edición quirúrgica gobernada (Fase 8):** `edit_note` (str_replace del body),
@@ -132,20 +132,22 @@ uv run focusyn agent create \
 > `sync` es necesario para `push_vault`. La key se muestra **una sola vez**; rótala con
 > `uv run focusyn agent rotate-key focusyn-mcp-local` (y re-registra con la nueva).
 
-### 2. Arrancar el gateway
+### 2. Endpoint del gateway
+
+El gateway canónico está **en la nube**: `https://focusyn.melquiades.systems/mcp/`
+(siempre disponible, no depende de que corras nada local). Verificar (sin auth = 401;
+con la key, el handshake responde):
 
 ```bash
-cd /home/melquiades/focusyn
-docker compose up -d        # contenedor focusyn-gateway-1, :7415
-# o en dev: make dev        # uvicorn --reload --port 7415
+curl -s -o /dev/null -w "health: %{http_code}\n" https://focusyn.melquiades.systems/health   # 200
+curl -s -o /dev/null -w "/mcp/: %{http_code}\n"   https://focusyn.melquiades.systems/mcp/    # 401 (sin auth)
 ```
 
-Verificar el endpoint MCP (sin auth = 401; con la key, el handshake responde):
+> **El trailing slash importa**: `/mcp` (sin barra) responde **301**. Registra siempre `/mcp/`.
 
-```bash
-curl -s -o /dev/null -w "health: %{http_code}\n" http://localhost:7415/health   # 200
-curl -s -o /dev/null -w "/mcp/: %{http_code}\n"   http://localhost:7415/mcp/     # 401 (sin auth)
-```
+Para desarrollo del propio gateway, el fallback local sigue disponible en `:7415`
+(`docker compose up -d` → contenedor `focusyn-gateway-1`, o `make dev` con `--reload`);
+en ese caso la URL es `http://localhost:7415/mcp/`.
 
 ### 3. Registrar en `scripts/secrets.json`
 
@@ -153,7 +155,7 @@ curl -s -o /dev/null -w "/mcp/: %{http_code}\n"   http://localhost:7415/mcp/    
 {
   "name": "focusyn",
   "type": "focusyn",
-  "url": "http://localhost:7415/mcp/",
+  "url": "https://focusyn.melquiades.systems/mcp/",
   "agent_key": "a2a_<KEY>"
 }
 ```
@@ -168,7 +170,7 @@ focusyn se registra **una sola vez** en el `mcpServers` top-level de `~/.claude.
 
 ```bash
 claude mcp add --scope user --transport http focusyn \
-  http://localhost:7415/mcp/ --header "X-Agent-Key: a2a_<KEY>"
+  https://focusyn.melquiades.systems/mcp/ --header "X-Agent-Key: a2a_<KEY>"
 ```
 
 > Precedencia de scopes: **Local > Project > User**. No dejes un `focusyn` per-project
@@ -182,7 +184,7 @@ Después: **reiniciar Claude Code en VSCode** para que cargue el MCP.
 
 | Campo | Valor | Descripción |
 |---|---|---|
-| `url` | `http://localhost:7415/mcp/` | Endpoint Streamable HTTP del gateway (in-process `/mcp`) |
+| `url` | `https://focusyn.melquiades.systems/mcp/` | Endpoint Streamable HTTP del gateway en la nube (in-process `/mcp`). Con **trailing slash**: sin él responde 301. Fallback dev local: `http://localhost:7415/mcp/` |
 | header `X-Agent-Key` | `a2a_<...>` | Key del agente de máquina (`focusyn-mcp-local`); el gateway resuelve scopes y aplica governance |
 
 El MCP ya **no lee el disco del cliente**: el `id` del frontmatter (para
@@ -204,11 +206,11 @@ El MCP ya **no lee el disco del cliente**: el `id` del frontmatter (para
 
 ## Smoke test
 
-Con el gateway corriendo, un handshake MCP `initialize` debe devolver
+Un handshake MCP `initialize` contra el gateway debe devolver
 `serverInfo.name = "focusyn"`:
 
 ```bash
-curl -s -X POST http://localhost:7415/mcp/ \
+curl -s -X POST https://focusyn.melquiades.systems/mcp/ \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "X-Agent-Key: a2a_<KEY>" \

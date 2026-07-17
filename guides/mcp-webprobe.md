@@ -25,8 +25,9 @@ navegar/click es trivial para el scope (tus landings, en chromium/firefox/webkit
 | Grupo | Tool | Uso |
 |---|---|---|
 | Sesión | `status` | Estado (running, **qué motores están vivos**, tabs con su motor, url, modo). Barato: **no** arranca el browser. |
-| Sesión | `goto` | Navega a una URL (relativa a `--base-url` o completa). Arranca el browser solo. **`browser`** elige el motor (`chromium`\|`firefox`\|`webkit`) — los 3 conviven a la vez sin pisarse (ver sección Multi-navegador). **`bypass_cache=true`** fuerza fetch de red (hard-load) — tras rebuild del frontend en apps sin hashing de assets. |
-| Sesión | `reload`, `set_viewport` | Recargar (`bypass_cache=true` = hard-reload, ignora caché) / cambiar viewport. |
+| Sesión | `goto` | Navega a una URL (relativa a `--base-url` o completa). Arranca el browser solo. **`browser`** elige el motor (`chromium`\|`firefox`\|`webkit`) — los 3 conviven a la vez sin pisarse (ver sección Multi-navegador). **`device`** emula un celular/tablet completo (ver sección Responsive). **`bypass_cache=true`** fuerza fetch de red (hard-load) — tras rebuild del frontend en apps sin hashing de assets. |
+| Sesión | `list_devices` | Enumera los presets de dispositivo para `device` (los mismos del device toolbar de DevTools). Sin `filter` = solo nombres (~133); con `filter` (`'iphone'`, `'pixel'`…) = viewport, dpr, mobile, touch y motor emulado. Barato: **no** arranca el browser. |
+| Sesión | `reload`, `set_viewport` | Recargar (`bypass_cache=true` = hard-reload, ignora caché) / cambiar **solo el tamaño** del viewport (para móvil de verdad → `device`, ver sección Responsive). |
 | Sesión | `save_storage_state`, `load_storage_state` | Persisten/cargan la sesión (cookies+localStorage) a disco para reusarla entre llamadas/arranques → saltar el login. No mutan (sin gate). El server además persiste la sesión en memoria entre recreaciones de context. |
 | Sesión | `set_mode` | `headed` (headless↔headed en runtime, gate `allow_headed`) y/o `reduced_motion` (`reduce`\|`no-preference`, emula prefers-reduced-motion sin relanzar — valida la rama `useReducedMotion` del DS). **headed también habilita scrollbars clásicos** (headless da thin/overlay no representativo — ver sección scrollbars). |
 | **Interacción** | `click` | Click en un elemento (botón Entrar/Generar/Aplicar/Aprobar). Selector CSS/`text=`/`role=`; `nth` desambigua. Reporta si navegó (URL+title) o cambió estado. **`force=true`** dispara el click a nivel DOM (dispatchEvent) para targets tapados por un overlay/canvas WebGL (ver gotcha abajo). **`position={x,y}`** clickea un offset (px) dentro del elemento (scrollbar/canvas/mapa/slider). |
@@ -187,6 +188,63 @@ Detalles del modelo:
 > browser="webkit")` devuelve un mensaje claro pidiendo ese comando. Chromium y Firefox ya
 > funcionan sin paso extra.
 
+## Responsive: emular un celular (`device`)
+
+**`set_viewport` NO alcanza para probar responsive.** Redimensionar cambia los píxeles, pero
+el sitio sigue viendo un desktop: UA de desktop, `matchMedia('(pointer: coarse)')` en `false`,
+sin eventos touch, `dpr=1`. Todo lo que ramifique por **detección** de móvil (y no por media
+query de ancho) sigue tomando la rama desktop. Medido sobre la misma página:
+
+```
+set_viewport(390, 844) → {ua_mobile:false, pointer_coarse:false, ontouchstart:false, dpr:1,  innerWidth:390}
+device="Pixel 7"       → {ua_mobile:true,  pointer_coarse:true,  ontouchstart:true,  dpr:2.625}
+```
+
+**`device`** (en `goto`/`open_tab`, desde v0.5.3) emula el dispositivo **entero** —
+viewport + `device_scale_factor` + `user_agent` + `is_mobile` + `has_touch` — igual que el
+device toolbar de DevTools, con los mismos ~133 presets (`list_devices` los enumera):
+
+```
+goto(url, browser="webkit", device="iPhone 15 Pro")     # preset
+open_tab(device={"preset": "Pixel 7", "viewport": {"w": 412, "h": 1200}})   # preset + override
+open_tab(device={"viewport": {"w": 360, "h": 800}, "is_mobile": true,       # custom puro
+                 "has_touch": true, "dpr": 3})
+goto(url, device="desktop")                             # sin emular (default)
+```
+
+**Un device = un context propio ⇒ desktop y mobile conviven vivos**, igual que los motores.
+Ese es el punto: comparás sin perder ninguno, en vez de alternar.
+
+```
+open_tab(url, label="desk")                                        → t1  desktop
+open_tab(url, browser="webkit", device="iPhone 15 Pro", label="mob") → t2  393x659 dpr3 touch
+screenshot(tab="t1"); screenshot(tab="t2")   # ambos vivos, sin relanzar nada
+```
+
+Detalles del modelo:
+- **El UA no cambia el MOTOR.** `device="iPhone 15 Pro"` sobre chromium es Blink diciendo que
+  es Safari — el mismo autoengaño que el device toolbar de Chrome. Para un iPhone fiel,
+  combinalo con **`browser="webkit"`** (Safari real); para Android, `browser="chromium"`. Si el
+  preset y el motor no matchean, el server lo avisa (no lo bloquea).
+- **`is_mobile` no existe en firefox** (Playwright lo rechaza): se ignora **con aviso** y el
+  resto (viewport/UA/dpr) sí emula. Para móvil real → webkit o chromium.
+- **La sesión se comparte entre devices del mismo motor** (`storage_state` es por motor):
+  logueás en desktop y el context mobile nace autenticado.
+- **`set_viewport` sigue sirviendo** dentro de una tab con device: barrer breakpoints o probar
+  alturas/rotación sin perder la emulación (no toca UA/touch/dpr).
+- **Los devices sobreviven a las recreaciones de context** (`set_mode(headed)`, crash,
+  `load_storage_state`): el iPhone vuelve como iPhone.
+- **Reaper**: un device sin tabs cierra su context (libera RAM); el motor sobrevive si le queda
+  algún otro device.
+- **`--device`** en `secrets.json` fija el device por defecto de la instancia (default: desktop).
+  Es opcional: lo normal es que el agente lo pase por tab.
+- **Incompatible con `--persistent-profile`** (ese modo abre un único context fijo): el server
+  devuelve un mensaje claro sugiriendo otro motor.
+
+> Un móvil real, ante una página **sin `<meta name="viewport">`**, usa un layout viewport de
+> ~980px. La emulación es fiel a eso: vas a ver `innerWidth: 980` aunque el device sea de
+> 390px. No es un bug del server — es el síntoma de que a la página le falta el meta tag.
+
 ## headless vs headed
 
 `headless` en `secrets.json` es solo el **modo de arranque**. El agente lo cambia en
@@ -248,7 +306,9 @@ el protocolo y sirve si exponés el MCP por HTTP a otra máquina sin disco.
 ```
 
 **Cero credenciales** — solo registro de instancia. Campos opcionales: `base_url`
-(para `goto` relativo), `persistent_profile` (conserva auth/cookies),
+(para `goto` relativo), `device` (dispositivo por defecto, ej. `"iPhone 15 Pro"`; default
+desktop — normalmente **no** se fija acá, el agente lo pasa por tab), `viewport_w`/`viewport_h`/`dpr`
+(el desktop base), `persistent_profile` (conserva auth/cookies; **incompatible con `device`**),
 `artifact_dir`/`artifact_ttl`/`max_artifacts`. La URL la pasa el agente en `goto`, así
 que una sola instancia genérica `webprobe` sirve para todos los proyectos.
 
