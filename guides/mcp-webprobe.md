@@ -320,8 +320,38 @@ que una sola instancia genérica `webprobe` sirve para todos los proyectos.
   necesita** (`libwoff1`, `libgstreamer*`, `libavif`, `libenchant`, `libsecret`, `libmanette`).
   Instalalas una vez con `sudo "<venv>/bin/playwright" install-deps webkit` (o `install-deps` para
   los 3). Sin ellas, `goto(..., browser="webkit")` devuelve el comando exacto como aviso.
-- **Display para headed**: `set_mode(headed=true)` y los motores no-headless requieren un display
-  (en WSL lo provee **WSLg** — esta máquina ya lo tiene: `DISPLAY=:0`).
+- **Display para headed**: `set_mode(headed=true)` y los motores no-headless requieren un display.
+  (Antes de julio 2026 esto corría en WSL y lo proveía WSLg; ahora es Ubuntu nativo.)
+
+### WebKit en Ubuntu 26.04 — dos trampas
+
+Desde la migración a Ubuntu 26.04 (julio 2026), WebKit necesita dos arreglos que **chromium y
+firefox no necesitan**. Sin ellos `goto(browser="webkit")` falla; los otros dos motores andan.
+
+**1. `install-deps` no sirve: los sonames cambiaron.** El bundle webkit de Playwright 1.49 se
+compiló en Ubuntu 24.04 y linkea contra versiones que 26.04 ya no empaqueta (icu 74 → 78,
+libxml2 `.so.2` → `.so.16`, vpx 9 → 12, x264 164 → 165). Por eso apt responde *"no se ha podido
+localizar el paquete libicu74"*: no falta, dejó de existir. La solución es traer esas libs de
+Noble al `sys/lib` del propio bundle, que sus wrappers ya tienen en `LD_LIBRARY_PATH`:
+
+```bash
+scripts/fix-webkit-libs-ubuntu26.sh   # sin sudo, no toca el sistema
+```
+
+Reejecutalo después de cada `playwright install webkit`, que borra el bundle y se lleva las libs.
+
+**2. El snap de VSCode rompe el proceso de red.** VSCode está instalado como snap y exporta
+`GIO_MODULE_DIR` apuntando a los módulos GIO del snap, linkeados contra la glibc de core20.
+El `WPENetworkProcess` de WebKit los carga y muere con `undefined symbol: __libc_pthread_init`;
+hacia afuera se ve como `Page.goto: WebKit encountered an internal error`, incluso sobre HTTP
+plano. El antídoto es pisar la variable con los módulos del sistema:
+
+```json
+"env": { "GIO_MODULE_DIR": "/usr/lib/x86_64-linux-gnu/gio/modules" }
+```
+
+`add-mcp-to-project.py` ya lo genera para los MCP de tipo `webprobe`, así que las instancias
+nuevas salen sanas. Solo importa si registrás una config a mano.
 
 ## Instalación
 
@@ -331,6 +361,9 @@ bash "/home/melquiades/Mrgenkko Skills/scripts/install-webprobe-mcp.sh"
 # → playwright install chromium firefox webkit (los 3 motores, en ~/.cache/ms-playwright)
 # → playwright install-deps (libs del SO; requiere sudo — si no hay, avisa el comando para webkit)
 # → copia server.py a ~/.claude/mcp-servers/webprobe/
+
+# En Ubuntu 26.04, además (ver "WebKit en Ubuntu 26.04" arriba):
+bash "/home/melquiades/Mrgenkko Skills/scripts/fix-webkit-libs-ubuntu26.sh"
 ```
 
 > El MCP es de vida larga: editar `server.py` **no** recarga el proceso vivo. Tras actualizar

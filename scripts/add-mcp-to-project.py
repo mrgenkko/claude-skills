@@ -26,6 +26,8 @@ SKILLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SECRETS_FILE = os.path.join(SKILLS_DIR, "scripts", "secrets.json")
 VENV_PYTHON = os.path.join(SKILLS_DIR, ".venv", "bin", "python")
 MCP_SERVERS_DIR = os.path.expanduser("~/.claude/mcp-servers")
+# Módulos GIO del sistema — antídoto al GIO_MODULE_DIR que inyecta el snap de VSCode.
+GIO_MODULE_DIR_SYS = "/usr/lib/x86_64-linux-gnu/gio/modules"
 
 
 def load_secrets() -> dict:
@@ -176,6 +178,12 @@ def build_mcp_servers(servers_config: list) -> dict:
                             ("max_artifacts", "--max-artifacts")):
                 if entry.get(k) is not None:
                     args.append(f"{flag}={entry[k]}")
+
+            # VSCode instalado como snap exporta GIO_MODULE_DIR apuntando a los módulos
+            # GIO del snap, linkeados contra la glibc de core20. El proceso de red de
+            # WebKit los carga y muere con "undefined symbol: __libc_pthread_init".
+            # Lo pisamos con los módulos del sistema; sin esto webkit no navega.
+            env.setdefault("GIO_MODULE_DIR", GIO_MODULE_DIR_SYS)
 
         else:
             print(f"WARN: tipo desconocido '{kind}' para '{name}', ignorando.")
