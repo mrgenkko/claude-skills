@@ -156,6 +156,12 @@ def build_mcp_servers(servers_config: list) -> dict:
                 args.append(f"--base-url={entry['base_url']}")
             if entry.get("device"):
                 args.append(f"--device={entry['device']}")
+            # capacidad (CPU/red/cores/RAM) y backend gráfico por defecto de la instancia.
+            # Lo normal es no fijarlos y que el agente los pase por tab / con set_mode.
+            if entry.get("device_class"):
+                args.append(f"--device-class={entry['device_class']}")
+            if entry.get("gpu_tier"):
+                args.append(f"--gpu-tier={entry['gpu_tier']}")
             for k, flag in (("viewport_w", "--viewport-w"),
                             ("viewport_h", "--viewport-h"),
                             ("dpr", "--dpr")):

@@ -47,6 +47,11 @@ parser.add_argument("--dpr", type=float, default=1.0)
 # device por defecto de las tabs nuevas (nombre de preset Playwright, ej. "iPhone 15 Pro").
 # Default None = desktop (viewport-w/h + dpr). El agente lo pisa por tab con `device` en goto/open_tab.
 parser.add_argument("--device", default=None)
+# clase de dispositivo por defecto (capacidad: CPU/red/cores/RAM). "desktop" = sin throttling.
+parser.add_argument("--device-class", dest="device_class", default="desktop")
+# gpu tier por defecto: auto (lo que decida el browser) | hardware (forzar GPU real) | software (SwiftShader)
+parser.add_argument("--gpu-tier", dest="gpu_tier", default="auto",
+                    choices=["auto", "hardware", "software"])
 parser.add_argument("--reduced-motion", default=None, choices=["reduce", "no-preference"])
 parser.add_argument("--nav-timeout-ms", type=int, default=15000)
 # ciclo de vida / multi-tab
@@ -64,7 +69,7 @@ SERVER_LABEL = args.name or "webprobe"
 # Bump en cada cambio de comportamiento. El agente lo ve en status() para saber si el
 # proceso MCP está stale (un MCP es de vida larga; editar server.py NO recarga el proceso
 # vivo — hay que reiniciar Claude Code / recargar la ventana de VSCode).
-WEBPROBE_VERSION = "0.5.3"
+WEBPROBE_VERSION = "0.5.6"
 app = Server(f"webprobe-{SERVER_LABEL}")
 
 
@@ -73,6 +78,41 @@ app = Server(f"webprobe-{SERVER_LABEL}")
 # ──────────────────────────────────────────────────────────────────────────
 _VALID_ENGINES = ("chromium", "firefox", "webkit")
 _DEVICE_DESKTOP = "desktop"   # device_key del context sin emulación (viewport-w/h + dpr del CLI)
+
+# ── Clases de dispositivo: emulan la CAPACIDAD, no la forma ────────────────
+# `device` (viewport/dpr/UA/touch) responde "¿se ve bien en un celu?".
+# `device_class` responde "¿se SIENTE bien en un celu?" — que es otra pregunta y otro eje.
+# Un celular de gama baja no es un desktop con la ventana chica: tiene ~4-6x menos CPU
+# por core, red con latencia alta, pocos cores y poca RAM. Sin esto, medir FPS con un
+# viewport de 360px sobre un desktop da siempre verde y el jank recién aparece en prod.
+# cpu = multiplicador de ralentización del renderer (CDP Emulation.setCPUThrottlingRate).
+_DEVICE_CLASSES = {
+    "desktop":  {"cpu": 1,   "net": "none",    "cores": None, "mem": None,
+                 "about": "sin throttling (comportamiento histórico del MCP)"},
+    "flagship": {"cpu": 1.5, "net": "wifi",    "cores": 8,    "mem": 8,
+                 "about": "iPhone reciente / Android tope de gama"},
+    "mid":      {"cpu": 4,   "net": "fast_4g", "cores": 8,    "mem": 4,
+                 "about": "Android gama media (el 4x que usa el CPU throttling de DevTools)"},
+    "low_end":  {"cpu": 6,   "net": "slow_4g", "cores": 4,    "mem": 2,
+                 "about": "Android gama baja / entrada — el escenario donde aparece el stutter"},
+}
+_DEFAULT_CLASS = "desktop"
+if args.device_class not in _DEVICE_CLASSES:
+    parser.error(f"--device-class inválida: '{args.device_class}'. Opciones: {', '.join(_DEVICE_CLASSES)}")
+
+# Perfiles de red con los valores canónicos de Chrome DevTools (ThrottlingPresets):
+# bytes/seg y latencia en ms. Los factores 0.9/0.8 son el overhead que DevTools ya descuenta.
+_NET_PROFILES = {
+    "none":    None,
+    "wifi":    {"download": 30 * 1024 * 1024 / 8, "upload": 15 * 1024 * 1024 / 8, "latency": 2},
+    "fast_4g": {"download": 9 * 1024 * 1024 / 8 * 0.9, "upload": 1.5 * 1024 * 1024 / 8 * 0.9,
+                "latency": 60 * 2.75},
+    "slow_4g": {"download": 1.6 * 1024 * 1024 / 8 * 0.9, "upload": 750 * 1024 / 8 * 0.9,
+                "latency": 150 * 3.75},
+    "slow_3g": {"download": 500 * 1024 / 8 * 0.8, "upload": 500 * 1024 / 8 * 0.8,
+                "latency": 400 * 5},
+    "offline": {"offline": True},
+}
 
 
 class _State:
@@ -88,15 +128,21 @@ class _State:
     # todos sus devices → logueás en desktop y el context mobile nace autenticado.
     # Las entradas persisten aunque se apague el browser (guardan storage_state + ctx_kwargs).
     engines: dict = {}
-    tabs: dict = {}          # tab_id -> {"page", "label", "last_used", "engine", "device"}
+    tabs: dict = {}          # tab_id -> {"page", "label", "last_used", "engine", "device",
+                             #            "klass": device_class, "cdp": CDPSession|None}
     active = None            # tab_id activo (global, cualquier engine)
     last_activity = 0.0      # time.monotonic() del último tool call
+    # gpu_tier es flag de LAUNCH (como headless) → cambiarlo relanza el browser.
+    gpu_tier_current = args.gpu_tier
+    gpu_renderer = None      # string real reportado por el driver (cache; None = sin medir aún)
+    bench_index = None       # índice de CPU del host (cache de calibrate())
     headless_current = args.headless
     reduced_motion_current = args.reduced_motion   # None | "reduce" | "no-preference" (override runtime)
     tab_counter = 0
     artifact_counter = 0
     default_engine = args.browser if args.browser in _VALID_ENGINES else "chromium"  # engine de una tab sin `browser` explícito
     default_device = args.device   # device de una tab sin `device` explícito (None = desktop)
+    default_class = args.device_class   # device_class de una tab sin `device_class` explícito
 
 
 _state = _State()
@@ -128,6 +174,168 @@ def _active_device() -> str:
     """device_key de la tab activa, o desktop si no hay tab activa."""
     info = _state.tabs.get(_state.active) if _state.active else None
     return info["device"] if info else _DEVICE_DESKTOP
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# device_class: emulación de CAPACIDAD (CPU/red/cores/RAM) — chromium-only (CDP)
+# ──────────────────────────────────────────────────────────────────────────
+def _tab_of(page) -> str:
+    """tab_id de una page (los tools reciben la page ya resuelta, no el id)."""
+    for tid, info in _state.tabs.items():
+        if info.get("page") is page:
+            return tid
+    return _state.active
+
+
+def _tab_class(tab_id: str) -> str:
+    info = _state.tabs.get(tab_id) or {}
+    return info.get("klass") or _DEFAULT_CLASS
+
+
+def _norm_class(name) -> str:
+    k = (name or _DEFAULT_CLASS).strip().lower()
+    if k not in _DEVICE_CLASSES:
+        raise RuntimeError(f"device_class desconocida: '{name}'. Opciones: "
+                           f"{', '.join(_DEVICE_CLASSES)}.")
+    return k
+
+
+async def _cdp_of(page):
+    """Sesión CDP persistente de la tab (una por tab, reutilizada). None fuera de chromium.
+    Persistente a propósito: los overrides de Emulation viven mientras la sesión esté attachada,
+    así que abrir/cerrar por llamada los perdería."""
+    tid = _tab_of(page)
+    info = _state.tabs.get(tid)
+    if info is None:
+        return None
+    cdp = info.get("cdp")
+    if cdp is not None:
+        return cdp
+    if info.get("engine") != "chromium":
+        return None
+    try:
+        cdp = await page.context.new_cdp_session(page)
+    except Exception:
+        return None
+    info["cdp"] = cdp
+    return cdp
+
+
+async def _apply_class_to_page(page, klass: str) -> list:
+    """Aplica (o levanta) el throttling de una device_class sobre una page. Devuelve avisos.
+    Idempotente: 'desktop' resetea todo a 1x / sin throttle de red."""
+    prof = _DEVICE_CLASSES[klass]
+    notes = []
+    cdp = await _cdp_of(page)
+    if cdp is None:
+        tid = _tab_of(page)
+        eng = (_state.tabs.get(tid) or {}).get("engine", "?")
+        if klass != _DEFAULT_CLASS:
+            notes.append(
+                f"device_class='{klass}' NO se aplicó: el throttling de CPU/red va por CDP y "
+                f"'{eng}' no lo expone (chromium-only). El viewport/UA del device sí emulan, "
+                f"pero la CAPACIDAD es la de tu desktop — los FPS de esta tab no representan un celu.")
+        return notes
+
+    # CPU: ralentiza la ejecución del renderer (JS, style, layout, paint). NO toca la GPU
+    # (para eso está gpu_tier): una página que jankea por blur/WebGL puede dar 60fps a 6x.
+    try:
+        await cdp.send("Emulation.setCPUThrottlingRate", {"rate": float(prof["cpu"])})
+    except Exception as e:
+        notes.append(f"CPU throttling falló: {e}")
+
+    # Red
+    net = _NET_PROFILES.get(prof["net"])
+    try:
+        if net is None:
+            await cdp.send("Network.emulateNetworkConditions",
+                           {"offline": False, "latency": 0, "downloadThroughput": -1,
+                            "uploadThroughput": -1})
+        elif net.get("offline"):
+            await cdp.send("Network.emulateNetworkConditions",
+                           {"offline": True, "latency": 0, "downloadThroughput": 0,
+                            "uploadThroughput": 0})
+        else:
+            await cdp.send("Network.emulateNetworkConditions", {
+                "offline": False, "latency": net["latency"],
+                "downloadThroughput": net["download"], "uploadThroughput": net["upload"]})
+    except Exception as e:
+        notes.append(f"network throttling falló: {e}")
+
+    # hardwareConcurrency: muchas libs (el scheduler de React entre ellas) ramifican por este
+    # número. Un desktop reporta 24 y la página elige el camino caro que el celu no aguanta.
+    try:
+        if prof["cores"]:
+            await cdp.send("Emulation.setHardwareConcurrencyOverride",
+                           {"hardwareConcurrency": int(prof["cores"])})
+        else:
+            await cdp.send("Emulation.setHardwareConcurrencyOverride",
+                           {"hardwareConcurrency": os.cpu_count() or 8})
+    except Exception:
+        notes.append("hardwareConcurrency no soportado por este Chrome (ignorado)")
+
+    # deviceMemory no tiene comando CDP → init script. Aplica desde la PRÓXIMA navegación
+    # (el documento vivo ya leyó navigator.deviceMemory).
+    try:
+        mem = prof["mem"]
+        js = (f"Object.defineProperty(navigator,'deviceMemory',{{get:()=>{mem},configurable:true}});"
+              if mem else "")
+        if js:
+            await cdp.send("Page.addScriptToEvaluateOnNewDocument", {"source": js})
+    except Exception:
+        pass
+    return notes
+
+
+async def _set_tab_class(page, klass: str) -> list:
+    """Fija la device_class de la tab de `page` y la aplica. Pegajosa: sobrevive navegaciones."""
+    klass = _norm_class(klass)
+    tid = _tab_of(page)
+    if tid in _state.tabs:
+        _state.tabs[tid]["klass"] = klass
+    return await _apply_class_to_page(page, klass)
+
+
+async def _reapply_class(page):
+    """Re-aplica el throttling tras navegar. Necesario: una navegación cross-origin puede
+    cambiar el proceso del renderer (site isolation) y llevarse los overrides puestos."""
+    tid = _tab_of(page)
+    klass = _tab_class(tid)
+    if klass == _DEFAULT_CLASS:
+        return
+    try:
+        await _apply_class_to_page(page, klass)
+    except Exception:
+        pass
+
+
+def _class_tag(page) -> str:
+    """Etiqueta de contexto para los reportes de medición. Sin esto, un 'smooth' de desktop y
+    uno de low_end se leen idénticos y se comparan números que no son comparables."""
+    tid = _tab_of(page)
+    klass = _tab_class(tid)
+    prof = _DEVICE_CLASSES[klass]
+    dev = (_state.tabs.get(tid) or {}).get("device", _DEVICE_DESKTOP)
+    bits = [f"class={klass}"]
+    if prof["cpu"] != 1:
+        bits.append(f"cpu={prof['cpu']}x")
+    if prof["net"] != "none":
+        bits.append(prof["net"])
+    if dev != _DEVICE_DESKTOP:
+        bits.append(f"device={dev}")
+    if _state.gpu_renderer:
+        bits.append(f"gpu={_gpu_short(_state.gpu_renderer)}")
+    return "[" + " · ".join(bits) + "]"
+
+
+def _gpu_short(renderer: str) -> str:
+    r = (renderer or "").lower()
+    if "swiftshader" in r or "llvmpipe" in r or "software" in r:
+        return "software"
+    for tag in ("nvidia", "amd", "radeon", "intel", "apple", "mali", "adreno"):
+        if tag in r:
+            return tag
+    return "hardware" if "hardware" in r else "hw?"
 
 
 def _resolve_url(url: str) -> str:
@@ -400,6 +608,29 @@ async def _teardown_quiet_locked():
     _state.active = None
 
 
+def _gpu_flags(tier: str) -> list:
+    """Flags de launch del backend gráfico. Es un eje INDEPENDIENTE de device_class: el CPU
+    throttling de CDP ralentiza el renderer pero NO la GPU, así que una página que jankea por
+    blur/backdrop-filter/WebGL puede dar 60fps a 6x de CPU y romperse igual en un celu.
+
+    OJO: headless arranca por defecto SIN GPU real (rasteriza con SwiftShader por CPU). Eso
+    significa que las mediciones históricas del MCP ya venían de un backend por software sin
+    avisarlo. Pedir 'hardware' NO garantiza obtenerlo (depende de driver/display/permisos) →
+    gpu_info reporta el renderer REAL y status lo muestra."""
+    if tier == "software":
+        # SwiftShader explícito: rasterización por CPU = proxy razonable de una GPU móvil pobre.
+        return ["--use-gl=swiftshader", "--use-angle=swiftshader",
+                "--disable-gpu-rasterization", "--disable-accelerated-2d-canvas"]
+    if tier == "hardware":
+        # GPU real en headless vía ANGLE sobre OpenGL. Medido en este equipo: da las 4 features
+        # aceleradas (gpu_compositing/rasterization/webgl/webgl2) con WebGL funcionando.
+        # NO usar --use-angle=vulkan: reporta las mismas 4 aceleradas pero el contexto WebGL no
+        # se crea desde JS, así que cualquier página con canvas/three.js queda sin medir.
+        return ["--use-gl=angle", "--use-angle=gl",
+                "--ignore-gpu-blocklist", "--enable-gpu-rasterization"]
+    return []
+
+
 def _uses_profile(engine: str) -> bool:
     """persistent_profile (raro; default None) solo tiene sentido para UN engine en disco →
     se aplica al default_engine; los demás engines arrancan efímeros."""
@@ -414,11 +645,12 @@ async def _launch_browser_locked(engine: str):
     launch_kwargs = {"headless": _state.headless_current}
     if engine == "chromium":
         # flags anti-throttling: el render no se ralentiza en background → medición fiel.
+        # (Es lo contrario a device_class: acá quitamos ruido del entorno, no simulamos un celu.)
         launch_kwargs["args"] = [
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
             "--disable-background-timer-throttling",
-        ]
+        ] + _gpu_flags(_state.gpu_tier_current)
     try:
         if _uses_profile(engine):
             ctx_kwargs = dict(entry["ctx_kwargs"].get(_DEVICE_DESKTOP) or _base_ctx_kwargs())
@@ -495,7 +727,8 @@ async def _ensure_context_locked(engine: str, device: str = _DEVICE_DESKTOP, ctx
     return engine
 
 
-async def _new_tab_locked(engine: str = None, device: str = _DEVICE_DESKTOP, label: str = None) -> str:
+async def _new_tab_locked(engine: str = None, device: str = _DEVICE_DESKTOP, label: str = None,
+                          klass: str = None) -> str:
     engine = _norm_engine(engine)
     page = await _state.engines[engine]["contexts"][device].new_page()
     # el context ya nace con reduced_motion del estado runtime; pero si se cambió en
@@ -507,7 +740,8 @@ async def _new_tab_locked(engine: str = None, device: str = _DEVICE_DESKTOP, lab
             pass
     tid = _new_tab_id()
     _state.tabs[tid] = {"page": page, "label": label or "", "last_used": time.monotonic(),
-                        "engine": engine, "device": device}
+                        "engine": engine, "device": device,
+                        "klass": _norm_class(klass or _state.default_class), "cdp": None}
     _state.active = tid
     return tid
 
@@ -515,6 +749,12 @@ async def _new_tab_locked(engine: str = None, device: str = _DEVICE_DESKTOP, lab
 async def _safe_close_page(tab_id: str):
     info = _state.tabs.pop(tab_id, None)
     if info is not None:
+        cdp = info.get("cdp")
+        if cdp is not None:
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
         try:
             await info["page"].close()
         except Exception:
@@ -523,7 +763,8 @@ async def _safe_close_page(tab_id: str):
         _state.active = next(iter(_state.tabs), None)
 
 
-async def _ensure_page(tab: str = None, browser: str = None, device=None, notes_out: list = None):
+async def _ensure_page(tab: str = None, browser: str = None, device=None, notes_out: list = None,
+                       device_class=None):
     """Capa 1: garantiza una page viva (arranca/reutiliza/reconstruye). Invisible al agente.
     `tab` apunta a una pestaña concreta (su engine y device ya están fijos). `browser`/`device`
     eligen el par (engine, device) cuando se crea/reutiliza una tab sin `tab` explícito: reusa la
@@ -531,29 +772,38 @@ async def _ensure_page(tab: str = None, browser: str = None, device=None, notes_
     chromium-desktop y webkit-iPhone conviven sin pisarse. Sin `browser` ni `device` se usa la tab
     activa tal cual. `notes_out` recibe los avisos de la resolución del device (ej. engine que no
     matchea el preset)."""
+    want_class = _norm_class(device_class) if device_class is not None else None
     async with _lock:
         if tab and tab in _state.tabs:
             tab_id = tab
             info = _state.tabs[tab_id]
             await _ensure_context_locked(info["engine"], info["device"])
-        elif browser or device is not None or (_state.default_device and not _state.tabs):
+            if want_class:
+                info["klass"] = want_class
+        elif (browser or device is not None or want_class is not None
+                or ((_state.default_device or _state.default_class != _DEFAULT_CLASS)
+                    and not _state.tabs)):
             engine = _norm_engine(browser or _active_engine())
             dev, ctx_extra, notes = await _resolve_device_locked(device, engine)
             if notes_out is not None:
                 notes_out.extend(notes)
             await _ensure_context_locked(engine, dev, ctx_extra)
+            # la device_class también particiona: una tab low_end y una desktop del mismo device
+            # conviven, para poder comparar el MISMO layout con y sin throttling sin perder ninguna.
+            klass = want_class or _norm_class(_state.default_class)
             tab_id = None
             if (_state.active in _state.tabs
                     and _state.tabs[_state.active]["engine"] == engine
-                    and _state.tabs[_state.active]["device"] == dev):
+                    and _state.tabs[_state.active]["device"] == dev
+                    and _tab_class(_state.active) == klass):
                 tab_id = _state.active
             else:
                 same = [(t, i["last_used"]) for t, i in _state.tabs.items()
-                        if i["engine"] == engine and i["device"] == dev]
+                        if i["engine"] == engine and i["device"] == dev and _tab_class(t) == klass]
                 if same:
                     tab_id = max(same, key=lambda x: x[1])[0]
             if tab_id is None:
-                tab_id = await _new_tab_locked(engine, dev)
+                tab_id = await _new_tab_locked(engine, dev, klass=klass)
         else:
             tab_id = _state.active
             if not tab_id or tab_id not in _state.tabs:
@@ -572,12 +822,24 @@ async def _ensure_page(tab: str = None, browser: str = None, device=None, notes_
             info = _state.tabs.get(tab_id, {})
             engine = info.get("engine", _state.default_engine)
             dev = info.get("device", _DEVICE_DESKTOP)
+            klass = info.get("klass")
             await _safe_close_page(tab_id)
             engine = await _ensure_context_locked(engine, dev)
-            tab_id = await _new_tab_locked(engine, dev)
+            tab_id = await _new_tab_locked(engine, dev, klass=klass)
             page = _state.tabs[tab_id]["page"]
             _state.active = tab_id
             _state.last_activity = time.monotonic()
+    # throttling fuera del lock: la sesión CDP es una ida y vuelta al browser y no debe
+    # alargar la sección crítica. `class_applied` evita re-enviar los overrides en cada tool.
+    info = _state.tabs.get(tab_id) or {}
+    if info.get("class_applied") != info.get("klass"):
+        try:
+            notes = await _apply_class_to_page(page, _tab_class(tab_id))
+            info["class_applied"] = info.get("klass")
+            if notes_out is not None:
+                notes_out.extend(notes)
+        except Exception:
+            pass
     return page
 
 
@@ -1225,6 +1487,7 @@ async def _status_line() -> str:
         info = _state.tabs[_state.active]
         parts.append(f"active_browser={info['engine']}")
         parts.append(f"device={info['device']}")
+        parts.append(f"device_class={_tab_class(_state.active)}")
         try:
             parts.append(f"url={info['page'].url}")
         except Exception:
@@ -1232,11 +1495,19 @@ async def _status_line() -> str:
         parts.append(f"viewport={await _viewport_str(info['page'])}")
     else:
         parts.append(f"viewport={args.viewport_w}x{args.viewport_h} dpr={args.dpr}")
-    # contexts vivos por engine: un device = un context (desktop y mobile conviven).
-    devs = sorted({f"{i['engine']}:{i['device']}" for i in _state.tabs.values()})
+    # contexts vivos por engine: un device = un context (desktop y mobile conviven), y dentro
+    # de cada tab su device_class (capacidad) — que particiona igual que el device.
+    devs = sorted({f"{i['engine']}:{i['device']}:{_tab_class(t)}" for t, i in _state.tabs.items()})
     if devs:
         parts.append(f"live={'+'.join(devs)}")
     parts.append(f"headless={str(_state.headless_current).lower()}")
+    parts.append(f"gpu_tier={_state.gpu_tier_current}")
+    # el renderer REAL: pedir 'hardware' no garantiza obtenerlo. Si dice software, todo FPS
+    # de canvas/WebGL medido acá está rasterizando por CPU y no representa a tu desktop.
+    if _state.gpu_renderer:
+        parts.append(f"gpu={_gpu_short(_state.gpu_renderer)}")
+    else:
+        parts.append("gpu=? (corré gpu_info)")
     # headless → scrollbars overlay/thin (no representativos, no honra ::-webkit-scrollbar);
     # headed → scrollbars clásicos (~16px, agarrables) = lo que ve el usuario real.
     parts.append(f"scrollbars={'overlay(no-repr)' if _state.headless_current else 'classic'}")
@@ -1279,7 +1550,8 @@ def _cache_note(requested_bypass: bool, client) -> str:
 async def _tool_goto(arguments: dict) -> str:
     notes = []
     page = await _ensure_page(arguments.get("tab"), arguments.get("browser"),
-                              arguments.get("device"), notes_out=notes)
+                              arguments.get("device"), notes_out=notes,
+                              device_class=arguments.get("device_class"))
     url = _resolve_url(arguments["url"])
     bypass = bool(arguments.get("bypass_cache", False))
     cdp = await _open_cache_bypass(page) if bypass else None
@@ -1289,22 +1561,26 @@ async def _tool_goto(arguments: dict) -> str:
         await _close_cache_bypass(cdp)
     status = resp.status if resp else "?"
     await _settle_redirect(page, url)   # capta el redirect client-side del guard de auth
+    await _reapply_class(page)          # site-isolation puede haber cambiado de renderer
     title = await page.title()
     warn = "".join(f"\n⚠ {n}" for n in notes)
     return (f"ok {status} {page.url}{_cache_note(bypass, cdp)}{_redirect_warn(url, page.url)}\n"
             f"title: {title}\nviewport: {await _viewport_str(page)} "
-            f"tab={_state.active} browser={_active_engine()} device={_active_device()}{warn}")
+            f"tab={_state.active} browser={_active_engine()} device={_active_device()} "
+            f"class={_tab_class(_state.active)}{warn}")
 
 
 async def _tool_reload(arguments: dict) -> str:
-    page = await _ensure_page(arguments.get("tab"))
+    page = await _ensure_page(arguments.get("tab"), device_class=arguments.get("device_class"))
     bypass = bool(arguments.get("bypass_cache", False))
     cdp = await _open_cache_bypass(page) if bypass else None
     try:
         resp = await page.reload(wait_until=arguments.get("wait_until", "load"))
     finally:
         await _close_cache_bypass(cdp)
-    return f"reloaded {resp.status if resp else '?'} {page.url}{_cache_note(bypass, cdp)}"
+    await _reapply_class(page)
+    return (f"reloaded {resp.status if resp else '?'} {page.url}{_cache_note(bypass, cdp)} "
+            f"{_class_tag(page)}")
 
 
 async def _tool_set_viewport(arguments: dict) -> str:
@@ -1323,10 +1599,25 @@ async def _tool_set_viewport(arguments: dict) -> str:
 async def _tool_set_mode(arguments: dict) -> str:
     rm = arguments.get("reduced_motion")
     headed_arg = arguments.get("headed")
-    if rm is None and headed_arg is None:
-        return ("set_mode: pasá 'headed' (bool, headless↔headed) y/o "
+    gpu_arg = arguments.get("gpu_tier")
+    if rm is None and headed_arg is None and gpu_arg is None:
+        return ("set_mode: pasá 'headed' (bool, headless↔headed), 'gpu_tier' "
+                "('auto'|'hardware'|'software', backend gráfico — relanza el browser) y/o "
                 "'reduced_motion' ('reduce' | 'no-preference', emula prefers-reduced-motion).")
     msgs = []
+
+    # gpu_tier es flag de LAUNCH igual que headed → se resuelve con el mismo relaunch de abajo.
+    if gpu_arg is not None:
+        if gpu_arg not in ("auto", "hardware", "software"):
+            return "gpu_tier debe ser 'auto', 'hardware' o 'software'"
+        if gpu_arg == _state.gpu_tier_current and _any_alive():
+            msgs.append(f"gpu_tier: ya está en '{gpu_arg}' (sin cambios)")
+            gpu_arg = None
+        else:
+            _state.gpu_tier_current = gpu_arg
+            _state.gpu_renderer = None   # invalidar el cache: hay que re-medir el renderer real
+            msgs.append(f"gpu_tier: {gpu_arg} — verificá con gpu_info que se haya logrado "
+                        f"(pedirlo no garantiza obtenerlo)")
 
     # reduced-motion: no requiere teardown — se emula por page (matchMedia lo refleja).
     if rm is not None:
@@ -1342,16 +1633,19 @@ async def _tool_set_mode(arguments: dict) -> str:
                 pass
         msgs.append(f"reduced_motion: {rm} (aplicado a {len(pages)} tab(s) abiertas + las nuevas)")
 
-    # headed/headless: flag de LAUNCH → teardown + relaunch.
-    if headed_arg is not None:
-        headed = bool(headed_arg)
-        if headed and not args.allow_headed:
+    # headed/headless y gpu_tier: son flags de LAUNCH → teardown + relaunch.
+    # `force_relaunch` cubre el caso "cambió gpu_tier pero el modo headed sigue igual": sin él
+    # la guarda de abajo lo tomaría como no-op y las flags nuevas no llegarían nunca al browser.
+    force_relaunch = gpu_arg is not None and _any_alive()
+    if headed_arg is not None or force_relaunch:
+        headed = bool(headed_arg) if headed_arg is not None else not _state.headless_current
+        if headed and headed_arg is not None and not args.allow_headed:
             return ("set_mode(headed) deshabilitado en esta instancia (allow_headed=false). "
                     "Re-registrá sin --forbid-headed (allow_headed:true en secrets.json) para permitirlo.")
         new_headless = not headed
-        to_relaunch = []
+        to_relaunch, klass_by = [], {}
         async with _lock:
-            if _state.headless_current == new_headless and _any_alive():
+            if _state.headless_current == new_headless and _any_alive() and not force_relaunch:
                 msgs.append(f"modo: ya está {'headed' if headed else 'headless'} (sin cambios)")
             else:
                 _state.headless_current = new_headless
@@ -1360,9 +1654,18 @@ async def _tool_set_mode(arguments: dict) -> str:
                 # cada context sobreviven al teardown → el iPhone vuelve como iPhone.
                 to_relaunch = [(e, list(_state.engines[e]["contexts"].keys()))
                                for e in _VALID_ENGINES if _engine_alive(e)] or [(_state.default_engine, [])]
+                # la device_class vive en la TAB, no en el context → si no la capturamos antes del
+                # teardown, un relaunch por gpu_tier devolvería todas las tabs a 'desktop' y las
+                # mediciones siguientes saldrían sin throttling sin que se note. Y como varias
+                # clases comparten un mismo context (mismo device), hay que recrear una tab por
+                # (device, clase): si no, un perf_matrix de 3 clases colapsa a una sola tab.
+                klass_by = {}
+                for i in _state.tabs.values():
+                    klass_by.setdefault((i["engine"], i["device"]), []).append(
+                        i.get("klass") or _DEFAULT_CLASS)
                 await _teardown_quiet_locked()
         if to_relaunch:
-            # relanza ya, en el nuevo modo (conserva reduced_motion + device + sesión)
+            # relanza ya, en el nuevo modo (conserva reduced_motion + device + class + sesión)
             async with _lock:
                 for eng, devs in to_relaunch:
                     if not devs:
@@ -1373,7 +1676,8 @@ async def _tool_set_mode(arguments: dict) -> str:
                         for d in devs:
                             await _ensure_context_locked(eng, d)
                     for d in devs:
-                        await _new_tab_locked(eng, d)
+                        for k in (klass_by.get((eng, d)) or [None]):
+                            await _new_tab_locked(eng, d, klass=k)
                 _state.last_activity = time.monotonic()
             sb = ("scrollbars ahora clásicos (~16px, agarrables)" if headed
                   else "scrollbars vuelven a overlay/thin (no representativos)")
@@ -1394,10 +1698,16 @@ async def _tool_open_tab(arguments: dict) -> str:
             if candidates:
                 evicted = min(candidates, key=lambda x: x[1])[0]
                 await _safe_close_page(evicted)
-        tab_id = await _new_tab_locked(engine, dev, label=arguments.get("label"))
+        tab_id = await _new_tab_locked(engine, dev, label=arguments.get("label"),
+                                       klass=arguments.get("device_class"))
         _state.last_activity = time.monotonic()
     page = _state.tabs[tab_id]["page"]
-    msg = f"tab abierta: {tab_id} [{engine} · {dev}]"
+    klass = _tab_class(tab_id)
+    if klass != _DEFAULT_CLASS:
+        for n in await _apply_class_to_page(page, klass):
+            notes.append(n)
+        _state.tabs[tab_id]["class_applied"] = klass
+    msg = f"tab abierta: {tab_id} [{engine} · {dev} · {klass}]"
     if arguments.get("label"):
         msg += f" ({arguments['label']})"
     if arguments.get("url"):
@@ -1636,12 +1946,23 @@ async def _tool_get_computed_style(arguments: dict) -> str:
 
 
 async def _tool_measure_fps(arguments: dict) -> str:
-    page = await _ensure_page(arguments.get("tab"))
+    page = await _ensure_page(arguments.get("tab"), device_class=arguments.get("device_class"))
+    action = arguments.get("action", "scroll")
+    scroll_px = int(arguments.get("scroll_px", 2000))
+    gesture_note = ""
+    if action == "touch_scroll":
+        # gesto REAL por el compositor (no window.scrollBy): es el único que ejercita el path
+        # táctil del celu — el que se rompe con listeners no-passive. Ver _gesture_scroll.
+        ok, gnote = await _gesture_scroll(page, scroll_px,
+                                          int(arguments.get("duration_ms", 2000)),
+                                          launch=True, blocking=False)
+        gesture_note = f"\ngesture: {gnote}"
+        action = "none" if ok else "scroll"
     r = await page.evaluate(_JS_MEASURE_FPS, {
-        "action": arguments.get("action", "scroll"),
+        "action": action,
         "selector": arguments.get("selector"),
         "duration_ms": int(arguments.get("duration_ms", 2000)),
-        "scroll_px": int(arguments.get("scroll_px", 2000)),
+        "scroll_px": scroll_px,
     })
     total = r.get("total", 0) or 0
     dropped = r.get("dropped", 0)
@@ -1653,13 +1974,20 @@ async def _tool_measure_fps(arguments: dict) -> str:
         verdict = "janky"
     else:
         verdict = "degraded"
-    return (f"avg_fps: {avg}\ndropped_frames: {dropped}/{total} ({pct}%)\n"
+    # bajo CPU throttling alto el propio loop de medición (rAF en el main thread) compite con
+    # la página: el observador altera lo observado. Decirlo en vez de fingir precisión.
+    warn = ""
+    if _DEVICE_CLASSES[_tab_class(_tab_of(page))]["cpu"] >= 4:
+        warn = ("\n(nota: el contador de frames corre en el main thread throttleado — el avg_fps "
+                "real puede ser algo mejor; el jank/worst sí son fiables. Para el conteo del "
+                "compositor usá frame_stats.)")
+    return (f"{_class_tag(page)}\navg_fps: {avg}\ndropped_frames: {dropped}/{total} ({pct}%)\n"
             f"jank_count: {jank}\nworst_frame_ms: {worst}\np95_frame_ms: {r.get('p95_ms', 0)}\n"
-            f"verdict: {verdict}")
+            f"verdict: {verdict}{gesture_note}{warn}")
 
 
 async def _tool_button_latency(arguments: dict) -> str:
-    page = await _ensure_page(arguments.get("tab"))
+    page = await _ensure_page(arguments.get("tab"), device_class=arguments.get("device_class"))
     selector = arguments["selector"]
     nth = int(arguments.get("nth", 0))
     runs = int(arguments.get("runs", 5))
@@ -1703,7 +2031,7 @@ async def _tool_button_latency(arguments: dict) -> str:
     p95 = round(samples[min(n - 1, int(n * 0.95))], 1)
     worst = round(samples[-1], 1)
     verdict = "good" if avg < 100 else ("ok" if avg < 200 else "slow")
-    return (f"selector: {selector}[{nth}]\n"
+    return (f"{_class_tag(page)}\nselector: {selector}[{nth}]\n"
             f"click_to_paint_ms: avg={avg} p95={p95} worst={worst} ({n} runs)\n"
             f"verdict: {verdict}")
 
@@ -1788,7 +2116,7 @@ async def _tool_interaction_animation(arguments: dict) -> str:
 
 
 async def _tool_long_tasks(arguments: dict) -> str:
-    page = await _ensure_page(arguments.get("tab"))
+    page = await _ensure_page(arguments.get("tab"), device_class=arguments.get("device_class"))
     r = await page.evaluate(_JS_LONG_TASKS, {
         "duration_ms": int(arguments.get("duration_ms", 3000)),
         "action": arguments.get("action", "none"),
@@ -1796,7 +2124,8 @@ async def _tool_long_tasks(arguments: dict) -> str:
     })
     lt = r.get("long_tasks", 0)
     total_blocked = r.get("total_blocked_ms", 0)
-    lines = [f"long_tasks: {lt} (total {total_blocked}ms blocked)",
+    lines = [_class_tag(page),
+             f"long_tasks: {lt} (total {total_blocked}ms blocked)",
              f"loaf: {r.get('loaf', 0)} frames >50ms (worst {r.get('worst_loaf_ms', 0)}ms)"]
     if r.get("top"):
         lines.append("top_blockers:")
@@ -1833,12 +2162,14 @@ async def _tool_entrance_animation_check(arguments: dict) -> str:
 
 
 async def _tool_web_vitals(arguments: dict) -> str:
-    page = await _ensure_page(arguments.get("tab"))
+    page = await _ensure_page(arguments.get("tab"), device_class=arguments.get("device_class"))
     if arguments.get("url"):
         await page.goto(_resolve_url(arguments["url"]), wait_until="load")
+        await _reapply_class(page)
     r = await page.evaluate(_JS_WEB_VITALS, {"settle_ms": int(arguments.get("settle_ms", 4000))})
     lcp, cls, inp, tbt = r.get("lcp"), r.get("cls"), r.get("inp"), r.get("tbt")
-    lines = [f"url: {page.url}",
+    lines = [_class_tag(page),
+             f"url: {page.url}",
              f"LCP: {lcp if lcp is not None else 'n/a'}ms (good<2500)",
              f"CLS: {cls} (good<0.1)",
              (f"INP: {inp}ms (good<200)" if inp is not None else "INP: n/a (sin interacción)"),
@@ -2383,7 +2714,765 @@ async def _tool_load_storage_state(arguments: dict) -> str:
     return f"storage_state cargado [{engine}]: {path} ({n_cookies} cookies, {n_origins} origin(s)){extra}"
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Perfil de capacidad: GPU real, calibración de CPU y clases de dispositivo
+# ──────────────────────────────────────────────────────────────────────────
+_JS_WEBGL_RENDERER = r"""
+() => {
+  const read = (gl) => {
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    return {
+      renderer: ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER),
+      vendor: ext ? gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR),
+      version: gl.getParameter(gl.VERSION),
+      max_texture: gl.getParameter(gl.MAX_TEXTURE_SIZE),
+    };
+  };
+  // 1) canvas propio; 2) OffscreenCanvas; 3) un canvas ya vivo de la página (r3f/three ya tienen
+  // uno y volver a pedirle el contexto devuelve el mismo). Un solo camino no alcanza: según el
+  // backend gráfico, crear un canvas suelto puede no dar contexto y quedarías sin el dato.
+  const tries = [
+    () => document.createElement('canvas'),
+    () => (typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(1, 1) : null),
+    ...[...document.querySelectorAll('canvas')].map(c => () => c),
+  ];
+  let lastErr = null;
+  for (const mk of tries) {
+    try {
+      const c = mk(); if (!c) continue;
+      const gl = c.getContext('webgl2') || c.getContext('webgl');
+      if (gl) return read(gl);
+    } catch (e) { lastErr = String(e); }
+  }
+  return {error: lastErr || 'sin contexto WebGL disponible'};
+}
+"""
+
+# Microbenchmark de CPU con la misma forma que el benchmarkIndex de Lighthouse: cuántas veces
+# se puede llenar un Uint8Array de 100k en una ventana fija. Sirve para NORMALIZAR: "6x" en tu
+# máquina no es "6x" en otra, así que un umbral fijo no es reproducible entre equipos ni en CI.
+_JS_BENCH = r"""
+(ms) => {
+  const start = Date.now();
+  let iterations = 0;
+  while (Date.now() - start < ms) {
+    const arr = new Uint8Array(100000);
+    for (let j = 0; j < 100000; j++) arr[j] = j;
+    iterations++;
+  }
+  const seconds = (Date.now() - start) / 1000;
+  return Math.round(iterations / 10 / seconds);
+}
+"""
+
+# Índices de referencia (benchmarkIndex de Lighthouse) de dispositivos reales. Son estimaciones
+# de orden de magnitud, no specs: sirven para elegir el multiplicador, no para prometer fidelidad.
+_BENCH_TARGETS = {
+    "low_end_android":  250,   # Moto G4 / gama de entrada
+    "mid_android":      700,   # gama media reciente
+    "flagship_mobile": 1600,   # iPhone reciente / Android tope de gama
+}
+
+
+async def _browser_cdp(engine: str):
+    """Sesión CDP a nivel BROWSER (no page): necesaria para SystemInfo/Tracing, que son
+    dominios del browser. None fuera de chromium."""
+    entry = _state.engines.get(engine) or {}
+    br = entry.get("browser")
+    if br is None or engine != "chromium":
+        return None
+    try:
+        return await br.new_browser_cdp_session()
+    except Exception:
+        return None
+
+
+async def _tool_gpu_info(arguments: dict) -> str:
+    """El renderer REAL. Headless suele caer a SwiftShader (rasterización por CPU) sin avisar,
+    y entonces todo FPS de canvas/WebGL medido es el de una GPU por software — ni tu desktop
+    ni un celu. Sin este dato las mediciones gráficas no son interpretables."""
+    page = await _ensure_page(arguments.get("tab"))
+    gl = await page.evaluate(_JS_WEBGL_RENDERER)
+    renderer = gl.get("renderer") if isinstance(gl, dict) else None
+    if renderer:
+        _state.gpu_renderer = renderer
+    lines = [f"webgl_renderer: {renderer or gl.get('error', 'n/a')}",
+             f"webgl_vendor: {gl.get('vendor', 'n/a')}",
+             f"webgl_version: {gl.get('version', 'n/a')}",
+             f"gpu_tier_pedido: {_state.gpu_tier_current}",
+             f"backend_real: {_gpu_short(renderer or '')}"]
+
+    engine = _active_engine()
+    cdp = await _browser_cdp(engine)
+    # featureStatus del browser: es la fuente AUTORITATIVA. El renderer de WebGL puede no estar
+    # disponible (según backend, un canvas suelto a veces no da contexto) y en ese caso no se
+    # puede decidir nada mirando solo WebGL.
+    feat_sw = None
+    if cdp is not None:
+        try:
+            info = await cdp.send("SystemInfo.getInfo")
+            feats = (info.get("gpu") or {}).get("featureStatus") or {}
+            accel = [k for k, v in feats.items() if isinstance(v, str) and v.startswith("enabled")]
+            soft = [k for k, v in feats.items() if isinstance(v, str) and "software" in v]
+            lines.append(f"acelerado_por_gpu: {', '.join(accel) if accel else '(nada)'}")
+            if soft:
+                lines.append(f"por_software: {', '.join(soft)}")
+            key = [k for k in ("gpu_compositing", "rasterization", "webgl") if k in feats]
+            if key:
+                feat_sw = all("software" in str(feats[k]) for k in key)
+                # sin renderer de WebGL, esto es lo que alimenta status()
+                if not renderer:
+                    _state.gpu_renderer = "software (featureStatus)" if feat_sw else "hardware (featureStatus)"
+        except Exception:
+            pass
+        try:
+            await cdp.detach()
+        except Exception:
+            pass
+
+    sw = feat_sw if feat_sw is not None else (_gpu_short(renderer or "") == "software")
+    if sw:
+        lines.append(
+            "\nveredicto: SIN GPU real — se rasteriza por CPU (SwiftShader). Los FPS de canvas/"
+            "WebGL/blur medidos acá NO representan tu desktop. Como proxy de una GPU móvil pobre "
+            "es útil, pero sabelo: es una coincidencia, no una calibración. "
+            "Para GPU real: set_mode(gpu_tier='hardware') (requiere driver/display; puede no lograrse).")
+    else:
+        lines.append("\nveredicto: GPU acelerada — las mediciones gráficas reflejan hardware real. "
+                     "Para simular una GPU móvil pobre: set_mode(gpu_tier='software').")
+    return "\n".join(lines)
+
+
+async def _tool_calibrate(arguments: dict) -> str:
+    """Mide la CPU del host y traduce un dispositivo objetivo a un multiplicador concreto.
+    Sin esto, 'cpu 6x' significa cosas distintas en cada máquina y ningún umbral es portable."""
+    page = await _ensure_page(arguments.get("tab"))
+    ms = max(200, min(3000, int(arguments.get("duration_ms", 700))))
+    tid = _tab_of(page)
+    klass = _tab_class(tid)
+    # medir SIEMPRE sin throttling: queremos el host, no el host ya ralentizado.
+    cdp = await _cdp_of(page)
+    if cdp is not None:
+        try:
+            await cdp.send("Emulation.setCPUThrottlingRate", {"rate": 1})
+        except Exception:
+            pass
+    idx = await page.evaluate(_JS_BENCH, ms)
+    if cdp is not None and klass != _DEFAULT_CLASS:
+        try:
+            await cdp.send("Emulation.setCPUThrottlingRate",
+                           {"rate": float(_DEVICE_CLASSES[klass]["cpu"])})
+        except Exception:
+            pass
+    _state.bench_index = idx
+
+    lines = [f"host_benchmark_index: {idx}  (referencia: desktop típico 1000-2000)",
+             f"cpu_cores_host: {os.cpu_count()}",
+             "",
+             "multiplicador necesario para emular cada dispositivo en ESTA máquina:"]
+    for name, target in _BENCH_TARGETS.items():
+        rate = round(idx / target, 1)
+        lines.append(f"  {name:<16} idx≈{target:<5} → cpu {rate}x")
+    lines.append("")
+    lines.append("clases actuales del MCP (multiplicador FIJO) y a qué dispositivo equivalen acá:")
+    for name, prof in _DEVICE_CLASSES.items():
+        if prof["cpu"] == 1:
+            continue
+        eq = round(idx / prof["cpu"])
+        closest = min(_BENCH_TARGETS.items(), key=lambda kv: abs(kv[1] - eq))
+        lines.append(f"  {name:<9} cpu {prof['cpu']}x → idx≈{eq} (≈{closest[0]})")
+    lines.append("")
+    lines.append("Si una clase no cae donde querés, pasá cpu_rate a mano: "
+                 "set_device_class(name='low_end', cpu_rate=<x>).")
+    return "\n".join(lines)
+
+
+async def _tool_set_device_class(arguments: dict) -> str:
+    """Fija la clase de dispositivo (capacidad) de una tab. Pegajosa: sobrevive navegaciones."""
+    name = arguments.get("name")
+    if name is None:
+        rows = [f"  {k:<9} cpu {v['cpu']}x · red {v['net']} · {v['cores'] or 'host'} cores · "
+                f"{v['mem'] or 'host'}GB — {v['about']}" for k, v in _DEVICE_CLASSES.items()]
+        return ("device_class emula la CAPACIDAD (device emula la FORMA). Clases:\n"
+                + "\n".join(rows)
+                + f"\n\nactiva en la tab: {_tab_class(_state.active)}")
+    klass = _norm_class(name)
+    page = await _ensure_page(arguments.get("tab"))
+    notes = await _set_tab_class(page, klass)
+
+    # override manual del multiplicador (lo que sugiere calibrate)
+    rate = arguments.get("cpu_rate")
+    if rate is not None:
+        cdp = await _cdp_of(page)
+        if cdp is None:
+            notes.append("cpu_rate ignorado: requiere chromium")
+        else:
+            try:
+                await cdp.send("Emulation.setCPUThrottlingRate", {"rate": float(rate)})
+                notes.append(f"cpu_rate override: {rate}x (pisa el {_DEVICE_CLASSES[klass]['cpu']}x "
+                             f"de la clase hasta el próximo cambio de clase)")
+            except Exception as e:
+                notes.append(f"cpu_rate falló: {e}")
+
+    prof = _DEVICE_CLASSES[klass]
+    out = [f"device_class: {klass} en tab {_tab_of(page)} — {prof['about']}",
+           f"cpu: {prof['cpu']}x · red: {prof['net']} · cores: {prof['cores'] or 'host'} · "
+           f"deviceMemory: {prof['mem'] or 'host'}GB"]
+    if prof["mem"]:
+        out.append("(deviceMemory aplica desde la próxima navegación: el documento vivo ya lo leyó)")
+    out.append("recordá: esto NO toca la GPU. Si el jank es por blur/WebGL, usá gpu_tier.")
+    out += [f"⚠ {n}" for n in notes]
+    return "\n".join(out)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Gestos de compositor + conteo de frames del lado del browser
+# ──────────────────────────────────────────────────────────────────────────
+async def _gesture_scroll(page, distance_px: int, duration_ms: int,
+                          launch: bool = False, blocking: bool = True):
+    """Scroll REAL por el compositor vía CDP Input.synthesizeScrollGesture (gesto táctil con
+    fling), en vez de window.scrollBy desde JS. La diferencia importa: el scrollBy corre en el
+    main thread y nunca toca el camino que un dedo recorre en un celu — justo el que se rompe
+    cuando hay listeners touch/wheel no-passive. Devuelve (ok, nota)."""
+    cdp = await _cdp_of(page)
+    if cdp is None:
+        return False, "no disponible (requiere chromium) → fallback a window.scrollBy (main thread)"
+    try:
+        vp = page.viewport_size or {"width": args.viewport_w, "height": args.viewport_h}
+        speed = max(100, int(distance_px / max(0.1, duration_ms / 1000)))
+        params = {
+            "x": vp["width"] // 2, "y": vp["height"] // 2,
+            "yDistance": -abs(distance_px),          # negativo = contenido sube = scroll hacia abajo
+            "gestureSourceType": "touch",
+            "speed": speed,
+        }
+        coro = cdp.send("Input.synthesizeScrollGesture", params)
+        if blocking:
+            await coro
+        else:
+            # el gesto corre mientras medimos: si esperáramos su fin, mediríamos la página quieta.
+            asyncio.create_task(_swallow(coro))
+        return True, f"touch fling real por el compositor ({distance_px}px @ {speed}px/s)"
+    except Exception as e:
+        return False, f"falló ({e}) → fallback a window.scrollBy"
+
+
+async def _swallow(coro):
+    try:
+        await coro
+    except Exception:
+        pass
+
+
+async def _measure_frames(page, duration_ms: int, action: str, scroll_px: int):
+    """Cuenta frames dibujados/dropeados leyendo el trace del COMPOSITOR. Devuelve (dict|None, nota).
+    Es más fiel que rAF bajo throttling: el contador rAF vive en el main thread ralentizado y
+    compite con la misma página que está midiendo."""
+    engine = _active_engine()
+    cdp = await _browser_cdp(engine)
+    if cdp is None:
+        return None, "requiere chromium (usa el tracing del browser)"
+
+    events = []
+    done = asyncio.Event()
+    cdp.on("Tracing.dataCollected", lambda p: events.extend(p.get("value") or []))
+    cdp.on("Tracing.tracingComplete", lambda p: done.set())
+    try:
+        await cdp.send("Tracing.start", {
+            "transferMode": "ReportEvents",
+            # devtools.timeline se incluye solo para poder sembrar el marcador de abajo.
+            "traceConfig": {"recordMode": "recordAsMuchAsPossible",
+                            "includedCategories": ["devtools.timeline",
+                                                   "disabled-by-default-devtools.timeline.frame"]},
+        })
+    except Exception as e:
+        try:
+            await cdp.detach()
+        except Exception:
+            pass
+        return None, f"no se pudo arrancar el tracing: {e}"
+
+    # El tracing es del BROWSER entero: con varias tabs vivas los frames de todas caen en el
+    # mismo trace y el conteo se suma (3 tabs ⇒ "180fps"). Cada tab corre en su propio proceso
+    # de renderer, así que sembramos un marcador desde ESTA page para descubrir su pid y quedarnos
+    # solo con sus frames.
+    marker = f"__wp_frames_{_tab_of(page)}__"
+    try:
+        await page.evaluate("(m)=>console.timeStamp(m)", marker)
+    except Exception:
+        marker = None
+
+    note = ""
+    if action == "touch_scroll":
+        ok, note = await _gesture_scroll(page, scroll_px, duration_ms, blocking=False)
+        if not ok:
+            await page.evaluate("(px)=>window.scrollBy(0,px)", scroll_px)
+    elif action == "scroll":
+        await page.evaluate("(px)=>window.scrollBy(0,px)", scroll_px)
+        note = "window.scrollBy (main thread — no ejercita el path táctil)"
+    else:
+        note = "sin acción (idle)"
+    await page.wait_for_timeout(duration_ms)
+
+    try:
+        await cdp.send("Tracing.end")
+        await asyncio.wait_for(done.wait(), timeout=20)
+    except Exception:
+        pass
+    try:
+        await cdp.detach()
+    except Exception:
+        pass
+
+    # localizar el pid del renderer de esta tab por el marcador sembrado arriba
+    pid = None
+    if marker:
+        for e in events:
+            if e.get("name") == "TimeStamp" and marker in json.dumps(e.get("args") or {}):
+                pid = e.get("pid")
+                break
+    scoped = [e for e in events if pid is None or e.get("pid") == pid]
+    if pid is None:
+        others = len([t for t in _state.tabs if t != _tab_of(page)])
+        if others:
+            note += (f" · ⚠ no pude aislar el proceso de esta tab: el conteo puede incluir los "
+                     f"frames de las otras {others} tab(s) abiertas")
+
+    drawn = sum(1 for e in scoped if e.get("name") == "DrawFrame")
+    dropped = sum(1 for e in scoped if e.get("name") == "DroppedFrame")
+    committed = sum(1 for e in scoped if e.get("name") == "Commit")
+    total = drawn + dropped
+    if total == 0:
+        return None, (note + " · el trace no trajo eventos de frame (¿página totalmente quieta?)")
+    return {"drawn": drawn, "dropped": dropped, "commits": committed, "total": total,
+            "pct": round(100 * dropped / total),
+            "fps": round(drawn / (duration_ms / 1000), 1)}, note
+
+
+async def _tool_frame_stats(arguments: dict) -> str:
+    page = await _ensure_page(arguments.get("tab"), device_class=arguments.get("device_class"))
+    duration = int(arguments.get("duration_ms", 3000))
+    r, note = await _measure_frames(page, duration, arguments.get("action", "touch_scroll"),
+                                    int(arguments.get("scroll_px", 2000)))
+    if r is None:
+        return (f"{_class_tag(page)}\n(sin datos: {note})\n"
+                f"Alternativa: measure_fps (cuenta por requestAnimationFrame).")
+    verdict = "smooth" if r["pct"] < 5 else ("degraded" if r["pct"] < 20 else "janky")
+    return (f"{_class_tag(page)}\n"
+            f"compositor_fps: {r['fps']}\n"
+            f"frames: {r['drawn']} dibujados / {r['dropped']} dropeados ({r['pct']}% perdidos)\n"
+            f"commits: {r['commits']}\n"
+            f"verdict: {verdict}\n"
+            f"gesture: {note}\n"
+            f"(medido por el compositor del browser — no lo afecta el CPU throttling del renderer)")
+
+
+async def _tool_scroll_gesture(arguments: dict) -> str:
+    if not args.allow_interact:
+        return _interact_forbidden("scroll_gesture")
+    page = await _ensure_page(arguments.get("tab"), device_class=arguments.get("device_class"))
+    px = int(arguments.get("distance_px", 1500))
+    dur = int(arguments.get("duration_ms", 500))
+    ok, note = await _gesture_scroll(page, px, dur, blocking=True)
+    y = await page.evaluate("window.scrollY")
+    return f"scroll_gesture: {note}\nscrollY ahora: {round(y)}" if ok else f"scroll_gesture: {note}"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Auditoría de causas de jank móvil (diagnóstico, no solo síntoma)
+# ──────────────────────────────────────────────────────────────────────────
+# Se instala ANTES del load para poder interceptar addEventListener: los listeners no-passive
+# de touch/wheel son la causa clásica de scroll trabado en celu que en desktop no se nota,
+# y solo se ven si estás mirando cuando se registran.
+_JS_LISTENER_PROBE = r"""
+(() => {
+  if (window.__wpProbe) return;
+  const blocking = ['touchstart','touchmove','wheel','mousewheel'];
+  const hits = [];
+  const orig = EventTarget.prototype.addEventListener;
+  EventTarget.prototype.addEventListener = function (type, fn, opts) {
+    try {
+      if (blocking.includes(type)) {
+        const passive = (opts && typeof opts === 'object') ? opts.passive : undefined;
+        if (passive !== true) {
+          let tgt = 'other';
+          if (this === window) tgt = 'window';
+          else if (this === document) tgt = 'document';
+          else if (this === document.body) tgt = 'body';
+          else if (this && this.tagName) tgt = this.tagName.toLowerCase() +
+            (this.className && typeof this.className === 'string'
+              ? '.' + this.className.trim().split(/\s+/).slice(0,2).join('.') : '');
+          hits.push({type, target: tgt, passive: passive === undefined ? 'default' : passive,
+                     stack: (new Error().stack || '').split('\n').slice(2,4).join(' | ').slice(0,220)});
+        }
+      }
+    } catch (e) {}
+    return orig.call(this, type, fn, opts);
+  };
+  window.__wpProbe = hits;
+})();
+"""
+
+_JS_MOBILE_AUDIT = r"""
+() => {
+  const vw = innerWidth, vh = innerHeight, dpr = devicePixelRatio || 1;
+  const vpArea = vw * vh;
+  const all = [...document.querySelectorAll('*')];
+  const sel = (e) => {
+    const c = (e.className && typeof e.className === 'string')
+      ? '.' + e.className.trim().split(/\s+/).slice(0,2).join('.') : '';
+    return e.tagName.toLowerCase() + (e.id ? '#' + e.id : c);
+  };
+  const areaOf = (e) => { const r = e.getBoundingClientRect(); return Math.max(0, r.width) * Math.max(0, r.height); };
+
+  // 1. blur / backdrop-filter: el asesino nº1 en GPU móvil. Lo que importa es el ÁREA, no el conteo.
+  const blurs = [];
+  for (const e of all) {
+    const s = getComputedStyle(e);
+    const bd = s.backdropFilter && s.backdropFilter !== 'none' ? s.backdropFilter : null;
+    const fl = s.filter && s.filter.includes('blur') ? s.filter : null;
+    if (!bd && !fl) continue;
+    const a = areaOf(e);
+    if (a < 100) continue;
+    const m = (bd || fl).match(/blur\(([\d.]+)px\)/);
+    blurs.push({sel: sel(e), kind: bd ? 'backdrop-filter' : 'filter', radius: m ? +m[1] : null,
+                area_vp: +(a / vpArea).toFixed(2)});
+  }
+  blurs.sort((a, b) => b.area_vp - a.area_vp);
+
+  // 2. animaciones que NO son transform/opacity → cada frame dispara layout o paint.
+  const badProps = new Set();
+  const animBad = [], animGood = [];
+  try {
+    for (const an of document.getAnimations()) {
+      const eff = an.effect; if (!eff || !eff.getKeyframes) continue;
+      const props = new Set();
+      for (const kf of eff.getKeyframes())
+        for (const k of Object.keys(kf))
+          if (!['offset','composite','computedOffset','easing'].includes(k)) props.add(k);
+      const t = eff.target ? sel(eff.target) : '?';
+      const bad = [...props].filter(p => !['transform','opacity','filter','backdropFilter'].includes(p));
+      if (bad.length) { bad.forEach(p => badProps.add(p)); animBad.push({sel: t, props: bad.slice(0,4)}); }
+      else animGood.push(t);
+    }
+  } catch (e) {}
+
+  // transiciones CSS declaradas sobre props que disparan layout.
+  // Solo elementos REALMENTE renderizados: head/meta/link también heredan un `* {transition}`
+  // y contarlos infla el número con ruido que no cuesta un solo frame.
+  const NON_VISUAL = new Set(['HEAD','META','LINK','SCRIPT','STYLE','TITLE','BASE','NOSCRIPT']);
+  const layoutProps = ['width','height','top','left','right','bottom','margin','padding','font-size'];
+  const transBad = [];
+  let transAll = 0;
+  for (const e of all) {
+    if (NON_VISUAL.has(e.tagName) || !e.getClientRects().length) continue;
+    const s = getComputedStyle(e);
+    if (!s.transitionProperty || s.transitionProperty === 'none') continue;
+    const props = s.transitionProperty.split(',').map(x => x.trim());
+    if (props.includes('all')) transAll++;
+    const bad = props.filter(p => p === 'all' || layoutProps.some(l => p === l || p.startsWith(l + '-')));
+    if (bad.length) transBad.push({sel: sel(e), props: bad.slice(0,3)});
+  }
+
+  // 3. will-change: cada uno promueve a capa propia → memoria de GPU. En celu es finita.
+  const wc = all.filter(e => { const w = getComputedStyle(e).willChange; return w && w !== 'auto'; })
+                .map(e => ({sel: sel(e), value: getComputedStyle(e).willChange}));
+
+  // 4. imágenes sobredimensionadas: el decode se paga en CPU y en un celu duele.
+  const imgs = [];
+  for (const im of document.images) {
+    if (!im.naturalWidth || !im.clientWidth) continue;
+    const ratio = im.naturalWidth / (im.clientWidth * dpr);
+    if (ratio > 1.6) imgs.push({src: (im.currentSrc || im.src).split('/').pop().slice(0, 48),
+                                natural: im.naturalWidth + 'x' + im.naturalHeight,
+                                shown: Math.round(im.clientWidth) + 'x' + Math.round(im.clientHeight),
+                                waste: +ratio.toFixed(1)});
+  }
+  imgs.sort((a, b) => b.waste - a.waste);
+
+  // 5. canvas: el fill rate se paga por píxel FÍSICO. A dpr 3 un canvas full-screen son 9x los píxeles.
+  const canv = [...document.querySelectorAll('canvas')].map(c => {
+    const r = c.getBoundingClientRect();
+    return {px: c.width * c.height, buffer: c.width + 'x' + c.height,
+            css: Math.round(r.width) + 'x' + Math.round(r.height),
+            mpx: +((c.width * c.height) / 1e6).toFixed(2)};
+  });
+
+  // 6. filtros SVG (feGaussianBlur y amigos): rasterizados por CPU en muchos móviles.
+  const svgFilters = document.querySelectorAll('svg filter').length;
+  const svgBlur = document.querySelectorAll('svg feGaussianBlur, svg feDropShadow').length;
+  const svgAnim = document.querySelectorAll('svg animate, svg animateTransform, svg animateMotion').length;
+
+  // 7. sombras grandes: box-shadow con blur alto es paint caro cada frame si se anima.
+  const shadows = [];
+  for (const e of all) {
+    const s = getComputedStyle(e).boxShadow;
+    if (!s || s === 'none') continue;
+    const m = s.match(/(\d+)px\s+(\d+)px/g);
+    const radius = Math.max(...(s.match(/\d+px/g) || ['0px']).map(x => parseInt(x)));
+    if (radius >= 40 && areaOf(e) > vpArea * 0.05) shadows.push({sel: sel(e), radius});
+  }
+
+  // 8. fixed/sticky: cada uno fuerza capa y en scroll móvil se recompone.
+  const fixed = all.filter(e => ['fixed','sticky'].includes(getComputedStyle(e).position)).length;
+
+  return {
+    dom_nodes: all.length, dpr, viewport: vw + 'x' + vh,
+    blur: {count: blurs.length, top: blurs.slice(0, 6),
+           total_area_vp: +blurs.reduce((s, b) => s + b.area_vp, 0).toFixed(1)},
+    animations: {bad: animBad.slice(0, 8), bad_count: animBad.length,
+                 good_count: animGood.length, bad_props: [...badProps]},
+    transitions_layout: {count: transBad.length, all_count: transAll, top: transBad.slice(0, 6)},
+    will_change: {count: wc.length, top: wc.slice(0, 6)},
+    oversized_images: {count: imgs.length, top: imgs.slice(0, 5)},
+    canvas: canv,
+    svg: {filters: svgFilters, blur_filters: svgBlur, smil_animations: svgAnim,
+          nodes: document.querySelectorAll('svg *').length},
+    big_shadows: {count: shadows.length, top: shadows.slice(0, 4)},
+    fixed_sticky: fixed,
+    listeners: window.__wpProbe || null,
+  };
+}
+"""
+
+
+async def _tool_mobile_perf_audit(arguments: dict) -> str:
+    """Busca las CAUSAS típicas de jank en móvil. measure_fps dice que está lento;
+    esto dice qué lo está poniendo lento."""
+    page = await _ensure_page(arguments.get("tab"), device_class=arguments.get("device_class"))
+    # el probe de listeners tiene que estar puesto antes de que la página registre los suyos
+    reload_first = arguments.get("reload", True)
+    if reload_first:
+        try:
+            await page.context.add_init_script(_JS_LISTENER_PROBE)
+        except Exception:
+            pass
+        try:
+            await page.reload(wait_until="load")
+            await _reapply_class(page)
+            await page.wait_for_timeout(int(arguments.get("settle_ms", 1200)))
+        except Exception:
+            pass
+
+    r = await page.evaluate(_JS_MOBILE_AUDIT)
+    L, findings = [], []
+    L.append(_class_tag(page))
+    L.append(f"url: {page.url}")
+    L.append(f"dom_nodes: {r['dom_nodes']} · viewport: {r['viewport']} · dpr: {r['dpr']}")
+    L.append("")
+
+    # ── listeners no-passive ──
+    lis = r.get("listeners")
+    if lis is None:
+        L.append("listeners_bloqueantes: (no medido — el probe se instala en el reload; "
+                 "corré con reload=true)")
+    elif lis:
+        L.append(f"🔴 listeners NO-passive que bloquean el scroll: {len(lis)}")
+        for h in lis[:6]:
+            L.append(f"   {h['type']} en {h['target']} (passive={h['passive']})")
+            if h.get("stack"):
+                L.append(f"      ↳ {h['stack']}")
+        findings.append(f"{len(lis)} listener(s) touch/wheel no-passive: el compositor tiene que "
+                        f"esperar al JS antes de scrollear. Es LA causa de scroll trabado en celu "
+                        f"que en desktop no se nota. Fix: {{passive:true}} en addEventListener")
+    else:
+        L.append("✅ listeners touch/wheel: todos passive (el scroll no espera al JS)")
+    L.append("")
+
+    # ── blur ──
+    b = r["blur"]
+    if b["count"]:
+        L.append(f"blur / backdrop-filter: {b['count']} elemento(s), "
+                 f"área total ≈ {b['total_area_vp']}x el viewport")
+        for x in b["top"]:
+            L.append(f"   {x['sel']} — {x['kind']} radius={x['radius']}px, "
+                     f"área={x['area_vp']}x viewport")
+        if b["total_area_vp"] >= 1.0:
+            findings.append(f"blur sobre ≈{b['total_area_vp']}x el área del viewport. En GPU móvil "
+                            f"el blur se paga por píxel y por frame: es el motivo nº1 de stutter "
+                            f"que no aparece en desktop. Fix: menos radio, menos área, o reemplazar "
+                            f"backdrop-filter por una capa semitransparente")
+    else:
+        L.append("blur / backdrop-filter: ninguno")
+
+    # ── animaciones ──
+    a = r["animations"]
+    L.append("")
+    L.append(f"animaciones activas: {a['good_count']} en transform/opacity (baratas), "
+             f"{a['bad_count']} en otras props")
+    if a["bad_count"]:
+        for x in a["bad"][:6]:
+            L.append(f"   ⚠ {x['sel']} anima {', '.join(x['props'])}")
+        findings.append(f"{a['bad_count']} animación(es) sobre {', '.join(a['bad_props'][:5])}: "
+                        f"cada frame dispara layout o paint en vez de ir por el compositor. "
+                        f"Fix: pasarlas a transform/opacity")
+    t = r["transitions_layout"]
+    if t["count"]:
+        L.append(f"   transiciones CSS sobre props de layout: {t['count']} elemento(s) visibles "
+                 f"({t.get('all_count', 0)} con `transition: all`)")
+        for x in t["top"][:4]:
+            L.append(f"      {x['sel']}: transition {', '.join(x['props'])}")
+        if t.get("all_count", 0) > 50:
+            findings.append(f"{t['all_count']} elementos visibles con `transition: all` (regla global "
+                            f"tipo `* {{transition:all}}`): cualquier cambio de estilo se vuelve "
+                            f"animable, incluidos los que disparan layout. Fix: acotar la transición "
+                            f"a las props que de verdad animás")
+
+    # ── capas ──
+    L.append("")
+    wc = r["will_change"]
+    L.append(f"will-change: {wc['count']} elemento(s) · position fixed/sticky: {r['fixed_sticky']}")
+    if wc["count"] > 12:
+        findings.append(f"{wc['count']} elementos con will-change: cada uno promueve una capa y "
+                        f"consume memoria de GPU, que en un celu es escasa. Fix: aplicarlo solo "
+                        f"mientras dura la animación, no permanente")
+
+    # ── canvas ──
+    if r["canvas"]:
+        L.append("")
+        for c in r["canvas"]:
+            L.append(f"canvas: buffer {c['buffer']} ({c['mpx']} Mpx) mostrado a {c['css']}")
+        big = [c for c in r["canvas"] if c["mpx"] > 1.5]
+        if big:
+            findings.append(f"canvas de {big[0]['mpx']} Mpx: el fill rate se paga por píxel físico. "
+                            f"En un celu a dpr 2-3 esto se multiplica. Fix: capar el "
+                            f"devicePixelRatio del renderer (en three.js: setPixelRatio(min(dpr,2)))")
+
+    # ── svg ──
+    s = r["svg"]
+    if s["nodes"]:
+        L.append("")
+        L.append(f"svg: {s['nodes']} nodos · {s['filters']} filtros "
+                 f"({s['blur_filters']} de blur/shadow) · {s['smil_animations']} animaciones SMIL")
+        if s["blur_filters"]:
+            findings.append(f"{s['blur_filters']} filtro(s) SVG de blur/drop-shadow: muchos móviles "
+                            f"los rasterizan por CPU. Fix: pre-rasterizar a imagen o quitar el filtro")
+        if s["smil_animations"] > 10:
+            findings.append(f"{s['smil_animations']} animaciones SMIL: SMIL no va por el compositor "
+                            f"y su soporte móvil es irregular. Fix: pasarlas a CSS/WAAPI")
+
+    # ── imágenes ──
+    im = r["oversized_images"]
+    if im["count"]:
+        L.append("")
+        L.append(f"imágenes sobredimensionadas: {im['count']}")
+        for x in im["top"]:
+            L.append(f"   {x['src']}: {x['natural']} mostrada a {x['shown']} ({x['waste']}x)")
+        findings.append(f"{im['count']} imagen(es) servidas mucho más grandes de lo que se muestran: "
+                        f"el decode cuesta CPU y memoria en el celu. Fix: srcset/sizes")
+
+    sh = r["big_shadows"]
+    if sh["count"]:
+        L.append("")
+        L.append(f"box-shadow de radio grande sobre áreas grandes: {sh['count']} "
+                 f"({', '.join(x['sel'] for x in sh['top'])})")
+
+    L.append("")
+    L.append("─" * 60)
+    if findings:
+        L.append(f"HALLAZGOS ({len(findings)}), del más probable al menos:")
+        for i, f in enumerate(findings, 1):
+            L.append(f"{i}. {f}")
+    else:
+        L.append("Sin causas estructurales evidentes de jank móvil. "
+                 "Si igual stutea, medí con frame_stats en device_class='low_end' "
+                 "y revisá el costo por frame del JS con long_tasks.")
+    return "\n".join(L)
+
+
+async def _tool_perf_matrix(arguments: dict) -> str:
+    """La misma página medida en varias clases de dispositivo, lado a lado. Responde
+    directamente '¿en qué punto se rompe?' — que es lo que no se ve midiendo solo en desktop."""
+    url = arguments.get("url")
+    classes = arguments.get("classes") or ["desktop", "mid", "low_end"]
+    classes = [_norm_class(c) for c in classes]
+    device = arguments.get("device")
+    action = arguments.get("action", "touch_scroll")
+    dur = int(arguments.get("duration_ms", 2500))
+    scroll_px = int(arguments.get("scroll_px", 2000))
+
+    rows = []
+    for klass in classes:
+        page = await _ensure_page(browser="chromium", device=device, device_class=klass)
+        if url:
+            try:
+                await page.goto(_resolve_url(url), wait_until="load")
+                await _reapply_class(page)
+                await page.wait_for_timeout(600)
+            except Exception as e:
+                rows.append({"class": klass, "error": str(e)[:80]})
+                continue
+        try:
+            await page.evaluate("()=>window.scrollTo(0,0)")
+        except Exception:
+            pass
+
+        # el conteo autoritativo es el del compositor; rAF queda como respaldo si no hay trace
+        frames, _note = await _measure_frames(page, dur, action, scroll_px)
+        fps = await page.evaluate(_JS_MEASURE_FPS, {"action": "none", "selector": None,
+                                                    "duration_ms": 900, "scroll_px": scroll_px})
+        lt = await page.evaluate(_JS_LONG_TASKS, {"duration_ms": 1200, "action": "none",
+                                                  "scroll_px": scroll_px})
+        rows.append({
+            "class": klass, "tab": _tab_of(page),
+            "cfps": frames["fps"] if frames else None,
+            "drop": frames["pct"] if frames else None,
+            "fps": fps.get("avg_fps", 0), "jank": fps.get("jank", 0),
+            "worst": fps.get("worst_ms", 0),
+            "blocked": lt.get("total_blocked_ms", 0), "loaf": lt.get("loaf", 0),
+        })
+
+    dev_label = device or "desktop"
+    gpu = _gpu_short(_state.gpu_renderer or "") if _state.gpu_renderer else "? (corré gpu_info)"
+    out = [f"perf_matrix · url={url or '(la ya cargada)'} · device={dev_label} · "
+           f"action={action} · gpu={gpu}", ""]
+    out.append(f"{'clase':<10} {'cpu':>5} {'cFPS':>6} {'drop%':>6} {'rAFfps':>7} {'jank':>5} "
+               f"{'worst':>7} {'blocked':>8} {'loaf':>5}  veredicto")
+    out.append("─" * 82)
+    for r in rows:
+        if r.get("error"):
+            out.append(f"{r['class']:<10} ERROR: {r['error']}")
+            continue
+        cpu = f"{_DEVICE_CLASSES[r['class']]['cpu']}x"
+        drop = r["drop"]
+        # el veredicto se decide por el compositor (drop%) cuando hay trace: el rAF puede decir
+        # 60fps mientras el compositor está perdiendo frames, que es lo que el usuario siente.
+        if drop is not None:
+            v = "smooth" if drop < 5 else ("degraded" if drop < 20 else "janky")
+        else:
+            v = ("smooth" if r["fps"] >= 55 and r["jank"] == 0
+                 else "janky" if r["jank"] >= 3 or r["worst"] > 80 else "degraded")
+        cf = f"{r['cfps']}" if r["cfps"] is not None else "n/a"
+        dp = f"{drop}%" if drop is not None else "n/a"
+        out.append(f"{r['class']:<10} {cpu:>5} {cf:>6} {dp:>6} {r['fps']:>7} {r['jank']:>5} "
+                   f"{r['worst']:>7} {r['blocked']:>8} {r['loaf']:>5}  {v}")
+    out.append("")
+    out.append("cFPS/drop% = compositor (lo que se siente) · rAFfps/jank = main thread · "
+               "blocked = ms de main thread bloqueado")
+    ok = [r for r in rows if not r.get("error")]
+    if len(ok) >= 2:
+        def bad(r):
+            return (r["drop"] is not None and r["drop"] >= 5) or r["fps"] < 50 or r["jank"] >= 3
+        first_bad = next((r for r in ok if bad(r)), None)
+        out.append("")
+        if first_bad:
+            out.append(f"→ se rompe en '{first_bad['class']}'. Para saber POR QUÉ: "
+                       f"mobile_perf_audit(tab='{first_bad['tab']}')")
+        else:
+            out.append("→ aguanta todas las clases probadas. Si igual stutea en el celu real, el "
+                       "cuello es GPU (probá set_mode(gpu_tier='software')) o térmico (no simulable).")
+    out.append("(cada clase vive en su propia tab: siguen abiertas para inspeccionarlas)")
+    return "\n".join(out)
+
+
 _DISPATCH = {
+    "gpu_info": _tool_gpu_info,
+    "calibrate": _tool_calibrate,
+    "set_device_class": _tool_set_device_class,
+    "frame_stats": _tool_frame_stats,
+    "scroll_gesture": _tool_scroll_gesture,
+    "mobile_perf_audit": _tool_mobile_perf_audit,
+    "perf_matrix": _tool_perf_matrix,
     "goto": _tool_goto,
     "save_storage_state": _tool_save_storage_state,
     "load_storage_state": _tool_load_storage_state,
@@ -2475,6 +3564,8 @@ async def list_tools() -> list[types.Tool]:
                 "url": {"type": "string", "description": "URL completa o ruta relativa a --base-url"},
                 "wait_until": {"type": "string", "enum": ["load", "domcontentloaded", "networkidle", "commit"], "default": "load"},
                 "bypass_cache": {"type": "boolean", "default": False, "description": "ignora la caché HTTP en esta navegación (hard-load, chromium)"},
+                "device_class": {"type": "string", "enum": ["desktop", "flagship", "mid", "low_end"],
+                                 "description": "capacidad a emular en esta tab (CPU/red/cores/RAM). `device` emula la FORMA, esto emula la CAPACIDAD: sin esto un viewport de celu sobre tu desktop siempre da verde. low_end = 6x CPU + slow_4g. Ver set_device_class."},
                 **browser_param,
                 **device_param,
                 **tab,
@@ -2646,6 +3737,8 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={"type": "object", "properties": {
                 "wait_until": {"type": "string", "enum": ["load", "domcontentloaded", "networkidle", "commit"], "default": "load"},
                 "bypass_cache": {"type": "boolean", "default": False, "description": "hard-reload ignorando caché HTTP (chromium)"},
+                "device_class": {"type": "string", "enum": ["desktop", "flagship", "mid", "low_end"],
+                                 "description": "capacidad a emular en esta tab (CPU/red/cores/RAM). `device` emula la FORMA, esto emula la CAPACIDAD: sin esto un viewport de celu sobre tu desktop siempre da verde. low_end = 6x CPU + slow_4g. Ver set_device_class."},
                 **tab,
             }},
         ),
@@ -2662,6 +3755,8 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={"type": "object", "properties": {
                 "headed": {"type": "boolean", "description": "true=ventana visible (WSLg) — también habilita scrollbars clásicos (~16px) para auditarlos; false=headless (scrollbars thin/overlay no representativos)"},
                 "reduced_motion": {"type": "string", "enum": ["reduce", "no-preference"], "description": "emula la media query prefers-reduced-motion ('reduce' = usuario pidió menos movimiento)"},
+                "gpu_tier": {"type": "string", "enum": ["auto", "hardware", "software"],
+                             "description": "backend gráfico (flag de LAUNCH → relanza el browser). 'software'=SwiftShader, buen proxy de GPU móvil pobre; 'hardware'=intenta GPU real. OJO: headless suele caer a software SIN avisar — confirmá siempre con gpu_info cuál te tocó."},
             }},
         ),
         types.Tool(
@@ -2670,6 +3765,8 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string", "description": "URL/ruta a abrir (opcional)"},
                 "label": {"type": "string", "description": "etiqueta legible (opcional)"},
+                "device_class": {"type": "string", "enum": ["desktop", "flagship", "mid", "low_end"],
+                                 "description": "capacidad a emular en esta tab (CPU/red/cores/RAM). `device` emula la FORMA, esto emula la CAPACIDAD: sin esto un viewport de celu sobre tu desktop siempre da verde. low_end = 6x CPU + slow_4g. Ver set_device_class."},
                 **browser_param,
                 **device_param,
             }},
@@ -2764,9 +3861,13 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="measure_fps",
-            description="Mide FPS/jank durante una acción (scroll programático / hover / idle) con requestAnimationFrame. Output: avg_fps, dropped, jank, worst/p95, verdict smooth|degraded|janky.",
+            description="Mide FPS/jank durante una acción con requestAnimationFrame. Output: avg_fps, dropped, jank, worst/p95, verdict smooth|degraded|janky, y SIEMPRE la device_class bajo la que se midió (un 'smooth' de desktop y uno de low_end no son comparables). Bajo throttling alto preferí frame_stats: el contador rAF vive en el main thread ralentizado y compite con la página que mide.",
             inputSchema={"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["scroll", "hover", "none"], "default": "scroll"},
+                "action": {"type": "string", "enum": ["touch_scroll", "scroll", "hover", "none"], "default": "scroll",
+                           "description": "touch_scroll = fling táctil REAL por el compositor (el path del celu, el que se traba con listeners no-passive); scroll = window.scrollBy en el main thread"},
+                "device_class": {"type": "string", "enum": ["desktop", "flagship", "mid", "low_end"],
+                                 "description": "capacidad del dispositivo bajo la que medir (ver set_device_class). Medir en desktop cuando el problema es de celu da siempre verde."},
+
                 "selector": {"type": "string", "description": "para action=hover"},
                 "duration_ms": {"type": "integer", "default": 2000},
                 "scroll_px": {"type": "integer", "default": 2000},
@@ -2780,6 +3881,8 @@ async def list_tools() -> list[types.Tool]:
                 "selector": {"type": "string"},
                 "nth": {"type": "integer", "default": 0, "description": "índice si el selector matchea varios"},
                 "runs": {"type": "integer", "default": 5},
+                "device_class": {"type": "string", "enum": ["desktop", "flagship", "mid", "low_end"],
+                                 "description": "capacidad del dispositivo bajo la que medir (ver set_device_class). Medir en desktop cuando el problema es de celu da siempre verde."},
                 **tab,
             }, "required": ["selector"]},
         ),
@@ -2805,6 +3908,8 @@ async def list_tools() -> list[types.Tool]:
                 "duration_ms": {"type": "integer", "default": 3000},
                 "action": {"type": "string", "enum": ["scroll", "none"], "default": "none"},
                 "scroll_px": {"type": "integer", "default": 2000},
+                "device_class": {"type": "string", "enum": ["desktop", "flagship", "mid", "low_end"],
+                                 "description": "capacidad del dispositivo bajo la que medir (ver set_device_class). Medir en desktop cuando el problema es de celu da siempre verde."},
                 **tab,
             }},
         ),
@@ -2825,6 +3930,8 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string", "description": "navega antes de medir (opcional)"},
                 "settle_ms": {"type": "integer", "default": 4000},
+                "device_class": {"type": "string", "enum": ["desktop", "flagship", "mid", "low_end"],
+                                 "description": "capacidad del dispositivo bajo la que medir (ver set_device_class). Medir en desktop cuando el problema es de celu da siempre verde."},
                 **tab,
             }},
         ),
@@ -2846,6 +3953,114 @@ async def list_tools() -> list[types.Tool]:
                 "action": {"type": "string", "enum": ["scroll", "none"], "default": "none"},
                 "scroll_px": {"type": "integer", "default": 2000},
                 **tab,
+            }},
+        ),
+        # ── emulación de CAPACIDAD (el celu lento), distinta de la de FORMA (`device`) ──
+        types.Tool(
+            name="set_device_class",
+            description=(
+                "Emula la CAPACIDAD del dispositivo: CPU lenta, red móvil, pocos cores, poca RAM. "
+                "Es el eje que le FALTA a `device`, que solo emula la forma (viewport/UA/touch) y por "
+                "eso 'en responsive se ve perfecto' mientras en el celu real hay stutter. "
+                "Clases: desktop (sin throttle) · flagship (1.5x, wifi) · mid (4x, fast_4g) · "
+                "low_end (6x, slow_4g, 4 cores, 2GB). Pegajosa: la tab la conserva entre navegaciones, "
+                "y cada clase vive en su propia tab (podés comparar sin perder ninguna). "
+                "Sin `name` lista las clases. Chromium-only (va por CDP). "
+                "OJO: NO toca la GPU — si el jank es por blur/WebGL, eso es gpu_tier."),
+            inputSchema={"type": "object", "properties": {
+                "name": {"type": "string", "enum": list(_DEVICE_CLASSES),
+                         "description": "clase a aplicar; omitir para listar"},
+                "cpu_rate": {"type": "number",
+                             "description": "pisa el multiplicador de CPU de la clase (ver calibrate)"},
+                **tab,
+            }},
+        ),
+        types.Tool(
+            name="calibrate",
+            description=(
+                "Mide la CPU de ESTA máquina (benchmark index estilo Lighthouse) y traduce cada "
+                "dispositivo objetivo a un multiplicador concreto. Necesario porque '6x' significa "
+                "cosas distintas en cada equipo: sin calibrar, ningún umbral de FPS es reproducible "
+                "en otra máquina ni en CI."),
+            inputSchema={"type": "object", "properties": {
+                "duration_ms": {"type": "integer", "default": 700},
+                **tab,
+            }},
+        ),
+        types.Tool(
+            name="gpu_info",
+            description=(
+                "Reporta el backend gráfico REAL (renderer WebGL + feature status del browser). "
+                "Importa mucho más de lo que parece: headless suele caer a SwiftShader — rasterizado "
+                "por CPU — sin avisar, y entonces todo FPS de canvas/WebGL/blur que midas no "
+                "representa ni tu desktop ni un celu. Corrélo antes de creerle a una medición gráfica."),
+            inputSchema={"type": "object", "properties": {**tab}},
+        ),
+        types.Tool(
+            name="frame_stats",
+            description=(
+                "Frames dropeados según el COMPOSITOR del browser (vía trace), no vía requestAnimationFrame. "
+                "Es más fiel que measure_fps bajo throttling: el contador rAF corre en el main thread "
+                "ralentizado y compite con la página que está midiendo. Por defecto dispara un fling "
+                "táctil real. Chromium-only."),
+            inputSchema={"type": "object", "properties": {
+                "duration_ms": {"type": "integer", "default": 3000},
+                "action": {"type": "string", "enum": ["touch_scroll", "scroll", "none"],
+                           "default": "touch_scroll"},
+                "scroll_px": {"type": "integer", "default": 2000},
+                "device_class": {"type": "string", "enum": list(_DEVICE_CLASSES)},
+                **tab,
+            }},
+        ),
+        types.Tool(
+            name="scroll_gesture",
+            description=(
+                "Scroll por GESTO TÁCTIL real (fling del compositor, vía CDP), no window.scrollBy. "
+                "La diferencia importa: scrollBy corre en el main thread y nunca recorre el camino "
+                "que hace un dedo en un celu — justo el que se traba cuando hay listeners "
+                "touch/wheel no-passive. Requiere allow_interact + chromium."),
+            inputSchema={"type": "object", "properties": {
+                "distance_px": {"type": "integer", "default": 1500},
+                "duration_ms": {"type": "integer", "default": 500},
+                "device_class": {"type": "string", "enum": list(_DEVICE_CLASSES)},
+                **tab,
+            }},
+        ),
+        types.Tool(
+            name="mobile_perf_audit",
+            description=(
+                "Busca las CAUSAS del jank móvil, no el síntoma: listeners touch/wheel no-passive "
+                "(la causa clásica de scroll trabado en celu que en desktop no se nota), área total "
+                "de blur/backdrop-filter, animaciones sobre props que disparan layout, exceso de "
+                "will-change, canvas por megapíxeles, filtros SVG, imágenes sobredimensionadas. "
+                "Devuelve hallazgos priorizados con el fix de cada uno. Complementa measure_fps: "
+                "ese dice que está lento, este dice qué lo pone lento."),
+            inputSchema={"type": "object", "properties": {
+                "reload": {"type": "boolean", "default": True,
+                           "description": "recarga para instrumentar addEventListener; sin esto no "
+                                          "se detectan los listeners no-passive"},
+                "settle_ms": {"type": "integer", "default": 1200},
+                "device_class": {"type": "string", "enum": list(_DEVICE_CLASSES)},
+                **tab,
+            }},
+        ),
+        types.Tool(
+            name="perf_matrix",
+            description=(
+                "La misma página medida en varias device_class lado a lado (desktop/mid/low_end por "
+                "defecto), en una tabla. Responde de una '¿en qué punto se rompe?' — que es "
+                "exactamente lo que no se ve midiendo solo en desktop. Cada clase queda en su propia "
+                "tab para inspeccionarla después con mobile_perf_audit."),
+            inputSchema={"type": "object", "properties": {
+                "url": {"type": "string", "description": "navega antes de medir (opcional)"},
+                "classes": {"type": "array", "items": {"type": "string", "enum": list(_DEVICE_CLASSES)},
+                            "description": "default: desktop, mid, low_end"},
+                "device": {"type": "string", "description": "preset a emular en todas las filas "
+                                                            "(ej. 'Pixel 7'); omitir = desktop"},
+                "action": {"type": "string", "enum": ["touch_scroll", "scroll", "none"],
+                           "default": "touch_scroll"},
+                "duration_ms": {"type": "integer", "default": 2500},
+                "scroll_px": {"type": "integer", "default": 2000},
             }},
         ),
     ]

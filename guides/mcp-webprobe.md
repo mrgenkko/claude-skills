@@ -10,6 +10,9 @@ dolores al probar landings desde Claude Code:
 2. **Diagnosticar "botones lentos / animaciones que no se sienten al entrar"** — lo
    que ningún MCP de la comunidad (`@playwright/mcp`, Chrome DevTools MCP, etc.) mide:
    FPS/jank, INP, latencia de botón y si la animación de entrada realmente dispara.
+3. **Reproducir el celular lento desde la PC** (v0.5.6) — CPU/red/GPU throttleadas, gesto
+   táctil real y auditoría de causas, para encontrar el stutter *antes* del deploy en vez de
+   descubrirlo en el dispositivo. Ver "Emular un celular lento".
 
 ## ¿Por qué custom y no `@playwright/mcp` oficial?
 
@@ -54,6 +57,13 @@ navegar/click es trivial para el scope (tus landings, en chromium/firefox/webkit
 | **Perf** | `entrance_animation_check` | ¿La animación de entrada **on-load** dispara o el elemento aparece estático? + reduced-motion (`nth` opcional). |
 | **Perf** | `interaction_animation` | Animación por **click/hover** (modal/drawer): todos los ejes (translateX/Y+scale, scale normalizado por tamaño), `settle_ms`+`opacity_settle_ms`, overshoot **con magnitud** (%), `nth` en trigger/target, `reset` (escape/reload/none) para destapar el siguiente. Target **opcional** → mide el propio trigger (hover sobre un botón). `target_within_trigger` (CSS relativo al trigger ya resuelto) para transform propagado padre→hijo: sigue a `trigger_nth` sin nth global desalineado. Verdict ok/overshoot_leve(>5%)/overshoot_fuerte(>15%)/opacity_incompleta. |
 | **Perf** | `web_vitals` | LCP, CLS, INP, TBT. |
+| **Celu lento** | `set_device_class` | Emula la **capacidad** (CPU lenta, red móvil, pocos cores, poca RAM): `desktop`\|`flagship`\|`mid`\|`low_end`. El eje que le falta a `device`, que solo emula la forma. Pegajoso por tab; cada clase vive en su tab. Chromium-only (CDP). Ver sección "Emular un celular lento". |
+| **Celu lento** | `gpu_info` | Backend gráfico **real** (renderer WebGL + featureStatus). Headless suele caer a SwiftShader **sin avisar** → todo FPS de canvas/WebGL/blur medido así no representa nada. Corrélo antes de creerle a una medición gráfica. |
+| **Celu lento** | `calibrate` | Benchmark de CPU del host → multiplicador necesario para cada dispositivo objetivo. Sin esto, "6x" significa cosas distintas en cada máquina y ningún umbral es portable. |
+| **Celu lento** | `frame_stats` | Frames dropeados según el **compositor** (trace del browser), no rAF. Más fiel bajo throttling: el contador rAF vive en el main thread ralentizado y compite con la página que mide. Chromium-only. |
+| **Celu lento** | `scroll_gesture` | Scroll por **gesto táctil real** (fling del compositor vía CDP), no `window.scrollBy`. Es el path que recorre un dedo en un celu — el que se traba con listeners no-passive. Gate `allow_interact`. |
+| **Celu lento** | `mobile_perf_audit` | Las **causas** del jank móvil: listeners touch/wheel no-passive, área de blur/backdrop-filter, animaciones sobre props de layout, `transition:all` global, will-change, megapíxeles de canvas, filtros SVG, imágenes sobredimensionadas. Devuelve hallazgos priorizados con su fix. |
+| **Celu lento** | `perf_matrix` | La misma página en varias `device_class` lado a lado, en tabla. Responde de una "¿en qué punto se rompe?". |
 | Captura | `screenshot` | PNG: `return=path` (disco, barato, reporta **dims reales**) o `return=inline` (base64, cliente remoto). `selector` recorta al elemento (un ancestro con `overflow` puede clipear → `full_page` o apuntá al contenedor scrollable). |
 | Captura | `record_trace` | Playwright trace (pesado, opt-in) a `--artifact-dir`. |
 
@@ -245,6 +255,99 @@ Detalles del modelo:
 > ~980px. La emulación es fiel a eso: vas a ver `innerWidth: 980` aunque el device sea de
 > 390px. No es un bug del server — es el síntoma de que a la página le falta el meta tag.
 
+## Emular un celular **lento** (`device_class` + `gpu_tier`)
+
+`device` emula la **forma** (viewport/UA/touch) y responde *"¿se ve bien en un celu?"*.
+No responde *"¿se **siente** bien?"* — y esa es otra pregunta, con otro eje. Un celular de
+gama baja no es un desktop con la ventana chica: tiene ~4-6x menos CPU por core, red con
+latencia alta, pocos cores, poca RAM y una GPU muy inferior. Por eso "en responsive todo
+perfecto" convive con stutter en producción.
+
+**Son tres ejes independientes** y hay que moverlos por separado:
+
+| Eje | Cómo | Qué jank descubre |
+|---|---|---|
+| CPU / red / cores / RAM | `device_class` (CDP, runtime) | JS pesado, hydration, layout thrashing, LCP, CLS |
+| GPU | `gpu_tier` (flag de **launch** → relanza) | blur, `backdrop-filter`, WebGL, sombras, exceso de capas |
+| Gesto | `scroll_gesture` / `action="touch_scroll"` | listeners no-passive, inercia, scroll del compositor |
+
+```
+goto(url, device="Pixel 7", device_class="low_end")   # forma + capacidad juntas
+perf_matrix(url, device="Pixel 7")                    # desktop/mid/low_end lado a lado
+mobile_perf_audit()                                   # ¿y por qué se rompe?
+set_mode(gpu_tier="software")                         # GPU pobre (relanza el browser)
+```
+
+Clases: `desktop` (sin throttle) · `flagship` (1.5x, wifi) · `mid` (4x, fast_4g, 8 cores) ·
+`low_end` (6x, slow_4g, 4 cores, 2GB). Cada clase vive en **su propia tab**, igual que los
+devices: podés comparar sin perder ninguna.
+
+### El punto ciego que esto destapa: headless mide **sin GPU**
+
+Chromium headless cae a **SwiftShader** (rasterización por CPU) sin decir nada. Medido acá:
+
+```
+sin flags        → webgl: unavailable_software, gpu_compositing: disabled_software
+--use-angle=gl   → 4/4 aceleradas, renderer = ANGLE (AMD ... radeonsi)   ← gpu_tier="hardware"
+--use-angle=vulkan → 4/4 aceleradas PERO el contexto WebGL no se crea desde JS  ← inservible
+```
+
+O sea: **todas las mediciones gráficas previas a v0.5.6 venían de un backend por software**.
+Por eso `gpu_info` existe y `status` muestra el renderer: pedir `hardware` **no garantiza**
+obtenerlo, y sin ese dato un número de FPS de canvas/WebGL/blur no es interpretable.
+
+### Por qué `frame_stats` y no solo `measure_fps`
+
+`measure_fps` cuenta con `requestAnimationFrame`, que **vive en el main thread**: bajo 6x de
+throttling el propio contador compite con la página que está midiendo. Y el rAF no ve los
+frames que pierde el compositor. Medido sobre la misma página y el mismo scroll:
+
+```
+measure_fps → avg_fps 59.9, jank 0, verdict smooth
+frame_stats → 13/184 frames dropeados (7%), verdict degraded    ← lo que el usuario siente
+```
+
+`frame_stats` lee el trace del browser. Detalle de implementación que importa: el tracing es
+**del browser entero**, así que con varias tabs vivas los frames de todas caen en el mismo
+trace (3 tabs ⇒ "176 fps"). El server siembra un `console.timeStamp` desde la page para
+descubrir el pid de su renderer y contar solo los suyos; si no lo logra, lo avisa en vez de
+devolver un número inflado.
+
+### Calibración: "6x" no significa lo mismo en cada máquina
+
+```
+calibrate() → host_benchmark_index: 2806  (desktop típico: 1000-2000)
+              low_end_android (idx≈250)  → cpu 11.2x
+              mid_android     (idx≈700)  → cpu 4.0x
+              clase low_end (6x fijo) → idx≈468 ≈ low_end_android
+```
+
+Sin calibrar, un umbral de FPS que fijes hoy no es reproducible en otra máquina ni en CI.
+Si una clase no cae donde querés: `set_device_class(name="low_end", cpu_rate=11.2)`.
+
+### Caso real: lait2 (4 variantes de la misma landing)
+
+Con `device="Pixel 7"` + `device_class="low_end"`, moviendo **solo** el eje GPU:
+
+| Ruta | GPU real | GPU software | Causa (`mobile_perf_audit`) |
+|---|---|---|---|
+| `/hud` | 0% drop | 1% drop | — |
+| `/svg` | 4% drop | 5% drop | 3 listeners no-passive (Lenis) + blur sobre 3.4x el viewport |
+| `/blender` | 2% drop | **25% drop** | 2 listeners no-passive + `transition:all` en 142 elementos |
+| `/r3f` | 3% drop | **33% drop** | escena WebGL (el canvas ya está capado a dpr 1) |
+
+Lectura: a 6x de CPU las cuatro aguantan. El cuello es **GPU**, y solo aparece al degradarla.
+Un `perf_matrix` de las tres clases con GPU real habría dicho "smooth" en todas — de ahí que
+los dos ejes tengan que moverse por separado.
+
+### Lo que esto NO simula
+
+Chromium en x86 con throttling **no es** un Snapdragon: no reproduce ARM vs x86, GPU
+tile-based, ni el **throttling térmico** tras medio minuto de scroll. Y **iOS/Safari no tiene
+CPU throttling** — WebKit no expone CDP, así que ahí solo emulás forma. Sirve para encontrar
+el grueso de los problemas antes del deploy y para detectar regresiones; no para números
+absolutos que predigan el dispositivo real.
+
 ## headless vs headed
 
 `headless` en `secrets.json` es solo el **modo de arranque**. El agente lo cambia en
@@ -311,6 +414,13 @@ desktop — normalmente **no** se fija acá, el agente lo pasa por tab), `viewpo
 (el desktop base), `persistent_profile` (conserva auth/cookies; **incompatible con `device`**),
 `artifact_dir`/`artifact_ttl`/`max_artifacts`. La URL la pasa el agente en `goto`, así
 que una sola instancia genérica `webprobe` sirve para todos los proyectos.
+
+Desde v0.5.6, además: `device_class` (capacidad por defecto: `desktop`\|`flagship`\|`mid`\|
+`low_end`; default `desktop` = sin throttling, comportamiento histórico) y `gpu_tier`
+(`auto`\|`hardware`\|`software`; default `auto`). Ambos son **defaults de la instancia** — lo
+normal es dejarlos y que el agente los pase por tab / con `set_mode`. Fijar
+`gpu_tier: "hardware"` en `secrets.json` tiene sentido si vas a medir WebGL seguido: evita
+que las mediciones arranquen en SwiftShader sin que nadie lo note.
 
 ## Requisitos
 
