@@ -64,7 +64,7 @@ navegar/click es trivial para el scope (tus landings, en chromium/firefox/webkit
 | **Celu lento** | `scroll_gesture` | Scroll por **gesto táctil real** (fling del compositor vía CDP), no `window.scrollBy`. Es el path que recorre un dedo en un celu — el que se traba con listeners no-passive. Gate `allow_interact`. |
 | **Celu lento** | `mobile_perf_audit` | Las **causas** del jank móvil: listeners touch/wheel no-passive, área de blur/backdrop-filter, animaciones sobre props de layout, `transition:all` global, will-change, megapíxeles de canvas, filtros SVG, imágenes sobredimensionadas. Devuelve hallazgos priorizados con su fix. |
 | **Celu lento** | `perf_matrix` | La misma página en varias `device_class` lado a lado, en tabla. Responde de una "¿en qué punto se rompe?". |
-| Captura | `screenshot` | PNG: `return=path` (disco, barato, reporta **dims reales**) o `return=inline` (base64, cliente remoto). `selector` recorta al elemento (un ancestro con `overflow` puede clipear → `full_page` o apuntá al contenedor scrollable). |
+| Captura | `screenshot` | PNG: `return=inline` (default, base64, se ve directo en el resultado) o `return=path` (disco, barato, reporta **dims reales**, requiere `Read` aparte para verla). `selector` recorta al elemento (un ancestro con `overflow` puede clipear → `full_page` o apuntá al contenedor scrollable). |
 | Captura | `record_trace` | Playwright trace (pesado, opt-in) a `--artifact-dir`. |
 
 Todas las tools de inspección/perf aceptan `tab` opcional (default: la activa).
@@ -387,9 +387,11 @@ También se puede fijar el modo de arranque con `--reduced-motion reduce` en el 
 
 Los artefactos van a `--artifact-dir` propio (default `~/.cache/webprobe/<name>/`),
 **no a `/tmp` pelado**, y el reaper los borra por `--artifact-ttl` (1 h) + cap
-`--max-artifacts` (LRU). `screenshot(return="path")` devuelve la ruta (token-cheap,
-cliente local stdio); `return="inline"` devuelve `ImageContent` base64 que viaja por
-el protocolo y sirve si exponés el MCP por HTTP a otra máquina sin disco.
+`--max-artifacts` (LRU). `screenshot(return="inline")` (default) devuelve `ImageContent`
+base64 que viaja por el protocolo y se ve directo en el resultado — mejor para inspección
+visual, y también lo que corresponde si exponés el MCP por HTTP a otra máquina sin disco.
+`return="path"` devuelve la ruta (token-cheap, requiere `Read` aparte para verla); conviene
+en corridas largas con muchas capturas donde no hace falta ver cada una.
 
 ## Configuración en `secrets.json`
 

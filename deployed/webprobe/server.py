@@ -69,7 +69,7 @@ SERVER_LABEL = args.name or "webprobe"
 # Bump en cada cambio de comportamiento. El agente lo ve en status() para saber si el
 # proceso MCP está stale (un MCP es de vida larga; editar server.py NO recarga el proceso
 # vivo — hay que reiniciar Claude Code / recargar la ventana de VSCode).
-WEBPROBE_VERSION = "0.5.6"
+WEBPROBE_VERSION = "0.5.7"
 app = Server(f"webprobe-{SERVER_LABEL}")
 
 
@@ -2200,7 +2200,7 @@ def _png_dims(path: str):
 
 async def _tool_screenshot(arguments: dict):
     page = await _ensure_page(arguments.get("tab"))
-    ret = arguments.get("return", "path")
+    ret = arguments.get("return", "inline")
     full_page = bool(arguments.get("full_page", False))
     selector = arguments.get("selector")
     clip_el = None
@@ -3937,11 +3937,11 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="screenshot",
-            description="Captura PNG. return='path' (default) guarda en --artifact-dir y devuelve la ruta + las dimensiones REALES de la imagen (token-cheap, cliente local); return='inline' devuelve la imagen base64 por el protocolo (cliente remoto sin disco). Con `selector` recorta a ese elemento (scroll-into-view + bounding box); OJO: un ancestro con overflow (tabla en un div scrollable) puede clipear el contenido — para capturar todo usá full_page=true o apuntá el selector al contenedor scrollable. Las dims reportadas (≈viewport ⇒ probablemente recortó) ayudan a detectarlo. NOTA scrollbars: en headless el scrollbar sale thin/overlay (casi no se ve, no representa al usuario real); para captar/auditar el scrollbar clásico usá set_mode(headed=true).",
+            description="Captura PNG. return='inline' (default) devuelve la imagen base64 por el protocolo — se ve directo en el resultado, mejor para inspección visual humana o del agente. return='path' guarda en --artifact-dir y devuelve la ruta + las dimensiones REALES de la imagen (token-cheap, requiere un Read aparte para verla; útil en corridas largas con muchas capturas donde no hace falta ver cada una). Con `selector` recorta a ese elemento (scroll-into-view + bounding box); OJO: un ancestro con overflow (tabla en un div scrollable) puede clipear el contenido — para capturar todo usá full_page=true o apuntá el selector al contenedor scrollable. Las dims reportadas (≈viewport ⇒ probablemente recortó) ayudan a detectarlo. NOTA scrollbars: en headless el scrollbar sale thin/overlay (casi no se ve, no representa al usuario real); para captar/auditar el scrollbar clásico usá set_mode(headed=true).",
             inputSchema={"type": "object", "properties": {
                 "selector": {"type": "string", "description": "recorta a un elemento (opcional)"},
                 "full_page": {"type": "boolean", "default": False},
-                "return": {"type": "string", "enum": ["path", "inline"], "default": "path"},
+                "return": {"type": "string", "enum": ["path", "inline"], "default": "inline"},
                 **tab,
             }},
         ),
