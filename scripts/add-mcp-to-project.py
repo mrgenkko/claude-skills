@@ -24,7 +24,15 @@ import os
 CLAUDE_JSON = os.path.expanduser("~/.claude.json")
 SKILLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SECRETS_FILE = os.path.join(SKILLS_DIR, "scripts", "secrets.json")
-VENV_PYTHON = os.path.join(SKILLS_DIR, ".venv", "bin", "python")
+# Windows: el binario necesita la extensión .exe para que cmd.exe lo resuelva
+# al lanzarlo como comando (la extensión de VSCode spawnea vía shell); ".venv/bin/python"
+# sin extensión funciona desde Git Bash pero cmd.exe lo rechaza con
+# "no se reconoce como un comando interno o externo".
+VENV_PYTHON = (
+    os.path.join(SKILLS_DIR, ".venv", "Scripts", "python.exe")
+    if os.name == "nt"
+    else os.path.join(SKILLS_DIR, ".venv", "bin", "python")
+)
 MCP_SERVERS_DIR = os.path.expanduser("~/.claude/mcp-servers")
 # Módulos GIO del sistema — antídoto al GIO_MODULE_DIR que inyecta el snap de VSCode.
 GIO_MODULE_DIR_SYS = "/usr/lib/x86_64-linux-gnu/gio/modules"
@@ -44,7 +52,12 @@ def build_mcp_servers(servers_config: list) -> dict:
     for entry in servers_config:
         name = entry["name"]
         kind = entry["type"]
-        env = {}
+        # Heredar el entorno completo de quien corre este script (SystemRoot, PATH,
+        # etc.) y no solo las claves específicas del entry. En Windows, un `env`
+        # que reemplaza el entorno en vez de extenderlo rompe `import asyncio`
+        # (WinError 10106: Winsock no inicializa sin SystemRoot) antes de que el
+        # server llegue a levantar el protocolo MCP.
+        env = dict(os.environ)
 
         if kind == "gcloud":
             args = [
