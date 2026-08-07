@@ -95,6 +95,45 @@ python3 ~/Mrgenkko\ Skills/scripts/add-mcp-to-project.py /ruta/absoluta/al/proye
 Por defecto no sobreescribe entradas existentes; usa `--update` para forzarlo.  
 Después de ejecutarlo, **reiniciar Claude Code en VSCode** para que carguen los nuevos MCPs.
 
+### Windows
+
+`add-mcp-to-project.py` corre igual en Windows. El venv se crea con el layout nativo:
+
+```powershell
+cd "$env:USERPROFILE\Mrgenkko Skills"
+py -3 -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+py -3 scripts\add-mcp-to-project.py C:\ruta\al\proyecto
+```
+
+El script detecta la plataforma y registra `.venv\Scripts\python.exe` en vez de
+`.venv/bin/python`, arma las rutas con el separador nativo y lee/escribe
+`~/.claude.json` forzando UTF-8 (sin eso, Windows lo abre con la codepage ANSI y
+corrompe las rutas de proyecto con acentos al reescribirlo).
+
+Los `server.py` de `deployed/` todavía no están validados en Windows: varios
+asumen rutas y binarios POSIX. Lo que está cubierto es el **registro**.
+
+### Tests
+
+Stdlib puro, sin dependencias ni `secrets.json`:
+
+```bash
+python3 -m unittest discover -s scripts -p "test_*.py" -v
+```
+
+CI los corre en Linux, Windows y macOS sobre Python 3.11 y 3.13
+(`.github/workflows/tests.yml`).
+
+**Sobre el `env` de cada MCP:** el cliente spawnea los servidores con
+`{...whitelist_heredada, ...env_declarado}` — o sea, `PATH`, `HOME`/`SystemRoot`
+y compañía ya llegan solos, y lo que este script declare **gana** sobre lo
+heredado. Por eso el `env` se deja mínimo: solo overrides deliberados
+(`GH_TOKEN`, `CLOUDSDK_CONFIG`, `GIO_MODULE_DIR`). Volcar `os.environ` ahí
+persistiría el entorno entero —secretos incluidos— en texto plano en
+`~/.claude.json`, pisaría esos overrides y congelaría un snapshot del entorno del
+momento del registro. Hay un test que lo impide.
+
 ---
 
 ## Servidores MCP incluidos

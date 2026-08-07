@@ -15,27 +15,78 @@ Por qué es necesario:
 Configuración:
     Todos los MCPs y sus credenciales se definen en scripts/secrets.json.
     Copiar scripts/secrets.example.json → scripts/secrets.json y completar.
+
+Portabilidad:
+    Corre en Linux/macOS y en Windows. Las diferencias de plataforma están
+    aisladas en venv_python() (layout del venv) y en el branch de webprobe
+    (GIO_MODULE_DIR es POSIX-only). Tests: scripts/test_add_mcp_to_project.py
 """
 
 import json
-import sys
 import os
+import stat
+import sys
+import tempfile
 
-CLAUDE_JSON = os.path.expanduser("~/.claude.json")
+HOME = os.path.expanduser("~")
+CLAUDE_JSON = os.path.join(HOME, ".claude.json")
 SKILLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SECRETS_FILE = os.path.join(SKILLS_DIR, "scripts", "secrets.json")
-# Windows: el binario necesita la extensión .exe para que cmd.exe lo resuelva
-# al lanzarlo como comando (la extensión de VSCode spawnea vía shell); ".venv/bin/python"
-# sin extensión funciona desde Git Bash pero cmd.exe lo rechaza con
-# "no se reconoce como un comando interno o externo".
-VENV_PYTHON = (
-    os.path.join(SKILLS_DIR, ".venv", "Scripts", "python.exe")
-    if os.name == "nt"
-    else os.path.join(SKILLS_DIR, ".venv", "bin", "python")
-)
-MCP_SERVERS_DIR = os.path.expanduser("~/.claude/mcp-servers")
+MCP_SERVERS_DIR = os.path.join(HOME, ".claude", "mcp-servers")
 # Módulos GIO del sistema — antídoto al GIO_MODULE_DIR que inyecta el snap de VSCode.
 GIO_MODULE_DIR_SYS = "/usr/lib/x86_64-linux-gnu/gio/modules"
+
+
+def venv_python() -> str:
+    """Ruta al intérprete del venv del repo.
+
+    En Windows el venv no tiene bin/: `python -m venv` crea Scripts/python.exe.
+    La ruta POSIX directamente no existe ahí, así que hay que elegir por plataforma.
+    """
+    if os.name == "nt":
+        return os.path.join(SKILLS_DIR, ".venv", "Scripts", "python.exe")
+    return os.path.join(SKILLS_DIR, ".venv", "bin", "python")
+
+
+def server_path(*parts: str) -> str:
+    """Ruta a un server.py bajo ~/.claude/mcp-servers, con el separador nativo."""
+    return os.path.join(MCP_SERVERS_DIR, *parts)
+
+
+def read_json(path: str) -> dict:
+    """Lee JSON forzando UTF-8.
+
+    Sin encoding explícito Windows abre con la codepage ANSI (cp1252) y
+    ~/.claude.json revienta con UnicodeDecodeError apenas una ruta de proyecto
+    o un valor traiga acentos o emoji.
+    """
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json_atomic(path: str, data: dict) -> None:
+    """Escribe JSON vía temporal + os.replace.
+
+    ~/.claude.json es la config de TODOS los proyectos. Un json.dump() directo
+    trunca el archivo antes de escribir: si falla a mitad (disco lleno, valor no
+    serializable, Ctrl-C) la config queda destruida. os.replace es atómico tanto
+    en POSIX como en Windows.
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".add-mcp-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        # mkstemp crea 0600; conservar los permisos del archivo original.
+        if os.path.exists(path):
+            os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def load_secrets() -> dict:
@@ -43,8 +94,26 @@ def load_secrets() -> dict:
         print(f"ERROR: No se encontró {SECRETS_FILE}")
         print("Copiar scripts/secrets.example.json → scripts/secrets.json y completar.")
         sys.exit(1)
-    with open(SECRETS_FILE) as f:
-        return json.load(f)
+    return read_json(SECRETS_FILE)
+
+
+def warn_if_no_venv() -> None:
+    """Avisa si el intérprete que se va a registrar no existe.
+
+    No es fatal (se puede registrar antes de crear el venv), pero un MCP que
+    apunta a un binario inexistente falla al arrancar sin decir por qué.
+    """
+    python_bin = venv_python()
+    if os.path.exists(python_bin):
+        return
+    venv_dir = os.path.join(SKILLS_DIR, ".venv")
+    reqs = os.path.join(SKILLS_DIR, "requirements.txt")
+    creator = "py -3 -m venv" if os.name == "nt" else "python3 -m venv"
+    print(f"WARN: no existe el intérprete del venv en {python_bin}")
+    print("      Los MCPs se registran igual, pero no van a arrancar. Crearlo con:")
+    print(f'        {creator} "{venv_dir}"')
+    print(f'        "{python_bin}" -m pip install -r "{reqs}"')
+    print()
 
 
 def build_mcp_servers(servers_config: list) -> dict:
@@ -52,16 +121,24 @@ def build_mcp_servers(servers_config: list) -> dict:
     for entry in servers_config:
         name = entry["name"]
         kind = entry["type"]
-        # Heredar el entorno completo de quien corre este script (SystemRoot, PATH,
-        # etc.) y no solo las claves específicas del entry. En Windows, un `env`
-        # que reemplaza el entorno en vez de extenderlo rompe `import asyncio`
-        # (WinError 10106: Winsock no inicializa sin SystemRoot) antes de que el
-        # server llegue a levantar el protocolo MCP.
-        env = dict(os.environ)
+
+        # NO heredar os.environ acá. El cliente MCP ya hace el merge al spawnear:
+        #     env: {...whitelist_heredada, ...env_declarado}
+        # donde la whitelist es HOME/LOGNAME/PATH/SHELL/TERM/USER en POSIX y
+        # APPDATA/HOMEDRIVE/HOMEPATH/LOCALAPPDATA/PATH/PROCESSOR_ARCHITECTURE/
+        # SYSTEMDRIVE/SYSTEMROOT/TEMP/USERNAME/USERPROFILE/PROGRAMFILES en Windows
+        # (verificado en Claude Code 2.1.223). O sea: SystemRoot y PATH ya llegan
+        # solos —no hay que reenviarlos— y lo que se declare acá GANA sobre lo
+        # heredado. Volcar os.environ haría tres daños: (1) persistiría el entorno
+        # entero, secretos incluidos, en texto plano en ~/.claude.json; (2) pisaría
+        # el GIO_MODULE_DIR del sistema con el del snap de VSCode, reviviendo el
+        # crash de webkit; (3) congelaría un snapshot del entorno del momento del
+        # registro en vez de heredar el vivo. Este dict es solo para overrides.
+        env = {}
 
         if kind == "gcloud":
             args = [
-                f"{MCP_SERVERS_DIR}/gcloud/server.py",
+                server_path("gcloud", "server.py"),
                 f"--project={entry['project']}",
                 f"--region={entry['region']}",
                 f"--workdir={entry['workdir']}",
@@ -76,7 +153,7 @@ def build_mcp_servers(servers_config: list) -> dict:
 
         elif kind == "postgres":
             args = [
-                f"{MCP_SERVERS_DIR}/postgres/server.py",
+                server_path("postgres", "server.py"),
                 f"--host={entry['host']}",
                 f"--port={entry['port']}",
                 f"--db={entry['db']}",
@@ -87,7 +164,7 @@ def build_mcp_servers(servers_config: list) -> dict:
         elif kind == "ssh":
             server_label = name.removeprefix("ssh-") or entry["host"]
             args = [
-                f"{MCP_SERVERS_DIR}/ssh/server.py",
+                server_path("ssh", "server.py"),
                 f"--host={entry['host']}",
                 f"--port={entry.get('port', 22)}",
                 f"--user={entry['user']}",
@@ -109,7 +186,7 @@ def build_mcp_servers(servers_config: list) -> dict:
         elif kind == "redis":
             server_label = name.removeprefix("redis-") or entry["host"]
             args = [
-                f"{MCP_SERVERS_DIR}/redis/server.py",
+                server_path("redis", "server.py"),
                 f"--host={entry['host']}",
                 f"--port={entry.get('port', 6379)}",
                 f"--db={entry.get('db', 0)}",
@@ -124,7 +201,7 @@ def build_mcp_servers(servers_config: list) -> dict:
         elif kind == "gh":
             server_label = name.removeprefix("gh-") or entry["owner"]
             args = [
-                f"{MCP_SERVERS_DIR}/gh/server.py",
+                server_path("gh", "server.py"),
                 f"--owner={entry['owner']}",
                 f"--name={server_label}",
             ]
@@ -140,7 +217,7 @@ def build_mcp_servers(servers_config: list) -> dict:
 
         elif kind == "obsidian":
             args = [
-                f"{MCP_SERVERS_DIR}/obsidian/server.py",
+                server_path("obsidian", "server.py"),
                 f"--vault-path={entry['vault_path']}",
             ]
 
@@ -161,7 +238,7 @@ def build_mcp_servers(servers_config: list) -> dict:
 
         elif kind == "webprobe":
             args = [
-                f"{MCP_SERVERS_DIR}/webprobe/server.py",
+                server_path("webprobe", "server.py"),
                 f"--browser={entry.get('browser', 'chromium')}",
                 f"--name={entry['name']}",
             ]
@@ -202,13 +279,15 @@ def build_mcp_servers(servers_config: list) -> dict:
             # GIO del snap, linkeados contra la glibc de core20. El proceso de red de
             # WebKit los carga y muere con "undefined symbol: __libc_pthread_init".
             # Lo pisamos con los módulos del sistema; sin esto webkit no navega.
-            env.setdefault("GIO_MODULE_DIR", GIO_MODULE_DIR_SYS)
+            # POSIX-only: en Windows esa ruta no existe y GIO no interviene.
+            if os.name != "nt":
+                env.setdefault("GIO_MODULE_DIR", GIO_MODULE_DIR_SYS)
 
         else:
             print(f"WARN: tipo desconocido '{kind}' para '{name}', ignorando.")
             continue
 
-        result[name] = {"type": "stdio", "command": VENV_PYTHON, "args": args, "env": env}
+        result[name] = {"type": "stdio", "command": venv_python(), "args": args, "env": env}
         # timeout por servidor (ms) del lado cliente — debe ser >= que el timeout máx
         # interno del server para que gane su mensaje "[timeout]" en vez del corte seco.
         if entry.get("timeout_ms"):
@@ -255,8 +334,7 @@ def main():
         print("  --only A,B,C      aplica la operación solo a esos MCPs")
         print()
         print("Proyectos disponibles en ~/.claude.json:")
-        with open(CLAUDE_JSON) as f:
-            d = json.load(f)
+        d = read_json(CLAUDE_JSON)
         for p in sorted(d.get("projects", {}).keys()):
             srv = list(d["projects"][p].get("mcpServers", {}).keys())
             tag = f"  [{', '.join(srv)}]" if srv else ""
@@ -265,8 +343,10 @@ def main():
 
     project_path = os.path.abspath(args_clean[0])
 
-    with open(CLAUDE_JSON) as f:
-        d = json.load(f)
+    if not remove_mode:
+        warn_if_no_venv()
+
+    d = read_json(CLAUDE_JSON)
 
     if "projects" not in d:
         d["projects"] = {}
@@ -295,8 +375,7 @@ def main():
             else:
                 not_found.append(name)
         d["projects"][project_path]["mcpServers"] = existing
-        with open(CLAUDE_JSON, "w") as f:
-            json.dump(d, f, indent=2)
+        write_json_atomic(CLAUDE_JSON, d)
         print(f"Proyecto: {project_path}")
         if removed:
             print(f"  Eliminados  : {', '.join(removed)}")
@@ -321,8 +400,7 @@ def main():
 
     d["projects"][project_path]["mcpServers"] = existing
 
-    with open(CLAUDE_JSON, "w") as f:
-        json.dump(d, f, indent=2)
+    write_json_atomic(CLAUDE_JSON, d)
 
     print(f"Proyecto: {project_path}")
     if added:

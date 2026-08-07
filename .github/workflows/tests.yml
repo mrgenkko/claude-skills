@@ -1,0 +1,33 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows está en la matriz a propósito: el registro de MCPs resuelve
+        # rutas y encoding distinto ahí, y sin CI esas diferencias solo se
+        # descubren cuando a alguien no le arrancan los servidores.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Sin dependencias: los tests son stdlib puro y no leen secrets.json.
+      - name: Tests
+        run: python -m unittest discover -s scripts -p "test_*.py" -v
+
+      - name: Compilar todos los scripts
+        run: python -m compileall -q scripts deployed examples
