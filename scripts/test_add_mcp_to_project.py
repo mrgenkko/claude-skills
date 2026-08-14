@@ -15,10 +15,14 @@ filtra secretos a disco y pisa los overrides deliberados.
 import importlib.util
 import json
 import os
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
+import unittest.mock
 from unittest import mock
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "add-mcp-to-project.py")
@@ -227,6 +231,178 @@ class TestIOdeArchivos(unittest.TestCase):
         mod.write_json_atomic(self.ruta, {"a": 2})
         modo = stat.S_IMODE(os.stat(self.ruta).st_mode)
         self.assertEqual(modo, 0o600)
+
+
+class TestCodexTraduccion(unittest.TestCase):
+    """La forma canónica es la de Claude; Codex es una traducción de esa."""
+
+    def setUp(self):
+        self.servers = mod.build_mcp_servers(SECRETS_COMPLETO)
+
+    def test_stdio_conserva_command_args_env(self):
+        codex = mod.to_codex_server(self.servers["gh-demo"])
+        self.assertEqual(codex["command"], self.servers["gh-demo"]["command"])
+        self.assertEqual(codex["args"], self.servers["gh-demo"]["args"])
+        self.assertEqual(codex["env"]["GH_TOKEN"], "ghp_desde_secrets")
+        self.assertEqual(codex["startup_timeout_sec"], mod.CODEX_STARTUP_TIMEOUT_SEC)
+
+    def test_http_renombra_headers(self):
+        """Codex llama http_headers a lo que Claude llama headers."""
+        codex = mod.to_codex_server(self.servers["focusyn"])
+        self.assertEqual(codex["url"], "https://x/mcp")
+        self.assertEqual(codex["http_headers"], {"X-Agent-Key": "k"})
+        self.assertNotIn("headers", codex)
+        self.assertNotIn("command", codex)
+
+    def test_timeout_ms_pasa_a_segundos(self):
+        codex = mod.to_codex_server({"type": "stdio", "command": "c", "args": [],
+                                     "env": {}, "timeout": 320_000})
+        self.assertEqual(codex["tool_timeout_sec"], 320)
+
+    def test_timeout_sub_segundo_no_queda_en_cero(self):
+        """Truncar 200ms a 0s dejaría un timeout que vence antes de empezar."""
+        codex = mod.to_codex_server({"type": "stdio", "command": "c", "args": [],
+                                     "env": {}, "timeout": 200})
+        self.assertEqual(codex["tool_timeout_sec"], 1)
+
+
+class TestCodexRender(unittest.TestCase):
+    def test_round_trip_por_tomllib(self):
+        servers = {n: mod.to_codex_server(c)
+                   for n, c in mod.build_mcp_servers(SECRETS_COMPLETO).items()}
+        datos = tomllib.loads(mod.render_codex_block(servers))
+        self.assertEqual(set(datos["mcp_servers"]), set(servers))
+        for nombre, esperado in servers.items():
+            with self.subTest(mcp=nombre):
+                self.assertEqual(datos["mcp_servers"][nombre], esperado)
+
+    def test_escapa_comillas_y_backslashes(self):
+        """Una contraseña con comillas rompería el TOML y Codex no arrancaría."""
+        raro = {"x": {"command": "c", "args": ['--password=a"b\\c\td'],
+                      "env": {"K": 'v"1'}}}
+        datos = tomllib.loads(mod.render_codex_block(raro))
+        self.assertEqual(datos["mcp_servers"]["x"]["args"], ['--password=a"b\\c\td'])
+        self.assertEqual(datos["mcp_servers"]["x"]["env"], {"K": 'v"1'})
+
+    def test_nombre_con_punto_no_anida_tablas(self):
+        """Sin comillas, [mcp_servers.a.b] crearía una tabla anidada, no un server."""
+        datos = tomllib.loads(mod.render_codex_block({"a.b": {"command": "c", "args": []}}))
+        self.assertEqual(list(datos["mcp_servers"]), ["a.b"])
+
+
+class TestCodexEscritura(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.proj = os.path.join(self.dir, "proj")
+        os.makedirs(self.proj)
+        self.codex_home = os.path.join(self.dir, "codex-home")
+        os.makedirs(self.codex_home)
+        self.config_global = os.path.join(self.codex_home, "config.toml")
+        self.destino = os.path.join(self.proj, ".codex", "config.toml")
+        self.servers = mod.build_mcp_servers(SECRETS_COMPLETO)
+        self.parche = mock.patch.multiple(mod, CODEX_HOME=self.codex_home,
+                                          CODEX_CONFIG=self.config_global)
+        self.parche.start()
+
+    def tearDown(self):
+        self.parche.stop()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def aplicar(self, **kwargs):
+        opciones = dict(project_path=self.proj, servers=self.servers, update_mode=False,
+                        remove_mode=False, only_filter=None, global_scope=False)
+        opciones.update(kwargs)
+        with mock.patch("sys.stdout"):
+            mod.apply_codex(**opciones)
+
+    def leer(self):
+        with open(self.destino, encoding="utf-8") as f:
+            return f.read()
+
+    def leer_global(self):
+        with open(self.config_global, encoding="utf-8") as f:
+            return f.read()
+
+    def test_marca_el_proyecto_trusted(self):
+        """Sin trust, Codex ignora el config del proyecto sin decir nada."""
+        self.aplicar()
+        datos = tomllib.loads(self.leer_global())
+        self.assertEqual(datos["projects"][self.proj]["trust_level"], "trusted")
+
+    def test_untrusted_previo_pasa_a_trusted(self):
+        with open(self.config_global, "w", encoding="utf-8") as f:
+            f.write(f'model = "x"\n\n[projects."{self.proj}"]\ntrust_level = "untrusted"\n')
+        self.aplicar()
+        datos = tomllib.loads(self.leer_global())
+        self.assertEqual(datos["projects"][self.proj]["trust_level"], "trusted")
+        self.assertEqual(datos["model"], "x")
+
+    def test_archivo_no_es_legible_por_otros(self):
+        """Lleva contraseñas en claro: 0600 y nada más."""
+        self.aplicar()
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(os.stat(self.destino).st_mode), 0o600)
+
+    def test_preserva_config_del_usuario(self):
+        os.makedirs(os.path.dirname(self.destino))
+        with open(self.destino, "w", encoding="utf-8") as f:
+            f.write('model = "gpt-5.6-sol"\n# comentario propio\n')
+        self.aplicar()
+        texto = self.leer()
+        self.assertIn("# comentario propio", texto)
+        datos = tomllib.loads(texto)
+        self.assertEqual(datos["model"], "gpt-5.6-sol")
+        self.assertEqual(set(datos["mcp_servers"]), set(self.servers))
+
+    def test_reaplicar_no_duplica(self):
+        self.aplicar()
+        self.aplicar()
+        datos = tomllib.loads(self.leer())
+        self.assertEqual(set(datos["mcp_servers"]), set(self.servers))
+        self.assertEqual(self.leer().count(mod.CODEX_MARK_BEGIN), 1)
+
+    def test_remove_total_deja_el_resto_del_archivo(self):
+        os.makedirs(os.path.dirname(self.destino))
+        with open(self.destino, "w", encoding="utf-8") as f:
+            f.write('model = "gpt-5.6-sol"\n')
+        self.aplicar()
+        self.aplicar(remove_mode=True)
+        datos = tomllib.loads(self.leer())
+        self.assertEqual(datos, {"model": "gpt-5.6-sol"})
+
+    def test_aborta_si_hay_mcp_declarado_a_mano(self):
+        """Regenerar sobre una tabla ajena duplicaría [mcp_servers.X]: TOML inválido."""
+        os.makedirs(os.path.dirname(self.destino))
+        with open(self.destino, "w", encoding="utf-8") as f:
+            f.write('[mcp_servers.a-mano]\ncommand = "x"\n')
+        with self.assertRaises(SystemExit):
+            self.aplicar()
+
+    def test_agrega_codex_al_gitignore(self):
+        if not shutil.which("git"):
+            self.skipTest("git no disponible")
+        subprocess.run(["git", "-C", self.proj, "init", "-q"], check=True)
+        self.aplicar()
+        with open(os.path.join(self.proj, ".gitignore"), encoding="utf-8") as f:
+            self.assertIn(".codex/", f.read())
+
+    def test_aborta_si_el_config_ya_esta_trackeado(self):
+        """Trackearlo publica contraseñas al primer push."""
+        if not shutil.which("git"):
+            self.skipTest("git no disponible")
+        subprocess.run(["git", "-C", self.proj, "init", "-q"], check=True)
+        os.makedirs(os.path.dirname(self.destino))
+        with open(self.destino, "w", encoding="utf-8") as f:
+            f.write("")
+        subprocess.run(["git", "-C", self.proj, "add", "-f", ".codex/config.toml"], check=True)
+        with self.assertRaises(SystemExit):
+            self.aplicar()
+
+    def test_global_no_toca_el_proyecto(self):
+        self.aplicar(global_scope=True, servers={"focusyn": self.servers["focusyn"]})
+        self.assertFalse(os.path.exists(self.destino))
+        datos = tomllib.loads(self.leer_global())
+        self.assertEqual(list(datos["mcp_servers"]), ["focusyn"])
 
 
 if __name__ == "__main__":

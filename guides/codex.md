@@ -1,0 +1,136 @@
+# Guía: MCP en Codex CLI (por proyecto)
+
+Codex CLI usa **otro archivo y otro formato** que la extensión VSCode de Claude Code: TOML en vez de JSON, y sus propios nombres de campo. Esta guía documenta cómo replicar en Codex el mismo mapeo proyecto → MCPs que ya existe en `~/.claude.json`, con la misma fuente de verdad (`scripts/secrets.json`).
+
+Verificado contra **codex-cli 0.148.0-alpha.9**.
+
+---
+
+## Dónde va la configuración
+
+| Alcance | Ruta | Cuándo usarla |
+|---------|------|----------------|
+| **Global (usuario)** | `~/.codex/config.toml` → `[mcp_servers.X]` | Lo que querés en todos los proyectos: `focusyn`. |
+| **Por proyecto** | `<repo>/.codex/config.toml` → `[mcp_servers.X]` | Todo lo demás: las credenciales y el scope son por proyecto. |
+
+Los dos se **mergean**: el config del proyecto suma servidores al global, no lo reemplaza.
+
+El binario no siempre está en el `PATH`: si Codex vino con la extensión ChatGPT de VSCode, vive en
+`~/.vscode/extensions/openai.chatgpt-*/bin/linux-x86_64/codex`.
+
+---
+
+## Las dos trampas
+
+### 1. El gate de trust (silencioso)
+
+Codex lee `<repo>/.codex/config.toml` **solo si el proyecto está marcado como confiable** en el config global:
+
+```toml
+[projects."/home/melquiades/lait-landing-02"]
+trust_level = "trusted"
+```
+
+Si no lo está, ignora el archivo entero **sin ningún warning**: los MCPs simplemente no existen y no hay nada en la salida que lo explique. `add-mcp-to-project.py --target codex` marca el trust automáticamente.
+
+### 2. El archivo vive dentro del repo
+
+Nuestros MCPs llevan credenciales en `args` (`--password=`) y en `env` (`GH_TOKEN`). En Claude eso queda en `~/.claude.json`, fuera de todo repo; en Codex cae en `<repo>/.codex/config.toml`, a un `git add .` de publicarse.
+
+Por eso el script, en cada corrida:
+
+- agrega `.codex/` al `.gitignore` del repo,
+- **aborta** si `.codex/config.toml` ya está trackeado en git (y te dice cómo sacarlo del índice),
+- escribe el archivo con permisos `0600`.
+
+Si un config llegó a viajar a un remoto, rotá las credenciales: sacarlo del índice no lo borra del historial.
+
+---
+
+## Uso
+
+```bash
+PYTHON="$HOME/Mrgenkko Skills/.venv/bin/python"
+SCRIPT="$HOME/Mrgenkko Skills/scripts/add-mcp-to-project.py"
+
+# Solo Codex
+"$PYTHON" "$SCRIPT" /ruta/al/proyecto --target codex --only gh-lait,webprobe
+
+# Claude y Codex a la vez (recomendado: no derivan)
+"$PYTHON" "$SCRIPT" /ruta/al/proyecto --target both --only gh-lait,webprobe
+
+# Actualizar tras cambiar secrets.json
+"$PYTHON" "$SCRIPT" /ruta/al/proyecto --target both --update
+
+# Quitar uno
+"$PYTHON" "$SCRIPT" /ruta/al/proyecto --target codex --remove --only webprobe
+
+# focusyn: global, una sola vez (su agent_key no debe caer en ningún repo)
+"$PYTHON" "$SCRIPT" --global --target codex --only focusyn
+```
+
+O vía la skill: `/mcp-project add lait-landing-02 gh-lait,webprobe --both`.
+
+---
+
+## Formato generado
+
+El script escribe un bloque delimitado y **respeta el resto del archivo** (tu `model`, tus `hooks`, tus comentarios):
+
+```toml
+model = "gpt-5.6-sol"          # tuyo, se conserva
+
+# >>> mrgenkko-skills: mcp_servers (generado) >>>
+[mcp_servers."gh-lait"]
+command = "/home/melquiades/Mrgenkko Skills/.venv/bin/python"
+args = [
+    "/home/melquiades/.claude/mcp-servers/gh/server.py",
+    "--owner=juandelgadolait",
+    "--name=lait",
+]
+env = { "GH_TOKEN" = "ghp_..." }
+startup_timeout_sec = 30
+# <<< mrgenkko-skills: mcp_servers <<<
+```
+
+El bloque va **al final** a propósito: en TOML una clave suelta después de una tabla pertenece a esa tabla, así que insertarlo en el medio reasignaría en silencio lo que viniera después. Antes de escribir, el script re-parsea el resultado y aborta si no queda válido.
+
+Si declaraste MCPs a mano fuera del bloque, el script aborta en vez de duplicar la tabla.
+
+### Equivalencias de campos
+
+| Claude (`~/.claude.json`) | Codex (`config.toml`) |
+|---|---|
+| `command`, `args`, `env` | igual |
+| `type: "http"` + `url` | `url` |
+| `headers` | `http_headers` |
+| `timeout` (ms, por tool call) | `tool_timeout_sec` (segundos) |
+| — | `startup_timeout_sec` (30; el default de Codex es corto y da timeouts espurios al arrancar un server Python del venv) |
+
+---
+
+## Verificación
+
+```bash
+cd /ruta/al/proyecto && codex mcp list
+```
+
+Lista el global + los del proyecto ya mergeados. Si falta uno, revisá el trust (trampa 1).
+
+Para comprobar que además **arrancan**, no alcanza `mcp list` (solo lee config): hay que hacerles el handshake MCP o abrir Codex y llamar una tool.
+
+---
+
+## Aprobación de tool calls
+
+En `codex exec` (no interactivo, `approval: never`) las llamadas a tools MCP se **auto-cancelan**: aparece `mcp: <server>/<tool> (failed)` con `user cancelled MCP tool call`. El server arrancó bien — es la política de aprobación, no un problema de registro. En el TUI interactivo aparece el prompt y se aprueba a mano.
+
+Los candidatos de config son `mcp_servers.<name>.approval_mode` y `default_tools_approval_mode`, pero **`approval_mode = "never"` no evita la cancelación** en `exec` (probado), y ni `codex mcp list` ni `codex doctor` validan esos valores, así que el enum aceptado quedó sin confirmar.
+
+---
+
+## Diferencias que importan frente a Claude Code
+
+- **No hay `codex mcp add` por proyecto**: ese subcomando escribe únicamente el config global. El TOML por proyecto se genera con el script.
+- **El trust es un prerrequisito**, no un detalle de UX: sin él no hay MCPs.
+- **Los secretos entran al árbol del repo**. Es la diferencia estructural con Claude, y la razón de los guards.
