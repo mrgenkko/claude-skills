@@ -323,6 +323,26 @@ def build_mcp_servers(servers_config: list) -> dict:
             if os.name != "nt":
                 env.setdefault("GIO_MODULE_DIR", GIO_MODULE_DIR_SYS)
 
+        elif kind == "pixelorama":
+            args = [
+                server_path("pixelorama", "server.py"),
+                f"--name={entry['name']}",
+            ]
+            # Sin workdir la instancia es genérica: el cliente MCP spawnea el server con
+            # cwd = el directorio del proyecto, y ahí se resuelven las rutas relativas.
+            # Fijarlo solo tiene sentido para una instancia atada a un repo concreto.
+            if entry.get("workdir"):
+                args.append(f"--workdir={entry['workdir']}")
+            # Vacío = autodetectar (PATH, ~/.local/opt/pixelorama, /usr/bin).
+            if entry.get("pixelorama_bin"):
+                args.append(f"--pixelorama-bin={entry['pixelorama_bin']}")
+            # Topes de memoria: un lienzo ocupa w*h*4 bytes POR capa y POR frame.
+            for k, flag in (("max_pixels", "--max-pixels"),
+                            ("max_layers", "--max-layers"),
+                            ("max_frames", "--max-frames")):
+                if entry.get(k) is not None:
+                    args.append(f"{flag}={entry[k]}")
+
         else:
             print(f"WARN: tipo desconocido '{kind}' para '{name}', ignorando.")
             continue
@@ -486,7 +506,7 @@ def git_toplevel(path: str):
     return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else None
 
 
-def proteger_del_repo(project_path: str) -> None:
+def proteger_del_repo(project_path: str, dry_run: bool = False) -> None:
     """.codex/ al .gitignore, y abortar si el config ya quedó trackeado."""
     toplevel = git_toplevel(project_path)
     if not toplevel:
@@ -512,6 +532,9 @@ def proteger_del_repo(project_path: str) -> None:
         if any(l.strip() in (patron, CODEX_PROJECT_DIR, f"/{patron}", f"/{CODEX_PROJECT_DIR}")
                for l in actual.splitlines()):
             return
+    if dry_run:
+        print(f"  .gitignore  : agregaría '{patron}' en {toplevel}")
+        return
     sufijo = "" if (not actual or actual.endswith("\n")) else "\n"
     write_text_atomic(
         gitignore,
@@ -520,7 +543,7 @@ def proteger_del_repo(project_path: str) -> None:
     print(f"  .gitignore  : agregado '{patron}' en {toplevel}")
 
 
-def asegurar_trust(project_path: str) -> None:
+def asegurar_trust(project_path: str, dry_run: bool = False) -> None:
     """Marca el proyecto como trusted en ~/.codex/config.toml.
 
     Sin esto Codex ignora <proyecto>/.codex/config.toml sin decir nada.
@@ -558,21 +581,28 @@ def asegurar_trust(project_path: str) -> None:
         sufijo = "" if (not texto or texto.endswith("\n")) else "\n"
         nuevo = texto + sufijo + f'\n{header}\ntrust_level = "trusted"\n'
 
+    if dry_run:
+        print(f"  trust       : marcaría {project_path} trusted en {CODEX_CONFIG}")
+        return
     os.makedirs(CODEX_HOME, exist_ok=True)
     write_text_atomic(CODEX_CONFIG, nuevo)
     print(f"  trust       : {project_path} marcado trusted en {CODEX_CONFIG}")
 
 
-def apply_codex(project_path, servers, update_mode, remove_mode, only_filter, global_scope):
+def apply_codex(project_path, servers, update_mode, remove_mode, only_filter,
+                global_scope, dry_run=False):
     """Escribe los MCPs en el config TOML de Codex (global o del proyecto)."""
+    pfx = "[dry-run] " if dry_run else ""
     if global_scope:
         destino = CODEX_CONFIG
-        os.makedirs(CODEX_HOME, exist_ok=True)
+        if not dry_run:
+            os.makedirs(CODEX_HOME, exist_ok=True)
     else:
         destino = os.path.join(project_path, CODEX_PROJECT_DIR, "config.toml")
-        proteger_del_repo(project_path)
-        asegurar_trust(project_path)
-        os.makedirs(os.path.dirname(destino), exist_ok=True)
+        proteger_del_repo(project_path, dry_run)
+        asegurar_trust(project_path, dry_run)
+        if not dry_run:
+            os.makedirs(os.path.dirname(destino), exist_ok=True)
 
     texto = ""
     if os.path.exists(destino):
@@ -633,19 +663,24 @@ def apply_codex(project_path, servers, update_mode, remove_mode, only_filter, gl
             print("       No se escribió nada.")
             sys.exit(1)
 
-    write_text_atomic(destino, final, keep_mode=False)
+    if not dry_run:
+        write_text_atomic(destino, final, keep_mode=False)
 
-    print(f"Codex ({'global' if global_scope else 'proyecto'}): {destino}")
+    print(f"{pfx}Codex ({'global' if global_scope else 'proyecto'}): {destino}")
     for etiqueta, valores in (("Agregados   ", added), ("Actualizados", updated),
                               ("Ya existían ", skipped), ("Eliminados  ", removed),
                               ("No existían ", not_found)):
         if valores:
             print(f"  {etiqueta}: {', '.join(valores)}")
     print()
-    print("Reinicia Codex para que carguen los MCPs (`codex mcp list` para verificar).")
+    if dry_run:
+        print("dry-run: no se escribió nada.")
+    else:
+        print("Reinicia Codex para que carguen los MCPs (`codex mcp list` para verificar).")
 
 
-def apply_claude(project_path, servers, update_mode, remove_mode, only_filter, global_scope):
+def apply_claude(project_path, servers, update_mode, remove_mode, only_filter,
+                 global_scope, dry_run=False):
     """Escribe los MCPs en ~/.claude.json (scope de proyecto o global)."""
     d = read_json(CLAUDE_JSON)
 
@@ -691,40 +726,84 @@ def apply_claude(project_path, servers, update_mode, remove_mode, only_filter, g
                 existing[name] = config
                 added.append(name)
 
-    write_json_atomic(CLAUDE_JSON, d)
+    if not dry_run:
+        write_json_atomic(CLAUDE_JSON, d)
 
-    print(f"Claude Code: {destino}")
+    print(f"{'[dry-run] ' if dry_run else ''}Claude Code: {destino}")
     for etiqueta, valores in (("Agregados   ", added), ("Actualizados", updated),
                               ("Ya existían ", skipped), ("Eliminados  ", removed),
                               ("No existían ", not_found)):
         if valores:
             print(f"  {etiqueta}: {', '.join(valores)}")
     print()
-    print("Reinicia Claude Code (VSCode) para que carguen los MCPs.")
+    if dry_run:
+        print("dry-run: no se escribió nada.")
+    else:
+        print("Reinicia Claude Code (VSCode) para que carguen los MCPs.")
+
+
+def print_usage():
+    print("Uso: python3 add-mcp-to-project.py /ruta/absoluta/al/proyecto [opciones]")
+    print("     python3 add-mcp-to-project.py --global --only NOMBRE [opciones]")
+    print()
+    print("  --update           sobreescribe entradas existentes con los valores de secrets.json")
+    print("  --remove           elimina los MCPs del proyecto (usar con --only para especificar cuáles)")
+    print("  --only A,B,C       aplica la operación solo a esos MCPs")
+    print("  --target T         claude (default) | codex | both")
+    print("  --global           scope global en vez de por proyecto")
+    print("  --dry-run          muestra lo que haría sin escribir nada")
+    print("  --yes, -y          no pedir confirmación en --remove")
+    print("  --help, -h         muestra esta ayuda")
+    print()
+    print("Proyectos disponibles en ~/.claude.json:")
+    d = read_json(CLAUDE_JSON)
+    for p in sorted(d.get("projects", {}).keys()):
+        srv = list(d["projects"][p].get("mcpServers", {}).keys())
+        tag = f"  [{', '.join(srv)}]" if srv else ""
+        print(f"  {p}{tag}")
 
 
 def main():
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print_usage()
+        sys.exit(0)
+
     update_mode = "--update" in sys.argv
     remove_mode = "--remove" in sys.argv
     global_scope = "--global" in sys.argv
+    dry_run = "--dry-run" in sys.argv
+    assume_yes = "--yes" in sys.argv or "-y" in sys.argv
     target = "claude"
     only_filter = None
     args_clean = []
     i = 1
     while i < len(sys.argv):
         a = sys.argv[i]
-        if a in ("--update", "--remove", "--global"):
+        if a in ("--update", "--remove", "--global", "--dry-run", "--yes", "-y"):
             pass
         elif a == "--only":
             i += 1
+            if i >= len(sys.argv):
+                print("ERROR: --only necesita una lista de MCPs (ej: --only pixelorama).")
+                sys.exit(1)
             only_filter = {n.strip() for n in sys.argv[i].split(",") if n.strip()}
         elif a.startswith("--only="):
             only_filter = {n.strip() for n in a.split("=", 1)[1].split(",") if n.strip()}
         elif a == "--target":
             i += 1
+            if i >= len(sys.argv):
+                print("ERROR: --target necesita un valor: claude | codex | both.")
+                sys.exit(1)
             target = sys.argv[i].strip().lower()
         elif a.startswith("--target="):
             target = a.split("=", 1)[1].strip().lower()
+        elif a.startswith("-"):
+            # Sin esto, un flag mal escrito (--codex, --help) caía en args_clean y se
+            # trataba como ruta de proyecto: registraba los MCPs en un proyecto fantasma.
+            print(f"ERROR: opción desconocida '{a}'.")
+            print()
+            print_usage()
+            sys.exit(1)
         else:
             args_clean.append(a)
         i += 1
@@ -745,21 +824,7 @@ def main():
         MCP_SERVERS = {k: v for k, v in MCP_SERVERS.items() if k in only_filter}
 
     if not args_clean and not global_scope:
-        print("Uso: python3 add-mcp-to-project.py /ruta/absoluta/al/proyecto [opciones]")
-        print("     python3 add-mcp-to-project.py --global --only NOMBRE [opciones]")
-        print()
-        print("  --update           sobreescribe entradas existentes con los valores de secrets.json")
-        print("  --remove           elimina los MCPs del proyecto (usar con --only para especificar cuáles)")
-        print("  --only A,B,C       aplica la operación solo a esos MCPs")
-        print("  --target T         claude (default) | codex | both")
-        print("  --global           scope global en vez de por proyecto")
-        print()
-        print("Proyectos disponibles en ~/.claude.json:")
-        d = read_json(CLAUDE_JSON)
-        for p in sorted(d.get("projects", {}).keys()):
-            srv = list(d["projects"][p].get("mcpServers", {}).keys())
-            tag = f"  [{', '.join(srv)}]" if srv else ""
-            print(f"  {p}{tag}")
+        print_usage()
         sys.exit(0)
 
     if global_scope:
@@ -768,19 +833,58 @@ def main():
             sys.exit(1)
         project_path = None
     else:
+        if len(args_clean) > 1:
+            # Casi siempre es una ruta con espacios sin comillar ("Mrgenkko Skills").
+            print(f"ERROR: se esperaba UNA ruta de proyecto, llegaron {len(args_clean)}:")
+            for a in args_clean:
+                print(f"  {a}")
+            print("Si la ruta tiene espacios, encerrala entre comillas.")
+            sys.exit(1)
         project_path = os.path.abspath(args_clean[0])
+        # En --remove no se exige que exista: limpiar la entrada de un proyecto ya
+        # borrado del disco es legítimo. Al registrar sí, o queda un proyecto fantasma.
+        if not remove_mode and not os.path.isdir(project_path):
+            print(f"ERROR: el proyecto no existe en disco: {project_path}")
+            print("Registrar MCPs ahí sólo crearía una entrada fantasma en ~/.claude.json.")
+            print("Creá el directorio primero, o revisá la ruta.")
+            sys.exit(1)
 
     if not remove_mode:
         warn_if_no_venv()
 
-    if target in ("claude", "both"):
-        apply_claude(project_path, MCP_SERVERS, update_mode, remove_mode,
-                     only_filter, global_scope)
-    if target == "both":
+    def dispatch(dry):
+        if target in ("claude", "both"):
+            apply_claude(project_path, MCP_SERVERS, update_mode, remove_mode,
+                         only_filter, global_scope, dry)
+        if target == "both":
+            print()
+        if target in ("codex", "both"):
+            apply_codex(project_path, MCP_SERVERS, update_mode, remove_mode,
+                        only_filter, global_scope, dry)
+
+    # --remove es destructivo y sin --only barre TODOS los MCPs del scope: se
+    # confirma sobre una vista previa real, no sobre lo que el usuario creyó pedir.
+    if remove_mode and not assume_yes and not dry_run:
+        print("Vista previa — esto es lo que se eliminaría:")
         print()
-    if target in ("codex", "both"):
-        apply_codex(project_path, MCP_SERVERS, update_mode, remove_mode,
-                    only_filter, global_scope)
+        dispatch(True)
+        print()
+        alcance = ", ".join(sorted(only_filter)) if only_filter else "TODOS los MCPs del scope"
+        print(f"A eliminar: {alcance}")
+        if not sys.stdin.isatty():
+            print("ERROR: --remove pide confirmación y stdin no es interactivo.")
+            print("       Agregá --yes si estás seguro (o --dry-run para ver sin tocar).")
+            sys.exit(1)
+        try:
+            resp = input("Escribí 'si' para confirmar: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            resp = ""
+        if resp not in ("si", "sí"):
+            print("Cancelado. No se escribió nada.")
+            sys.exit(1)
+        print()
+
+    dispatch(dry_run)
 
 
 if __name__ == "__main__":
