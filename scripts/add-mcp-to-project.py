@@ -343,6 +343,36 @@ def build_mcp_servers(servers_config: list) -> dict:
                 if entry.get(k) is not None:
                     args.append(f"{flag}={entry[k]}")
 
+        elif kind == "modal":
+            args = [
+                server_path("modal", "server.py"),
+                f"--workspace={entry['workspace']}",
+                f"--name={name}",
+            ]
+            if entry.get("environment"):
+                args.append(f"--environment={entry['environment']}")
+            if entry.get("modal_bin"):
+                args.append(f"--modal-bin={entry['modal_bin']}")
+            # Perfil aislado: ningún subcomando toca el ~/.modal.toml global, así que
+            # el workspace activo no puede derivar entre instancias.
+            if entry.get("config_path"):
+                args.append(f"--config-path={entry['config_path']}")
+            # Dos gates independientes: escribir (deploy/stop/rm) y prender cómputo
+            # facturado por segundo (run, endpoint create). Ambos apagados por defecto.
+            if entry.get("allow_write"):
+                args.append("--allow-write")
+            if entry.get("allow_gpu"):
+                args.append("--allow-gpu")
+            # El token va por ENV, no por args: la línea de comandos de un proceso la
+            # lee cualquier usuario de la máquina con `ps aux`, mientras que
+            # /proc/<pid>/environ es 0400 del dueño. La CLI de modal resuelve
+            # `env MODAL_*` ANTES que el perfil en disco, así que con esto queda
+            # stateless — es el mismo efecto que GH_TOKEN en gh.
+            if entry.get("token_id"):
+                env["MODAL_TOKEN_ID"] = entry["token_id"]
+            if entry.get("token_secret"):
+                env["MODAL_TOKEN_SECRET"] = entry["token_secret"]
+
         else:
             print(f"WARN: tipo desconocido '{kind}' para '{name}', ignorando.")
             continue
