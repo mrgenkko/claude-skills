@@ -134,3 +134,19 @@ Los candidatos de config son `mcp_servers.<name>.approval_mode` y `default_tools
 - **No hay `codex mcp add` por proyecto**: ese subcomando escribe únicamente el config global. El TOML por proyecto se genera con el script.
 - **El trust es un prerrequisito**, no un detalle de UX: sin él no hay MCPs.
 - **Los secretos entran al árbol del repo**. Es la diferencia estructural con Claude, y la razón de los guards.
+
+---
+
+## Generar imágenes desde Claude (`/codex-imagegen`)
+
+Claude Code no genera imágenes; el `image_gen` integrado de Codex sí, con la sesión de ChatGPT (sin `OPENAI_API_KEY`). La skill `/codex-imagegen` lo envuelve en `scripts/codex-imagegen.py`: Claude escribe el prompt, Codex llama a `image_gen` con ese texto tal cual, y la imagen sale con su `.prompt.txt` al lado. Verificado contra **codex-cli 0.160.0** (2026-10-03): generación, edición con imagen de referencia y modo `--rewrite`, ~45 s por imagen con `gpt-6-astra` en `high`.
+
+Lo que costó descubrir:
+
+- **El agente reescribe el prompt si lo dejás.** «Un círculo rojo plano sobre fondo negro» le llegó a `image_gen` con hex, proporciones y exclusiones agregadas. Para que llegue crudo hay que pedirlo explícito (el script lo delimita entre `<<<PROMPT` y `PROMPT>>>`); `--rewrite` habilita la reescritura.
+- **El prompt real sólo está en el registro de sesión.** `~/.codex/sessions/AAAA/MM/DD/rollout-*-<thread_id>.jsonl` trae un item `kind: "image_gen.generation"` con `revisedPrompt` y `savedPath`. El stream `--json` no lo emite. Con `--ephemeral` no hay registro → no hay prompt; por eso el script no lo usa, y borra el registro después de leerlo (repite la imagen en base64, ~1–1,6 MB).
+- **Las sesiones de `exec` no entran en `session_index.jsonl`**, el índice del historial.
+- **`-i <FILE>...` es variádico.** `codex exec -i ref.png "prompt"` se come el prompt como otra imagen y corta con `No prompt provided via stdin`. El prompt va por stdin.
+- **`image_gen` recibe tres cosas:** `prompt`, cuántas de las imágenes adjuntas incluir (`num_last_images_to_include`) y `transparent_background`. Calidad, tamaño y máscaras son del modo API, no del integrado.
+- **`--ignore-user-config`** evita arrancar los MCPs globales (focusyn) y la memoria en cada imagen; la auth se sigue leyendo de `CODEX_HOME`. Tampoco lee el `model` del config: el script fija `gpt-6-astra` en `high`.
+- Correr en un directorio temporal vacío, para que no cargue el `AGENTS.md` del proyecto.

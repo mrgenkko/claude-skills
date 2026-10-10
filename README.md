@@ -15,8 +15,10 @@ Mrgenkko Skills/
 ├── README.md
 ├── requirements.txt             ← dependencias Python de los MCPs
 ├── .gitignore
+├── .claude/skills/              ← skills de Claude Code (se enlazan a cada proyecto, ver «Skills»)
 ├── scripts/
 │   ├── add-mcp-to-project.py   ← registra MCPs en un proyecto nuevo
+│   ├── codex-imagegen.py       ← genera/edita imágenes con el image_gen de Codex (skill /codex-imagegen)
 │   ├── install-lottie-mcp.sh   ← instala @lottiefiles/creator-mcp en ~/.claude/mcp-servers/lottie
 │   ├── run-lottie-mcp.sh       ← arranque Lottie para Claude Code (stdio)
 │   ├── secrets.json            ← credenciales y configuración (gitignoreado)
@@ -133,6 +135,26 @@ heredado. Por eso el `env` se deja mínimo: solo overrides deliberados
 persistiría el entorno entero —secretos incluidos— en texto plano en
 `~/.claude.json`, pisaría esos overrides y congelaría un snapshot del entorno del
 momento del registro. Hay un test que lo impide.
+
+---
+
+## Skills
+
+Viven en `.claude/skills/` de este repo y se usan **desde cualquier proyecto con un enlace simbólico**, sin copiarlas: hay un solo repo que mantener y el cambio llega a todos los proyectos enlazados al instante.
+
+```bash
+mkdir -p /ruta/al/proyecto/.claude/skills
+ln -s "$HOME/Mrgenkko Skills/.claude/skills/codex-imagegen" /ruta/al/proyecto/.claude/skills/codex-imagegen
+```
+
+Claude Code descubre la skill a través del enlace (verificado). El enlace apunta a una ruta absoluta de esta máquina: si el `.claude/` del proyecto no está en su `.gitignore`, no lo commitees.
+
+| Skill | Qué hace |
+|---|---|
+| `/codex-imagegen` | Genera o edita imágenes con el `image_gen` integrado de Codex CLI, con la sesión de ChatGPT del usuario. Claude escribe el prompt, llega crudo a `image_gen` y la imagen sale con su `.prompt.txt`. Script: `scripts/codex-imagegen.py` |
+| `/mcp-project` | Agrega, actualiza o elimina MCPs por proyecto en Claude Code y Codex |
+| `/nuevo-proyecto-obsidian` | Scaffold de un proyecto en el vault |
+| `/link-memoria-obsidian` | Vincula la claude-memory de un proyecto con el vault |
 
 ---
 
