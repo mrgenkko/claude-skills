@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import os
 import psycopg2
 import psycopg2.extras
 from mcp.server import Server
@@ -14,8 +15,16 @@ parser.add_argument("--host", required=True)
 parser.add_argument("--port", type=int, default=5432)
 parser.add_argument("--db", required=True)
 parser.add_argument("--user", required=True)
-parser.add_argument("--password", required=True)
+# La contraseña llega por env (MCP_PASSWORD, la pone scripts/mcp-launch.py desde el
+# llavero del SO) o por flag (legacy: queda visible en `ps aux`). Gana el flag.
+parser.add_argument("--password", default=None)
 args, _ = parser.parse_known_args()
+# pop: que no la herede nada que este proceso lance.
+_env_password = os.environ.pop("MCP_PASSWORD", None)
+if args.password is None:  # "" (--password=) es un valor válido
+    args.password = _env_password
+if args.password is None:
+    parser.error("falta la contraseña: MCP_PASSWORD en el entorno (scripts/mcp-launch.py) o --password")
 
 
 def get_conn():

@@ -44,6 +44,15 @@ parser.add_argument("--forbid-sessions", dest="forbid_sessions", action="store_t
 parser.add_argument("--session-idle-timeout", dest="session_idle_timeout", type=int, default=1800,
                     help="Segundos de inactividad tras los que el watcher apaga una sesión idle (0=off).")
 args, _ = parser.parse_known_args()
+# Las claves llegan por env (MCP_PASSWORD / MCP_SUDO_PASSWORD, las pone
+# scripts/mcp-launch.py desde el llavero del SO) o por flag (legacy: quedan visibles
+# en `ps aux`). Gana el flag. pop: que no las herede nada que este proceso lance.
+_env_password = os.environ.pop("MCP_PASSWORD", None)
+_env_sudo_password = os.environ.pop("MCP_SUDO_PASSWORD", None)
+if args.password is None:  # "" (--password=) es un valor válido
+    args.password = _env_password
+if args.sudo_password is None:  # "" (--sudo-password=) es un valor válido
+    args.sudo_password = _env_sudo_password
 
 SERVER_LABEL = args.name or args.host
 

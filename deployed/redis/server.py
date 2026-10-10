@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import os
 import shlex
 import redis
 from mcp.server import Server
@@ -19,6 +20,12 @@ parser.add_argument("--name", default=None)
 # borran toda la base. Registrar la instancia con --allow-flush para habilitarlos.
 parser.add_argument("--allow-flush", action="store_true")
 args, _ = parser.parse_known_args()
+# La contraseña llega por env (MCP_PASSWORD, la pone scripts/mcp-launch.py desde el
+# llavero del SO) o por flag (legacy: queda visible en `ps aux`). Gana el flag.
+# pop: que no la herede nada que este proceso lance.
+_env_password = os.environ.pop("MCP_PASSWORD", None)
+if args.password is None:  # "" (--password=) es un valor válido
+    args.password = _env_password
 
 SERVER_LABEL = args.name or f"{args.host}:{args.port}/{args.db}"
 
