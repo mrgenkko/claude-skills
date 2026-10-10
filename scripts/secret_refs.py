@@ -14,15 +14,19 @@ y add-mcp-to-project.py no dependan de él.
 SERVICE = "mrgenkko-mcp"
 PREFIX = "keyring:"
 
-# Campos de secrets.json que son credenciales, por tipo de MCP. gcloud.key_file
+# Campos de secrets.json que son credenciales, por tipo de MCP, y cómo le llegan
+# al server: (variable de entorno, flag legacy en texto plano o None). Es la única
+# tabla: el registro (add-mcp-to-project.py) y la comparación del --sweep salen de
+# acá. focusyn es remoto: su "variable" es el nombre del header. gcloud.key_file
 # NO está: es una ruta a un archivo, y gcloud necesita el archivo.
 SECRET_FIELDS = {
-    "postgres": ("password",),
-    "redis": ("password",),
-    "ssh": ("password", "sudo_password"),
-    "gh": ("token",),
-    "modal": ("token_id", "token_secret"),
-    "focusyn": ("agent_key",),
+    "postgres": {"password": ("MCP_PASSWORD", "--password")},
+    "redis": {"password": ("MCP_PASSWORD", "--password")},
+    "ssh": {"password": ("MCP_PASSWORD", "--password"),
+            "sudo_password": ("MCP_SUDO_PASSWORD", "--sudo-password")},
+    "gh": {"token": ("GH_TOKEN", None)},
+    "modal": {"token_id": ("MODAL_TOKEN_ID", None), "token_secret": ("MODAL_TOKEN_SECRET", None)},
+    "focusyn": {"agent_key": ("X-Agent-Key", None)},
 }
 
 
@@ -44,7 +48,12 @@ def default_id(name: str, field: str) -> str:
 
 
 def secret_fields(entry: dict) -> tuple:
-    return SECRET_FIELDS.get(entry.get("type"), ())
+    return tuple(SECRET_FIELDS.get(entry.get("type"), {}))
+
+
+def destino(kind: str, campo: str) -> tuple:
+    """(variable o header, flag legacy o None) de un campo secreto."""
+    return SECRET_FIELDS[kind][campo]
 
 
 def explain(exc: BaseException, rid: str) -> str:

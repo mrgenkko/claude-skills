@@ -379,25 +379,5 @@ class TestSecretRefs(unittest.TestCase):
         self.assertIn("RuntimeError", msg)
 
 
-class TestGuardiaDeAddMcp(unittest.TestCase):
-    """Hasta la fase 2, add-mcp-to-project.py no puede registrar referencias."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.add = cargar("add_mcp_to_project_guardia", "add-mcp-to-project.py")
-
-    def test_aborta_si_un_mcp_elegido_tiene_referencia(self):
-        cfg = [{"name": "pg", "type": "postgres", "password": "keyring:pg/password"}]
-        with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit):
-            self.add.abortar_si_hay_refs_al_llavero(cfg, ["pg"])
-        self.assertIn("pg.password", out.getvalue())
-
-    def test_deja_pasar_si_no_esta_elegido_o_es_plano(self):
-        cfg = [{"name": "pg", "type": "postgres", "password": "keyring:pg/password"},
-               {"name": "gh", "type": "gh", "token": "plano"},
-               {"name": "webprobe", "type": "webprobe"}]
-        self.add.abortar_si_hay_refs_al_llavero(cfg, ["gh", "webprobe"])  # no sale
-
-
 if __name__ == "__main__":
     unittest.main()
