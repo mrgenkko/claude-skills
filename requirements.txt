@@ -3,3 +3,4 @@ psycopg2-binary==2.9.12
 paramiko==4.0.0
 redis==5.2.1
 playwright==1.49.0
+keyring==25.7.0

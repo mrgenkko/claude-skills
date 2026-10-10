@@ -43,6 +43,11 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - solo en Pythons viejos
     tomllib = None
 
+# secret_refs vive al lado; se agrega la carpeta porque este script también se
+# carga por ruta (importlib) desde los tests, sin scripts/ en el sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import secret_refs  # noqa: E402
+
 HOME = os.path.expanduser("~")
 CLAUDE_JSON = os.path.join(HOME, ".claude.json")
 SKILLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -154,6 +159,27 @@ def warn_if_no_venv() -> None:
     print(f'        {creator} "{venv_dir}"')
     print(f'        "{python_bin}" -m pip install -r "{reqs}"')
     print()
+
+
+def abortar_si_hay_refs_al_llavero(servers_config: list, nombres) -> None:
+    """Hasta la fase 2 este script no sabe registrar `keyring:<id>`.
+
+    Sin este freno, después de `mcp-secrets.py migrate` escribiría el texto
+    "keyring:postgres-x/password" como contraseña en ~/.claude.json: el MCP no
+    conectaría y no habría forma obvia de entender por qué.
+    """
+    nombres = set(nombres)
+    con_refs = sorted(f"{e['name']}.{c}" for e in servers_config if e.get("name") in nombres
+                      for c in secret_refs.secret_fields(e) if secret_refs.is_ref(e.get(c)))
+    if not con_refs:
+        return
+    print("ERROR: estos campos de secrets.json apuntan al llavero (keyring:...) y este script")
+    print("       todavía no sabe registrarlos (llega en la fase 2, ver pendientes/llavero-fase2.md):")
+    for c in con_refs:
+        print(f"         {c}")
+    print("       Registrarlos ahora escribiría el texto 'keyring:...' como clave. No se tocó nada.")
+    print("       Los MCPs sin claves se pueden registrar igual con --only.")
+    sys.exit(1)
 
 
 def build_mcp_servers(servers_config: list) -> dict:
@@ -852,6 +878,9 @@ def main():
             print(f"Disponibles: {', '.join(sorted(MCP_SERVERS.keys()))}")
             sys.exit(1)
         MCP_SERVERS = {k: v for k, v in MCP_SERVERS.items() if k in only_filter}
+
+    if not remove_mode:
+        abortar_si_hay_refs_al_llavero(secrets["mcp_servers"], MCP_SERVERS.keys())
 
     if not args_clean and not global_scope:
         print_usage()

@@ -6,6 +6,8 @@ __pycache__/
 
 # Secrets — nunca subir al repositorio
 scripts/secrets.json
+# Respaldo que deja `mcp-secrets.py migrate`: tiene los valores en texto plano
+scripts/secrets.json.bak
 
 # Contexto personal de Claude (usa CLAUDE.example.md como plantilla)
 .claude/settings.json
