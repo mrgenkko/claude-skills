@@ -95,6 +95,8 @@ Ver `examples/mcp-database/server.py` para el código completo.
 }
 ```
 
+Con `--password=` la clave queda en texto plano en `~/.claude.json` y visible en `ps aux`. El postgres de este repo también la acepta por entorno (`MCP_PASSWORD`), que es como la pasa `scripts/mcp-launch.py` desde el llavero del sistema: ver [secrets.md](secrets.md).
+
 ---
 
 ## Agregar a un proyecto con el script

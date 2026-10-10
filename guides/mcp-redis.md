@@ -38,6 +38,10 @@ en el MCP de postgres).
 }
 ```
 
+Con contraseña: `"password": "keyring:redis-mi-cache/password"` y la clave en el llavero
+(`mcp-secrets.py set redis-mi-cache/password`). El server la recibe como `MCP_PASSWORD` en el
+entorno, nunca como `--password` (ver [secrets.md](secrets.md)).
+
 Multi-instancia: igual que postgres con varias DB, registrar `redis-cache`,
 `redis-sessions`, etc. con el mismo binario y distinto `--db` o `--host`. El
 `--name` se deriva del nombre quitando el prefijo `redis-`.
@@ -83,7 +87,7 @@ Redis sin escribir código.
 ## Troubleshooting
 
 **`Error Redis: Authentication required`**
-→ Falta `password` en `secrets.json`.
+→ Falta `password`. Va en el llavero: `"password": "keyring:redis-<nombre>/password"` en `secrets.json` y `mcp-secrets.py set redis-<nombre>/password` (ver [secrets.md](secrets.md)).
 
 **`Error Redis: Connection refused`**
 → Verificar host/puerto y que Redis acepte conexiones remotas (`bind` y `protected-mode`).

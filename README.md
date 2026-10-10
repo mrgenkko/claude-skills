@@ -17,13 +17,17 @@ Mrgenkko Skills/
 ├── .gitignore
 ├── .claude/skills/              ← skills de Claude Code (se enlazan a cada proyecto, ver «Skills»)
 ├── scripts/
-│   ├── add-mcp-to-project.py   ← registra MCPs en un proyecto nuevo
+│   ├── add-mcp-to-project.py   ← registra MCPs en un proyecto nuevo (--sweep: re-registra todos)
+│   ├── mcp-secrets.py          ← claves de los MCP en el llavero del SO (set/check/migrate)
+│   ├── mcp-launch.py           ← lanzador: lee las claves del llavero al arrancar cada MCP
+│   ├── secret_refs.py          ← referencias keyring:<id> (compartido)
 │   ├── codex-imagegen.py       ← genera/edita imágenes con el image_gen de Codex (skill /codex-imagegen)
 │   ├── install-lottie-mcp.sh   ← instala @lottiefiles/creator-mcp en ~/.claude/mcp-servers/lottie
 │   ├── run-lottie-mcp.sh       ← arranque Lottie para Claude Code (stdio)
-│   ├── secrets.json            ← credenciales y configuración (gitignoreado)
+│   ├── secrets.json            ← configuración de los MCPs; las claves solo como keyring:<id> (gitignoreado)
 │   └── secrets.example.json    ← plantilla de secrets
 ├── guides/
+│   ├── secrets.md              ← credenciales de los MCP en el llavero del SO
 │   ├── cursor.md               ← MCP en Cursor IDE (~/.cursor/mcp.json, global)
 │   ├── mcp-databases.md        ← cómo crear MCPs de bases de datos
 │   ├── mcp-blender.md          ← Blender Lab oficial (add-on + servidor MCP)
@@ -60,12 +64,19 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-**2. Configurar credenciales:**
+**2. Configurar los MCPs y sus claves:**
 
 ```bash
 cp scripts/secrets.example.json scripts/secrets.json
-# Editar secrets.json con tus proyectos, BDs y credenciales
+# Editar secrets.json con tus proyectos y BDs. Los campos secretos van como
+# "password": "keyring:<mcp>/password" — el valor NO va en el archivo:
+.venv/bin/python scripts/mcp-secrets.py set postgres-mi-bd/password   # lo pide sin mostrarlo
+.venv/bin/python scripts/mcp-secrets.py check                         # ¿están todas?
 ```
+
+Las claves viven en el llavero del sistema (GNOME Keyring / Administrador de credenciales) y
+nunca se escriben en `~/.claude.json` ni en ningún config: ver [guides/secrets.md](guides/secrets.md).
+Un `secrets.json` viejo con claves en texto plano se pasa con `mcp-secrets.py migrate`.
 
 **3. Copiar contexto de Claude:**
 
@@ -90,9 +101,14 @@ python3 ~/Mrgenkko\ Skills/scripts/add-mcp-to-project.py
 # Registrar todos los MCPs en un proyecto nuevo
 python3 ~/Mrgenkko\ Skills/scripts/add-mcp-to-project.py /ruta/absoluta/al/proyecto
 
-# Actualizar entradas ya existentes (cuando cambian credenciales o argumentos)
+# Actualizar entradas ya existentes (cuando cambian argumentos)
 python3 ~/Mrgenkko\ Skills/scripts/add-mcp-to-project.py /ruta/absoluta/al/proyecto --update
+
+# Re-registrar en TODOS los proyectos donde ya están (Claude + Codex); --dry-run primero
+python3 ~/Mrgenkko\ Skills/scripts/add-mcp-to-project.py --sweep --dry-run
 ```
+
+Rotar una clave **no** requiere re-registrar: `mcp-secrets.py set <id>` y reconectar el MCP.
 
 Por defecto no sobreescribe entradas existentes; usa `--update` para forzarlo.  
 Después de ejecutarlo, **reiniciar Claude Code en VSCode** para que carguen los nuevos MCPs.
@@ -118,11 +134,14 @@ asumen rutas y binarios POSIX. Lo que está cubierto es el **registro**.
 
 ### Tests
 
-Stdlib puro, sin dependencias ni `secrets.json`:
+Sin `secrets.json` ni llavero real (los tests inyectan uno en memoria):
 
 ```bash
-python3 -m unittest discover -s scripts -p "test_*.py" -v
+.venv/bin/python -m unittest discover -s scripts -p "test_*.py" -v
 ```
+
+Con un `python3` sin las dependencias de los servers (psycopg2, redis, paramiko), los tests de
+`test_servers_env.py` se saltean; el resto es stdlib puro.
 
 CI los corre en Linux, Windows y macOS sobre Python 3.11 y 3.13
 (`.github/workflows/tests.yml`).

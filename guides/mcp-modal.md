@@ -15,10 +15,11 @@ igual a un TOML aparte, como defensa en profundidad para cualquier subcomando qu
 tocar config local.
 
 Consecuencia práctica: **`modal setup` y `modal token new` están bloqueados** y no hacen
-falta. El token se genera una vez en el dashboard (`Settings → API Tokens`) y se pega en
-`secrets.json`. El registrador lo escribe en `env`, no en `args`, porque la línea de
-comandos de un proceso la lee cualquier usuario con `ps aux` mientras que
-`/proc/<pid>/environ` es 0400 del dueño.
+falta. El token se genera una vez en el dashboard (`Settings → API Tokens`) y se guarda en el
+llavero del sistema (`mcp-secrets.py set modal-<ws>/token_id` y `.../token_secret`). El
+lanzador (`scripts/mcp-launch.py`) lo pone en el entorno del server al arrancar, nunca en
+`args`: la línea de comandos de un proceso la lee cualquier usuario con `ps aux`, mientras que
+`/proc/<pid>/environ` es 0400 del dueño. Ver [secrets.md](secrets.md).
 
 ## Tres gates, porque acá el cómputo se paga por segundo
 
@@ -75,8 +76,8 @@ Todas aceptan `environment` (default el de la instancia) y las de listado devuel
   "type": "modal",
   "workspace": "mrgenkko",
   "environment": "main",
-  "token_id": "ak-...",
-  "token_secret": "as-...",
+  "token_id": "keyring:modal-mrgenkko/token_id",
+  "token_secret": "keyring:modal-mrgenkko/token_secret",
   "config_path": "/home/melquiades/.config/modal/mrgenkko.toml",
   "modal_bin": "",
   "allow_write": false,

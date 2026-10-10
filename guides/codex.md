@@ -35,9 +35,7 @@ Si no lo está, ignora el archivo entero **sin ningún warning**: los MCPs simpl
 
 ### 2. El archivo vive dentro del repo
 
-Nuestros MCPs llevan credenciales en `args` (`--password=`) y en `env` (`GH_TOKEN`). En Claude eso queda en `~/.claude.json`, fuera de todo repo; en Codex cae en `<repo>/.codex/config.toml`, a un `git add .` de publicarse.
-
-Por eso el script, en cada corrida:
+Con las credenciales en el llavero ([secrets.md](secrets.md)), el TOML **ya no lleva ninguna**: solo `--secret VAR=keyring:<id>` para el lanzador, y `http_headers_helper` para focusyn. Pero una entrada que siga en texto plano en `secrets.json` todavía escribe `--password=` o `GH_TOKEN` en `<repo>/.codex/config.toml`, a un `git add .` de publicarse. Por eso los guards siguen:
 
 - agrega `.codex/` al `.gitignore` del repo,
 - **aborta** si `.codex/config.toml` ya está trackeado en git (y te dice cómo sacarlo del índice),
@@ -62,6 +60,9 @@ SCRIPT="$HOME/Mrgenkko Skills/scripts/add-mcp-to-project.py"
 # Actualizar tras cambiar secrets.json
 "$PYTHON" "$SCRIPT" /ruta/al/proyecto --target both --update
 
+# Re-registrar en TODOS los proyectos donde ya están (Claude + Codex)
+"$PYTHON" "$SCRIPT" --sweep --dry-run
+
 # Quitar uno
 "$PYTHON" "$SCRIPT" /ruta/al/proyecto --target codex --remove --only webprobe
 
@@ -84,11 +85,15 @@ model = "gpt-5.6-sol"          # tuyo, se conserva
 [mcp_servers."gh-lait"]
 command = "/home/melquiades/Mrgenkko Skills/.venv/bin/python"
 args = [
+    "/home/melquiades/Mrgenkko Skills/scripts/mcp-launch.py",
+    "--secret",
+    "GH_TOKEN=keyring:gh-lait/token",
+    "--",
     "/home/melquiades/.claude/mcp-servers/gh/server.py",
     "--owner=juandelgadolait",
     "--name=lait",
 ]
-env = { "GH_TOKEN" = "ghp_..." }
+env_vars = ["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"]
 startup_timeout_sec = 30
 # <<< mrgenkko-skills: mcp_servers <<<
 ```
@@ -133,7 +138,9 @@ Los candidatos de config son `mcp_servers.<name>.approval_mode` y `default_tools
 
 - **No hay `codex mcp add` por proyecto**: ese subcomando escribe únicamente el config global. El TOML por proyecto se genera con el script.
 - **El trust es un prerrequisito**, no un detalle de UX: sin él no hay MCPs.
-- **Los secretos entran al árbol del repo**. Es la diferencia estructural con Claude, y la razón de los guards.
+- **El config vive dentro del repo.** Con el llavero ya no lleva secretos, pero una entrada en texto plano los metería ahí: es la razón de los guards.
+- **Codex filtra el entorno de sus MCP.** El lanzador necesita el bus de sesión para leer el llavero, por eso las entradas que lo usan llevan `env_vars = ["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"]` (verificado que 0.162 lo acepta).
+- **`http_headers_helper` es un string** (0.162 rechaza lista y tabla) y no está documentado si pasa por un shell: por eso el helper es una ruta sola, sin espacios ni argumentos.
 
 ---
 

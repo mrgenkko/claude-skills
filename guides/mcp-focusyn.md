@@ -156,12 +156,16 @@ en ese caso la URL es `http://localhost:7415/mcp/`.
   "name": "focusyn",
   "type": "focusyn",
   "url": "https://focusyn.melquiades.systems/mcp/",
-  "agent_key": "a2a_<KEY>"
+  "agent_key": "keyring:focusyn/agent_key"
 }
 ```
 
-`add-mcp-to-project.py` construye con estos campos una entrada **http**:
-`{"type":"http","url":...,"headers":{"X-Agent-Key": <agent_key>}}` (ya no es stdio).
+La key va en el llavero del sistema (`mcp-secrets.py set focusyn/agent_key`), no en el JSON.
+`add-mcp-to-project.py` construye con estos campos una entrada **http** sin la key:
+`{"type":"http","url":...,"headersHelper":"~/.claude/mcp-servers/_launch/headers-focusyn"}`.
+Ese ejecutable lee la key del llavero en cada conexión e imprime `{"X-Agent-Key": ...}`; en Codex
+es `http_headers_helper`. Con la key en texto plano (legacy) sigue saliendo `headers`. Ver
+[secrets.md](secrets.md).
 
 ### 4. Registrar como MCP GLOBAL (user-scope)
 

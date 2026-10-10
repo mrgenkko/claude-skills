@@ -126,6 +126,8 @@ redirige a `download_file` en vez de texto corrupto.
 
 *Se debe proveer `--key-file` o `--password`.
 
+Las dos contraseñas también se aceptan por entorno: `MCP_PASSWORD` y `MCP_SUDO_PASSWORD`. Así las pasa `scripts/mcp-launch.py` desde el llavero, y no quedan visibles en `ps aux`. Si llegan las dos formas, gana el flag. El server borra esas variables de su entorno apenas las lee. Ver [secrets.md](secrets.md).
+
 ### Sudo
 
 Si se pasa `--sudo-password`, el tool `shell` detecta automáticamente los comandos con `sudo` e
@@ -196,7 +198,7 @@ ssh -i ~/.ssh/id_ed25519 usuario@ip-servidor
 }
 ```
 
-Reemplaza `null` por la contraseña si el usuario SSH requiere sudo con password.
+Si el usuario SSH requiere sudo con password: `"sudo_password": "keyring:ssh-mi-servidor/sudo_password"` y `mcp-secrets.py set ssh-mi-servidor/sudo_password`. La contraseña nunca va en el JSON.
 
 Campos opcionales de sesiones (defaults sensatos, no hace falta agregarlos):
 
@@ -213,6 +215,8 @@ python3 "~/Mrgenkko Skills/scripts/add-mcp-to-project.py" /ruta/al/proyecto
 
 ### 3. Registro manual en `~/.claude.json`
 
+Solo como referencia y sin sudo. Con `--sudo-password=` en `args`, la contraseña queda en `~/.claude.json` y en `ps aux`. El script la registra por el lanzador (`mcp-launch.py --secret MCP_SUDO_PASSWORD=keyring:... -- server.py ...`).
+
 ```json
 {
   "projects": {
@@ -227,7 +231,6 @@ python3 "~/Mrgenkko Skills/scripts/add-mcp-to-project.py" /ruta/al/proyecto
             "--port=22",
             "--user=ubuntu",
             "--key-file=/home/melquiades/.ssh/claude_mcp",
-            "--sudo-password=tu-contraseña-sudo",
             "--name=mi-servidor"
           ],
           "env": {}

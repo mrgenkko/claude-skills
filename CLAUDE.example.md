@@ -15,10 +15,13 @@ Skills/
 ├── requirements.txt             ← dependencias Python de los MCPs
 ├── .gitignore
 ├── scripts/
-│   ├── add-mcp-to-project.py    ← script para registrar MCPs en un proyecto
-│   ├── secrets.json             ← credenciales reales (gitignoreado)
-│   └── secrets.example.json     ← plantilla de credenciales
+│   ├── add-mcp-to-project.py    ← script para registrar MCPs en un proyecto (--sweep: todos)
+│   ├── mcp-secrets.py           ← claves en el llavero del SO (set/check/migrate)
+│   ├── mcp-launch.py            ← lee las claves del llavero al arrancar cada MCP
+│   ├── secrets.json             ← configuración; claves solo como keyring:<id> (gitignoreado)
+│   └── secrets.example.json     ← plantilla
 ├── guides/
+│   ├── secrets.md              ← credenciales de los MCP en el llavero del SO
 │   ├── cursor.md                ← MCP global en Cursor (~/.cursor/mcp.json)
 │   ├── mcp-databases.md         ← cómo crear MCP de bases de datos
 │   ├── mcp-gcloud.md            ← cómo crear MCP de Google Cloud
@@ -158,4 +161,4 @@ La carpeta `wiki/` es un cerebro externo acumulativo — crece con cada fuente p
 - Los servidores MCP custom van en `~/.claude/mcp-servers/<nombre>/server.py`
 - El venv para los MCP Python es `~/Mrgenkko Skills/.venv`
 - Las service account keys van en `~/keys/<proyecto>/` (nunca en el repo)
-- Las credenciales van en `scripts/secrets.json` (gitignoreado)
+- La configuración de los MCPs va en `scripts/secrets.json` (gitignoreado); las **credenciales**, en el llavero del sistema, referenciadas como `keyring:<id>` (ver `guides/secrets.md`). Nunca un valor en el JSON ni en `~/.claude.json`

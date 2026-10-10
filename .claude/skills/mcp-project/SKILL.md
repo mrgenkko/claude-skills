@@ -34,7 +34,9 @@ Sufijo opcional en cualquier operación; por defecto solo Claude Code:
 | `--codex` | `--target codex` | Solo `<proyecto>/.codex/config.toml` |
 | `--both` | `--target both` | Los dos, en la misma corrida |
 
-Con `--codex` el script además marca el proyecto como `trusted` en `~/.codex/config.toml` (sin eso Codex ignora el archivo sin avisar) y agrega `.codex/` al `.gitignore` del repo, porque el TOML lleva credenciales en texto plano.
+Con `--codex` el script además marca el proyecto como `trusted` en `~/.codex/config.toml` (sin eso Codex ignora el archivo sin avisar) y agrega `.codex/` al `.gitignore` del repo: con las claves en el llavero el TOML ya no lleva ninguna, pero una entrada que siga en texto plano sí.
+
+**Credenciales:** viven en el llavero del sistema, no en `secrets.json` (ahí solo `keyring:<id>`). Si el script avisa `credenciales en texto plano`, sugerir `mcp-secrets.py migrate`. Si un MCP no arranca con «keyring:<id> no existe», falta cargarla: `mcp-secrets.py set <id>` — **nunca** pedirle al usuario que pegue la clave en el chat. Ver `guides/secrets.md`.
 
 ## Resolución de ruta de proyecto
 
@@ -87,6 +89,13 @@ print('\n'.join(mcps) if mcps else '(sin MCPs registrados)')
 
 # Solo algunos:
 "$PYTHON" "$SCRIPT" /ruta/al/proyecto --update --only mcp1,mcp2
+```
+
+### sweep (todos los proyectos)
+Re-registra, en cada scope donde ya están, los MCPs de `secrets.json` (Claude y Codex). No agrega ninguno. Correr siempre primero el `--dry-run` y mostrar al usuario el bloque «OJO: además de las credenciales…» si aparece:
+```bash
+"$PYTHON" "$SCRIPT" --sweep --dry-run
+"$PYTHON" "$SCRIPT" --sweep
 ```
 
 ### remove

@@ -50,7 +50,7 @@ Para que el agente de cada proyecto sepa qué `repo` disparar, deja los parámet
 A diferencia de gcloud —que activa la service account en disco (`~/.config/gcloud`) y necesita `CLOUDSDK_CONFIG` para que la cuenta activa no derive entre instancias— en `gh` basta con pasar **`GH_TOKEN` por instancia**:
 
 - Con `GH_TOKEN` seteado, `gh` es **stateless**: no lee ni escribe `~/.config/gh/hosts.yml`. Cada instancia usa exactamente su token, sin estado compartido en disco → la deriva de cuenta es estructuralmente imposible.
-- `add-mcp-to-project.py` inyecta `GH_TOKEN` en el bloque `env` del MCP en `~/.claude.json` (no como flag, para no exponerlo en la línea de comandos).
+- El token vive en el llavero del sistema: `secrets.json` solo tiene `"token": "keyring:gh-<org>/token"`, y `scripts/mcp-launch.py` pone `GH_TOKEN` en el entorno del server al arrancar. No queda ni en `~/.claude.json` ni en la línea de comandos. Ver [secrets.md](secrets.md).
 - `config_dir` (→ `GH_CONFIG_DIR`) es opcional, solo defensa en profundidad para subcomandos que toquen config local.
 
 Una instancia por org: `gh-lait`, `gh-melquiades`, `gh-gz`, cada una con su PAT.
@@ -115,11 +115,13 @@ Verifica que `gh` esté instalado y copia el `server.py` a `~/.claude/mcp-server
 {
   "name": "gh-lait",
   "type": "gh",
-  "token": "github_pat_xxx",
+  "token": "keyring:gh-lait/token",
   "owner": "lait",
   "allow_write": false
 }
 ```
+
+El PAT se guarda en el llavero, no en el JSON: `mcp-secrets.py set gh-lait/token`, que lo pide sin mostrarlo.
 
 ### 2. Registrar con el script automático
 
@@ -130,6 +132,8 @@ python3 "~/Mrgenkko Skills/scripts/add-mcp-to-project.py" /ruta/al/proyecto --on
 O con la skill: `/mcp-project add <proyecto> gh-lait`.
 
 ### 3. Registro manual en `~/.claude.json`
+
+Solo como referencia: con el token en `env` queda en texto plano en `~/.claude.json`. Lo que escribe el script es `"args": ["<repo>/scripts/mcp-launch.py", "--secret", "GH_TOKEN=keyring:gh-lait/token", "--", "<server.py>", ...]` sin `env`.
 
 ```json
 {
@@ -187,7 +191,7 @@ pr_checks(number="42", repo="lait/lait-ui-kit")                    # ¿pasó CI 
 → Instalar GitHub CLI (https://cli.github.com) y reiniciar la extensión.
 
 **`[exit 1] ... HTTP 401` / `Bad credentials`**
-→ El PAT es inválido o expiró. Regenerarlo y actualizar `GH_TOKEN` en `secrets.json` + `--update`.
+→ El PAT es inválido o expiró. Regenerarlo, `mcp-secrets.py set gh-<org>/token` y reconectar el MCP (no hace falta re-registrar).
 
 **`[exit 1] ... HTTP 403` o falta un scope**
 → El PAT no tiene el scope/permiso necesario (ej. `actions:read` para runs). Ajustar scopes.
