@@ -22,6 +22,8 @@ Mrgenkko Skills/
 │   ├── mcp-launch.py           ← lanzador: lee las claves del llavero al arrancar cada MCP
 │   ├── secret_refs.py          ← referencias keyring:<id> (compartido)
 │   ├── codex-imagegen.py       ← genera/edita imágenes con el image_gen de Codex (skill /codex-imagegen)
+│   ├── prose_check.py          ← medidor único de densidad de prosa del ecosistema (skill /prosa)
+│   ├── test_prose_check.py     ← su validación: fixtures, oráculos, mutantes y repos git temporales
 │   ├── install-lottie-mcp.sh   ← instala @lottiefiles/creator-mcp en ~/.claude/mcp-servers/lottie
 │   ├── run-lottie-mcp.sh       ← arranque Lottie para Claude Code (stdio)
 │   ├── secrets.json            ← configuración de los MCPs; las claves solo como keyring:<id> (gitignoreado)
@@ -171,6 +173,7 @@ Claude Code descubre la skill a través del enlace (verificado). El enlace apunt
 | Skill | Qué hace |
 |---|---|
 | `/codex-imagegen` | Genera o edita imágenes con el `image_gen` integrado de Codex CLI, con la sesión de ChatGPT del usuario. Claude escribe el prompt, llega crudo a `image_gen` y la imagen sale con su `.prompt.txt`. Script: `scripts/codex-imagegen.py` |
+| `/prosa` | Mide y gatea la densidad de prosa del código (LAIT-DEC-445: techo 25 %, objetivo 15 %), con dos varas opcionales y `--solo-prosa` para verificar podas. Un solo medidor para Python, TS/JS, Go, C/C++, shell, CMake, Dockerfile y HTML, configurado por el `.prose-check.toml` de cada repo. Script: `scripts/prose_check.py` |
 | `/mcp-project` | Agrega, actualiza o elimina MCPs por proyecto en Claude Code y Codex |
 | `/nuevo-proyecto-obsidian` | Scaffold de un proyecto en el vault |
 | `/link-memoria-obsidian` | Vincula la claude-memory de un proyecto con el vault |
